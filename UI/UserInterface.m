@@ -16670,28 +16670,6 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     self.assetExplorerFilterButton.showsMenuAsPrimaryAction = YES;
 }
 
-static UIColor *zs_zebra_strip_pattern_color(BOOL modded) {
-    static UIColor *moddedColor = nil;
-    static UIColor *stockColor = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        const CGFloat bandHeight = 6;
-        UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
-        format.opaque = NO;
-        UIColor *(^makePattern)(UIColor *) = ^UIColor *(UIColor *tint) {
-            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1, bandHeight * 2) format:format];
-            UIImage *tile = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-                CGContextSetFillColorWithColor(context.CGContext, tint.CGColor);
-                CGContextFillRect(context.CGContext, CGRectMake(0, 0, 1, bandHeight));
-            }];
-            return [UIColor colorWithPatternImage:tile];
-        };
-        moddedColor = makePattern([zs_accent_green_color() colorWithAlphaComponent:0.22]);
-        stockColor = makePattern([UIColor colorWithRed:0.45 green:0.62 blue:1.0 alpha:0.16]);
-    });
-    return modded ? moddedColor : stockColor;
-}
-
 - (NSUInteger)zs_assetExplorerModdedDisplayCount {
     return MIN(self.assetExplorerDisplayedModdedCount, self.assetExplorerDisplayedBundles.count);
 }
@@ -16733,7 +16711,7 @@ static UIColor *zs_zebra_strip_pattern_color(BOOL modded) {
     UIView *stripes = [[UIView alloc] init];
     stripes.translatesAutoresizingMaskIntoConstraints = NO;
     stripes.userInteractionEnabled = NO;
-    stripes.backgroundColor = zs_zebra_strip_pattern_color([self zs_assetExplorerSectionIsModded:section]);
+    stripes.backgroundColor = [UIColor colorWithWhite:0 alpha:0.38];
     [header.contentView addSubview:stripes];
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
