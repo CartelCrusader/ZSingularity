@@ -15825,31 +15825,39 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     }
 }
 
-- (CGPoint)zs_assetExplorerClampedPreviewOffset:(CGPoint)offset scale:(CGFloat)scale {
-    UIView *clip = self.assetExplorerPreviewClipView;
-    CGSize size = clip.bounds.size;
-    CGFloat maxX = MAX(0, (size.width * scale - size.width) / 2);
-    CGFloat maxY = MAX(0, (size.height * scale - size.height) / 2);
-    CGFloat minX = -maxX;
-    CGFloat minY = -maxY;
-    UIView *overlay = self.assetExplorerFullScreenOverlay;
-    if (scale > 1 && clip && overlay && clip.window && overlay.window) {
-        CGRect window = [clip convertRect:overlay.bounds fromView:overlay];
-        CGFloat scaledW = size.width * scale;
-        CGFloat scaledH = size.height * scale;
-        CGFloat centerX = size.width / 2;
-        CGFloat centerY = size.height / 2;
-        if (scaledW > window.size.width) {
-            minX = CGRectGetMaxX(window) - centerX - scaledW / 2;
-            maxX = CGRectGetMinX(window) - centerX + scaledW / 2;
-        }
-        if (scaledH > window.size.height) {
-            minY = CGRectGetMaxY(window) - centerY - scaledH / 2;
-            maxY = CGRectGetMinY(window) - centerY + scaledH / 2;
+static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMax, CGFloat scale, CGFloat *outLo, CGFloat *outHi) {
+    CGFloat extra = MAX(0, clipLen * scale - clipLen);
+    CGFloat a = extra / 2;
+    CGFloat lo = -a;
+    CGFloat hi = a;
+    CGFloat winLen = winMax - winMin;
+    if (a > 0 && winLen > clipLen + 0.5) {
+        CGFloat t = MIN(1, extra / (winLen - clipLen));
+        lo = -a + (winMax - clipLen) * t;
+        hi = a + winMin * t;
+        if (lo > hi) {
+            CGFloat mid = (lo + hi) / 2;
+            lo = mid;
+            hi = mid;
         }
     }
-    offset.x = MIN(MAX(offset.x, minX), maxX);
-    offset.y = MIN(MAX(offset.y, minY), maxY);
+    *outLo = lo;
+    *outHi = hi;
+}
+
+- (CGPoint)zs_assetExplorerClampedPreviewOffset:(CGPoint)offset scale:(CGFloat)scale {
+    UIView *clip = self.assetExplorerPreviewClipView;
+    UIView *overlay = self.assetExplorerFullScreenOverlay;
+    CGSize size = clip.bounds.size;
+    CGRect window = CGRectMake(0, 0, size.width, size.height);
+    if (clip && overlay && clip.window && overlay.window) {
+        window = [clip convertRect:overlay.bounds fromView:overlay];
+    }
+    CGFloat loX, hiX, loY, hiY;
+    zs_preview_axis_range(size.width, CGRectGetMinX(window), CGRectGetMaxX(window), scale, &loX, &hiX);
+    zs_preview_axis_range(size.height, CGRectGetMinY(window), CGRectGetMaxY(window), scale, &loY, &hiY);
+    offset.x = MIN(MAX(offset.x, loX), hiX);
+    offset.y = MIN(MAX(offset.y, loY), hiY);
     return offset;
 }
 
@@ -15879,6 +15887,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
             break;
         }
         case UIGestureRecognizerStateChanged: {
+            if (pinch.numberOfTouches < 2) break;
             CGFloat base = self.assetExplorerPreviewGestureBaseScale > 0 ? self.assetExplorerPreviewGestureBaseScale : 1;
             CGFloat scale = MIN(MAX(base * pinch.scale, 0.4), 16);
             CGPoint startOffset = self.assetExplorerPreviewGestureBaseOffset;
@@ -16912,7 +16921,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle || self.assetExplorerDisplayedBundles.count == 0) return nil;
 
     UIView *header = [[UIView alloc] init];
-    header.backgroundColor = UIColor.clearColor;
+    header.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     label.font = zs_mono_font(10, UIFontWeightSemibold);
