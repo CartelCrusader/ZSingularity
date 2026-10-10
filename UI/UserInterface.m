@@ -5597,7 +5597,12 @@ static const CGFloat kZSSyslogIndexColumnWidth = 22;
 @implementation ZSAssetPreviewClipView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     if (self.hidden || self.contentView.hidden) return nil;
-    return [super hitTest:point withEvent:event];
+    UIView *hit = [super hitTest:point withEvent:event];
+    if (hit) return hit;
+    UIView *content = self.contentView;
+    if (!content || content.superview != self) return nil;
+    CGPoint inContent = [content convertPoint:point fromView:self];
+    return [content pointInside:inContent withEvent:event] ? content : nil;
 }
 @end
 
@@ -5987,6 +5992,7 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 @property (nonatomic, assign) CGFloat assetExplorerPreviewGestureBaseScale;
 @property (nonatomic, assign) CGPoint assetExplorerPreviewGestureBaseOffset;
 @property (nonatomic, assign) CGPoint assetExplorerPreviewGestureFocal;
+@property (nonatomic, assign) NSInteger assetExplorerPreviewPanTouchCount;
 @property (nonatomic, strong) UITextView *assetExplorerTextView;
 @property (nonatomic, strong) UILabel *assetExplorerTextureMessageLabel;
 @property (nonatomic, strong) UILabel *assetExplorerTextureCaptionLabel;
@@ -15431,7 +15437,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     ZSAssetPreviewClipView *previewClip = [[ZSAssetPreviewClipView alloc] init];
     previewClip.translatesAutoresizingMaskIntoConstraints = NO;
     previewClip.backgroundColor = UIColor.clearColor;
-    previewClip.clipsToBounds = YES;
+    previewClip.clipsToBounds = NO;
     previewClip.contentView = textureImageView;
     UIPinchGestureRecognizer *previewPinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(zs_assetExplorerPreviewPinched:)];
     previewPinch.delegate = self;
@@ -15805,14 +15811,45 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     CGPoint offset = self.assetExplorerPreviewOffset;
     imageView.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(offset.x, offset.y), scale, scale);
     imageView.layer.magnificationFilter = scale >= 3 ? kCAFilterNearest : kCAFilterLinear;
+    if (scale > 1.01) {
+        UIView *host = self.assetExplorerPreviewClipView.superview;
+        NSArray<UIView *> *controls = @[
+            self.assetExplorerCloseButton ?: (UIView *)[NSNull null],
+            self.assetExplorerBackButton ?: (UIView *)[NSNull null],
+            self.assetExplorerTextureBackButton ?: (UIView *)[NSNull null],
+            self.assetExplorerTextureExportButton ?: (UIView *)[NSNull null],
+        ];
+        for (UIView *control in controls) {
+            if ([control isKindOfClass:[UIView class]] && control.superview == host) [host bringSubviewToFront:control];
+        }
+    }
 }
 
 - (CGPoint)zs_assetExplorerClampedPreviewOffset:(CGPoint)offset scale:(CGFloat)scale {
-    CGSize size = self.assetExplorerPreviewClipView.bounds.size;
+    UIView *clip = self.assetExplorerPreviewClipView;
+    CGSize size = clip.bounds.size;
     CGFloat maxX = MAX(0, (size.width * scale - size.width) / 2);
     CGFloat maxY = MAX(0, (size.height * scale - size.height) / 2);
-    offset.x = MIN(MAX(offset.x, -maxX), maxX);
-    offset.y = MIN(MAX(offset.y, -maxY), maxY);
+    CGFloat minX = -maxX;
+    CGFloat minY = -maxY;
+    UIView *overlay = self.assetExplorerFullScreenOverlay;
+    if (scale > 1 && clip && overlay && clip.window && overlay.window) {
+        CGRect window = [clip convertRect:overlay.bounds fromView:overlay];
+        CGFloat scaledW = size.width * scale;
+        CGFloat scaledH = size.height * scale;
+        CGFloat centerX = size.width / 2;
+        CGFloat centerY = size.height / 2;
+        if (scaledW > window.size.width) {
+            minX = CGRectGetMaxX(window) - centerX - scaledW / 2;
+            maxX = CGRectGetMinX(window) - centerX + scaledW / 2;
+        }
+        if (scaledH > window.size.height) {
+            minY = CGRectGetMaxY(window) - centerY - scaledH / 2;
+            maxY = CGRectGetMinY(window) - centerY + scaledH / 2;
+        }
+    }
+    offset.x = MIN(MAX(offset.x, minX), maxX);
+    offset.y = MIN(MAX(offset.y, minY), maxY);
     return offset;
 }
 
@@ -15875,9 +15912,16 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     if (!clip || !self.assetExplorerTextureOpen || self.assetExplorerTextureImageView.hidden) return;
     if (pan.state == UIGestureRecognizerStateBegan) {
         self.assetExplorerPreviewGestureBaseOffset = self.assetExplorerPreviewOffset;
+        self.assetExplorerPreviewPanTouchCount = pan.numberOfTouches;
         return;
     }
     if (pan.state != UIGestureRecognizerStateChanged) return;
+    if (pan.numberOfTouches != self.assetExplorerPreviewPanTouchCount) {
+        self.assetExplorerPreviewPanTouchCount = pan.numberOfTouches;
+        self.assetExplorerPreviewGestureBaseOffset = self.assetExplorerPreviewOffset;
+        [pan setTranslation:CGPointZero inView:clip];
+        return;
+    }
     if (pan.numberOfTouches > 1) return;
     CGFloat scale = self.assetExplorerPreviewScale > 0 ? self.assetExplorerPreviewScale : 1;
     if (scale <= 1.01) return;
@@ -16868,7 +16912,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle || self.assetExplorerDisplayedBundles.count == 0) return nil;
 
     UIView *header = [[UIView alloc] init];
-    header.backgroundColor = [UIColor colorWithWhite:0 alpha:0.38];
+    header.backgroundColor = UIColor.clearColor;
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     label.font = zs_mono_font(10, UIFontWeightSemibold);

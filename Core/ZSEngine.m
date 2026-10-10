@@ -752,6 +752,32 @@ void zs_set_bundle_modded(NSString *cab, BOOL modded) {
     }
 }
 
+void zs_apply_modded_bundle_changes(NSArray<NSString *> *toAdd, NSArray<NSString *> *toRemove) {
+    zs_ensure_modded_bundles_loaded();
+    BOOL needsFlush = NO;
+    @synchronized (zs_modded_bundles_lock()) {
+        for (NSString *raw in toRemove) {
+            NSString *cab = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (cab.length == 0 || ![g_moddedBundles containsObject:cab]) continue;
+            [g_moddedBundles removeObject:cab];
+            g_moddedBundlesDirty = YES;
+        }
+        for (NSString *raw in toAdd) {
+            NSString *cab = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            if (cab.length == 0 || [g_moddedBundles containsObject:cab]) continue;
+            [g_moddedBundles addObject:cab];
+            g_moddedBundlesDirty = YES;
+        }
+        needsFlush = g_moddedBundlesDirty;
+    }
+    if (!needsFlush) return;
+    if (zs_persist_current_settings_checked()) {
+        @synchronized (zs_modded_bundles_lock()) { g_moddedBundlesDirty = NO; }
+    } else {
+        ZLog(@"[ZSScripts] couldn't persist moddedBundles yet, will retry on the next change");
+    }
+}
+
 void zs_clear_modded_bundles(void) {
     zs_ensure_modded_bundles_loaded();
     BOOL changed = NO;

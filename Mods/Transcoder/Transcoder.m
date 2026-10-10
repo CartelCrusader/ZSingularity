@@ -2848,17 +2848,23 @@ static BOOL zt_files_have_identical_bytes(NSString *pathA, NSString *pathB) {
 
     NSDictionary<NSString *, NSString *> *manifest = [self bds_loadManifest];
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableOrderedSet<NSString *> *toAdd = [NSMutableOrderedSet orderedSet];
+    NSMutableOrderedSet<NSString *> *toRemove = [NSMutableOrderedSet orderedSet];
     for (NSString *backupKey in manifest) {
         NSString *livePath = manifest[backupKey];
         if (![livePath isKindOfClass:[NSString class]] || livePath.length == 0) continue;
         NSString *backupPath = [dir stringByAppendingPathComponent:[backupKey stringByAppendingString:kBackupSuffix]];
         if (![fm fileExistsAtPath:backupPath]) continue;
+        if (![fm fileExistsAtPath:livePath]) continue;
 
-        BOOL liveExists = [fm fileExistsAtPath:livePath];
-        BOOL modded = liveExists && !zt_files_have_identical_bytes(livePath, backupPath);
-        zt_set_modded(zt_cab_for_bundle_file(backupPath), modded);
-        if (liveExists) zt_set_modded(zt_cab_for_installed_bundle(livePath), modded);
+        NSString *backupCAB = zt_cab_for_bundle_file(backupPath);
+        NSString *liveCAB = zt_cab_for_installed_bundle(livePath);
+        NSMutableOrderedSet<NSString *> *target = zt_files_have_identical_bytes(livePath, backupPath) ? toRemove : toAdd;
+        if (backupCAB.length > 0) [target addObject:backupCAB];
+        if (liveCAB.length > 0) [target addObject:liveCAB];
     }
+    [toRemove minusOrderedSet:toAdd];
+    zs_apply_modded_bundle_changes(toAdd.array, toRemove.array);
 }
 
 + (BOOL)bds_fileAtPath:(NSString *)pathA hasIdenticalBytesToFileAtPath:(NSString *)pathB {

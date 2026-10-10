@@ -153,6 +153,8 @@ BOOL zs_bundle_is_modded(NSString *cab);
 
 void zs_set_bundle_modded(NSString *cab, BOOL modded);
 
+void zs_apply_modded_bundle_changes(NSArray<NSString *> *toAdd, NSArray<NSString *> *toRemove);
+
 void zs_clear_modded_bundles(void);
 
 #pragma mark - File index (Mod Loader Pipeline caching - see UnityBundleTools.h)
