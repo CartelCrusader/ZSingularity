@@ -5930,6 +5930,7 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 @property (nonatomic, weak) NSLayoutConstraint *zsFloatingFieldBottomConstraint;
 @property (nonatomic, copy) void (^zsFloatingFieldCompletion)(NSString * _Nullable trimmedText);
 @property (nonatomic, strong) UIView *zsFloatingFieldButtonRow;
+@property (nonatomic, strong) UILabel *zsFloatingFieldHintLabel;
 @property (nonatomic, copy) void (^zsFloatingFieldResetHandler)(void);
 
 @property (nonatomic, strong) UIButton *syslogButton;
@@ -8081,6 +8082,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     self.zsFloatingFieldBackdrop = nil;
     self.zsFloatingFieldContainer = nil;
     self.zsFloatingFieldButtonRow = nil;
+    self.zsFloatingFieldHintLabel = nil;
     self.zsFloatingFieldResetHandler = nil;
     self.zsFloatingField = nil;
 
@@ -11580,6 +11582,7 @@ static BOOL zs_keep_alive_background_mode_declared(void) {
     [self zs_presentFloatingTextFieldWithInitialText:zs_custom_greeting_text()
                                           placeholder:@"Greeting text"
                                                secure:NO
+                                             hintText:@"Note: Client side only, others won\u2019t see this."
                                          resetHandler:^{
         zs_set_custom_greeting_text(@"");
         [weakSelf zs_refreshCustomGreetingRow];
@@ -11795,6 +11798,7 @@ static BOOL zs_keep_alive_background_mode_declared(void) {
     __weak typeof(self) weakSelf = self;
     [self zs_promptForModFolderNameWithTitle:@"New Mod Folder"
                                   actionTitle:@"Create"
+                                     hintText:@"Create a new folder to add mods to it."
                                    completion:^(NSString *trimmedName) {
         typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
@@ -12868,25 +12872,22 @@ static const NSTimeInterval kDoctorPollInterval = 6.0;
 - (void)zs_promptForModFolderNameWithTitle:(NSString *)title
                                 actionTitle:(NSString *)actionTitle
                                  completion:(void (^)(NSString *trimmedName))completion {
-    UIViewController *presenter = zs_key_window().rootViewController;
-    if (!presenter) return;
+    [self zs_promptForModFolderNameWithTitle:title actionTitle:actionTitle hintText:nil completion:completion];
+}
 
-    UIAlertController *prompt = [UIAlertController alertControllerWithTitle:title
-                                                                      message:nil
-                                                               preferredStyle:UIAlertControllerStyleAlert];
-    [prompt addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"Folder name";
-        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        field.autocorrectionType = UITextAutocorrectionTypeNo;
+- (void)zs_promptForModFolderNameWithTitle:(NSString *)title
+                                actionTitle:(NSString *)actionTitle
+                                   hintText:(NSString *)hintText
+                                 completion:(void (^)(NSString *trimmedName))completion {
+    [self zs_presentFloatingTextFieldWithInitialText:nil
+                                          placeholder:@"Folder name"
+                                               secure:NO
+                                             hintText:hintText
+                                         resetHandler:nil
+                                           completion:^(NSString * _Nullable trimmedText) {
+        if (trimmedText.length == 0) return;
+        completion(trimmedText);
     }];
-    [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [prompt addAction:[UIAlertAction actionWithTitle:actionTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *trimmed = [(prompt.textFields.firstObject.text ?: @"")
-            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (trimmed.length == 0) return;
-        completion(trimmed);
-    }]];
-    [presenter presentViewController:prompt animated:YES completion:nil];
 }
 
 - (void)zs_rebuildModsLibrary {
@@ -13778,6 +13779,20 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
                                              secure:(BOOL)secure
                                        resetHandler:(void (^)(void))resetHandler
                                          completion:(void (^)(NSString * _Nullable trimmedText))completion {
+    [self zs_presentFloatingTextFieldWithInitialText:initialText
+                                          placeholder:placeholder
+                                               secure:secure
+                                             hintText:nil
+                                         resetHandler:resetHandler
+                                           completion:completion];
+}
+
+- (void)zs_presentFloatingTextFieldWithInitialText:(NSString *)initialText
+                                        placeholder:(NSString *)placeholder
+                                             secure:(BOOL)secure
+                                           hintText:(NSString *)hintText
+                                       resetHandler:(void (^)(void))resetHandler
+                                         completion:(void (^)(NSString * _Nullable trimmedText))completion {
     UIView *unityView = zs_ui_host_view();
     if (!unityView) return;
     if (self.zsFloatingField) {
@@ -13869,6 +13884,33 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         [cancelButton.widthAnchor constraintGreaterThanOrEqualToConstant:60],
     ]];
 
+    UILabel *hintLabel = nil;
+    if (hintText.length > 0) {
+        hintLabel = [[UILabel alloc] init];
+        hintLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        hintLabel.text = hintText;
+        hintLabel.font = zs_mono_font(10, UIFontWeightRegular);
+        hintLabel.textColor = [UIColor colorWithWhite:1 alpha:0.78];
+        hintLabel.numberOfLines = 0;
+        hintLabel.backgroundColor = UIColor.clearColor;
+        hintLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+        hintLabel.layer.shadowOpacity = 0.9;
+        hintLabel.layer.shadowRadius = 2;
+        hintLabel.layer.shadowOffset = CGSizeMake(0, 1);
+        hintLabel.layer.masksToBounds = NO;
+        hintLabel.alpha = 0;
+        [unityView addSubview:hintLabel];
+        zs_mark_host_owned(hintLabel);
+        zs_force_dark(hintLabel);
+        [unityView bringSubviewToFront:hintLabel];
+        self.zsFloatingFieldHintLabel = hintLabel;
+        [NSLayoutConstraint activateConstraints:@[
+            [hintLabel.leadingAnchor constraintEqualToAnchor:buttonRow.trailingAnchor constant:12],
+            [hintLabel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+            [hintLabel.centerYAnchor constraintEqualToAnchor:buttonRow.centerYAnchor],
+        ]];
+    }
+
     CGFloat bottomInset = unityView.safeAreaInsets.bottom + 291;
     if (!CGRectIsEmpty(self.zs_lastKeyboardFrame)) {
         CGFloat inset = CGRectGetHeight(unityView.bounds) - CGRectGetMinY(self.zs_lastKeyboardFrame);
@@ -13880,6 +13922,7 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     [UIView animateWithDuration:0.15 animations:^{
         container.alpha = 1;
         buttonRow.alpha = 1;
+        hintLabel.alpha = 1;
     }];
 
     [field becomeFirstResponder];
@@ -13920,9 +13963,11 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     UIView *backdrop = self.zsFloatingFieldBackdrop;
     UIView *container = self.zsFloatingFieldContainer;
     UIView *buttonRow = self.zsFloatingFieldButtonRow;
+    UIView *hintLabel = self.zsFloatingFieldHintLabel;
     self.zsFloatingFieldBackdrop = nil;
     self.zsFloatingFieldContainer = nil;
     self.zsFloatingFieldButtonRow = nil;
+    self.zsFloatingFieldHintLabel = nil;
     self.zsFloatingFieldResetHandler = nil;
     self.zsFloatingField = nil;
     self.zsFloatingFieldBottomConstraint = nil;
@@ -13936,10 +13981,12 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         backdrop.alpha = 0;
         container.alpha = 0;
         buttonRow.alpha = 0;
+        hintLabel.alpha = 0;
     } completion:^(BOOL finished) {
         [backdrop removeFromSuperview];
         [container removeFromSuperview];
         [buttonRow removeFromSuperview];
+        [hintLabel removeFromSuperview];
     }];
 
     if (saving && completion) {
@@ -18506,6 +18553,7 @@ static void zs_memory_page_insets(UIView *overlay, CGFloat *leftOut, CGFloat *ri
     [self zs_presentFloatingTextFieldWithInitialText:nil
                                           placeholder:@"add keyword(s)"
                                                secure:NO
+                                             hintText:@"TIP: Separate entries with commas, (ie. ZSingularity, Glory-to-NCorp, 0xDEADBEEF)"
                                          resetHandler:nil
                                            completion:^(NSString * _Nullable trimmedText) {
         if (trimmedText.length == 0) return;
