@@ -5929,6 +5929,8 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 @property (nonatomic, strong) UITextField *zsFloatingField;
 @property (nonatomic, weak) NSLayoutConstraint *zsFloatingFieldBottomConstraint;
 @property (nonatomic, copy) void (^zsFloatingFieldCompletion)(NSString * _Nullable trimmedText);
+@property (nonatomic, strong) UIView *zsFloatingFieldButtonRow;
+@property (nonatomic, copy) void (^zsFloatingFieldResetHandler)(void);
 
 @property (nonatomic, strong) UIButton *syslogButton;
 @property (nonatomic, assign) BOOL syslogDebugModeEnabled;
@@ -8078,6 +8080,8 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
 
     self.zsFloatingFieldBackdrop = nil;
     self.zsFloatingFieldContainer = nil;
+    self.zsFloatingFieldButtonRow = nil;
+    self.zsFloatingFieldResetHandler = nil;
     self.zsFloatingField = nil;
 
     self.normalFpsSlider = nil;
@@ -11565,6 +11569,27 @@ static BOOL zs_keep_alive_background_mode_declared(void) {
 
 
 
+- (void)zs_refreshCustomGreetingRow {
+    if (self.customGreetingRow) {
+        zs_disclosure_row_set_value(self.customGreetingRow, zs_custom_greeting_button_title(zs_custom_greeting_text()));
+    }
+}
+
+- (void)zs_customGreetingTextButtonTapped:(id)sender {
+    __weak typeof(self) weakSelf = self;
+    [self zs_presentFloatingTextFieldWithInitialText:zs_custom_greeting_text()
+                                          placeholder:@"Greeting text"
+                                               secure:NO
+                                         resetHandler:^{
+        zs_set_custom_greeting_text(@"");
+        [weakSelf zs_refreshCustomGreetingRow];
+    }
+                                           completion:^(NSString * _Nullable trimmedText) {
+        zs_set_custom_greeting_text(trimmedText ?: @"");
+        [weakSelf zs_refreshCustomGreetingRow];
+    }];
+}
+
 - (void)deleteSpecificAssetTapped {
     UIViewController *presenter = zs_key_window().rootViewController;
     if (!presenter) return;
@@ -13741,6 +13766,18 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
                                         placeholder:(NSString *)placeholder
                                              secure:(BOOL)secure
                                          completion:(void (^)(NSString * _Nullable trimmedText))completion {
+    [self zs_presentFloatingTextFieldWithInitialText:initialText
+                                          placeholder:placeholder
+                                               secure:secure
+                                         resetHandler:nil
+                                           completion:completion];
+}
+
+- (void)zs_presentFloatingTextFieldWithInitialText:(NSString *)initialText
+                                        placeholder:(NSString *)placeholder
+                                             secure:(BOOL)secure
+                                       resetHandler:(void (^)(void))resetHandler
+                                         completion:(void (^)(NSString * _Nullable trimmedText))completion {
     UIView *unityView = zs_ui_host_view();
     if (!unityView) return;
     if (self.zsFloatingField) {
@@ -13748,6 +13785,7 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     }
 
     self.zsFloatingFieldCompletion = completion;
+    self.zsFloatingFieldResetHandler = resetHandler;
 
     UIView *backdrop = [[UIView alloc] init];
     backdrop.translatesAutoresizingMaskIntoConstraints = NO;
@@ -13797,6 +13835,40 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         [container.heightAnchor constraintEqualToConstant:44],
     ]];
 
+    UIButton *saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *cancelButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIFont *buttonFont = zs_mono_font(11, UIFontWeightSemibold);
+    zs_style_button_as_native_glass_with_font(saveButton, @"Save", zs_accent_green_color(), buttonFont);
+    zs_style_button_as_native_glass_with_font(resetButton, @"Reset", [UIColor colorWithRed:1.0 green:0.72 blue:0.3 alpha:1.0], buttonFont);
+    zs_style_button_as_native_glass_with_font(cancelButton, @"Cancel", [UIColor colorWithWhite:1 alpha:0.85], buttonFont);
+    [saveButton addTarget:self action:@selector(zs_floatingFieldSaveTapped) forControlEvents:UIControlEventTouchUpInside];
+    [resetButton addTarget:self action:@selector(zs_floatingFieldResetTapped) forControlEvents:UIControlEventTouchUpInside];
+    [cancelButton addTarget:self action:@selector(zs_floatingFieldCancelTapped) forControlEvents:UIControlEventTouchUpInside];
+
+    NSArray<UIView *> *rowButtons = resetHandler ? @[saveButton, resetButton, cancelButton] : @[saveButton, cancelButton];
+    UIStackView *buttonRow = [[UIStackView alloc] initWithArrangedSubviews:rowButtons];
+    buttonRow.translatesAutoresizingMaskIntoConstraints = NO;
+    buttonRow.axis = UILayoutConstraintAxisHorizontal;
+    buttonRow.spacing = 8;
+    buttonRow.alignment = UIStackViewAlignmentCenter;
+    buttonRow.alpha = 0;
+    [unityView addSubview:buttonRow];
+    zs_mark_host_owned(buttonRow);
+    zs_force_dark(buttonRow);
+    [unityView bringSubviewToFront:buttonRow];
+    self.zsFloatingFieldButtonRow = buttonRow;
+    [NSLayoutConstraint activateConstraints:@[
+        [buttonRow.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [buttonRow.bottomAnchor constraintEqualToAnchor:container.topAnchor constant:-8],
+        [saveButton.heightAnchor constraintEqualToConstant:30],
+        [resetButton.heightAnchor constraintEqualToConstant:30],
+        [cancelButton.heightAnchor constraintEqualToConstant:30],
+        [saveButton.widthAnchor constraintGreaterThanOrEqualToConstant:60],
+        [resetButton.widthAnchor constraintGreaterThanOrEqualToConstant:60],
+        [cancelButton.widthAnchor constraintGreaterThanOrEqualToConstant:60],
+    ]];
+
     CGFloat bottomInset = unityView.safeAreaInsets.bottom + 291;
     if (!CGRectIsEmpty(self.zs_lastKeyboardFrame)) {
         CGFloat inset = CGRectGetHeight(unityView.bounds) - CGRectGetMinY(self.zs_lastKeyboardFrame);
@@ -13807,6 +13879,7 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 
     [UIView animateWithDuration:0.15 animations:^{
         container.alpha = 1;
+        buttonRow.alpha = 1;
     }];
 
     [field becomeFirstResponder];
@@ -13846,21 +13919,27 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 
     UIView *backdrop = self.zsFloatingFieldBackdrop;
     UIView *container = self.zsFloatingFieldContainer;
+    UIView *buttonRow = self.zsFloatingFieldButtonRow;
     self.zsFloatingFieldBackdrop = nil;
     self.zsFloatingFieldContainer = nil;
+    self.zsFloatingFieldButtonRow = nil;
+    self.zsFloatingFieldResetHandler = nil;
     self.zsFloatingField = nil;
     self.zsFloatingFieldBottomConstraint = nil;
     self.zsFloatingFieldCompletion = nil;
 
     backdrop.userInteractionEnabled = NO;
     container.userInteractionEnabled = NO;
+    buttonRow.userInteractionEnabled = NO;
 
     [UIView animateWithDuration:0.15 animations:^{
         backdrop.alpha = 0;
         container.alpha = 0;
+        buttonRow.alpha = 0;
     } completion:^(BOOL finished) {
         [backdrop removeFromSuperview];
         [container removeFromSuperview];
+        [buttonRow removeFromSuperview];
     }];
 
     if (saving && completion) {
@@ -13874,6 +13953,31 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 
 - (void)zs_floatingFieldBackdropTapped {
     [self.zsFloatingField resignFirstResponder];
+}
+
+- (void)zs_floatingFieldSaveTapped {
+    [self.zsFloatingField resignFirstResponder];
+}
+
+- (void)zs_floatingFieldResetTapped {
+    UITextField *field = self.zsFloatingField;
+    if (!field) return;
+    void (^resetHandler)(void) = self.zsFloatingFieldResetHandler;
+    if (resetHandler) {
+        [self zs_commitFloatingFieldSaving:NO];
+        [field resignFirstResponder];
+        resetHandler();
+        return;
+    }
+    field.text = @"";
+    [field resignFirstResponder];
+}
+
+- (void)zs_floatingFieldCancelTapped {
+    UITextField *field = self.zsFloatingField;
+    if (!field) return;
+    [self zs_commitFloatingFieldSaving:NO];
+    [field resignFirstResponder];
 }
 
 - (void)zs_promptForModRemarkForEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
@@ -18361,6 +18465,10 @@ static void zs_memory_page_insets(UIView *overlay, CGFloat *leftOut, CGFloat *ri
 }
 
 - (BOOL)textFieldShouldBeginEditing:(UITextField *)textField {
+    if (textField == self.syslogBlacklistField) {
+        [self zs_presentSyslogBlacklistEditor];
+        return NO;
+    }
     return YES;
 }
 
@@ -18387,6 +18495,25 @@ static void zs_memory_page_insets(UIView *overlay, CGFloat *leftOut, CGFloat *ri
     if (textField != self.syslogBlacklistField) return YES;
 
     NSString *raw = textField.text ?: @"";
+    textField.text = @"";
+    [self zs_applySyslogBlacklistInput:raw];
+    [textField resignFirstResponder];
+    return YES;
+}
+
+- (void)zs_presentSyslogBlacklistEditor {
+    __weak typeof(self) weakSelf = self;
+    [self zs_presentFloatingTextFieldWithInitialText:nil
+                                          placeholder:@"add keyword(s)"
+                                               secure:NO
+                                         resetHandler:nil
+                                           completion:^(NSString * _Nullable trimmedText) {
+        if (trimmedText.length == 0) return;
+        [weakSelf zs_applySyslogBlacklistInput:trimmedText];
+    }];
+}
+
+- (void)zs_applySyslogBlacklistInput:(NSString *)raw {
     BOOL added = NO;
     for (NSString *piece in [raw componentsSeparatedByString:@","]) {
         NSString *term = [piece stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].lowercaseString;
@@ -18395,7 +18522,6 @@ static void zs_memory_page_insets(UIView *overlay, CGFloat *leftOut, CGFloat *ri
         [self.syslogBlacklist addObject:term];
     }
 
-    textField.text = @"";
     if (added) {
         g_syslogBlacklist = self.syslogBlacklist.array;
         [self zs_rebuildSyslogBlacklistEntries];
@@ -18403,8 +18529,6 @@ static void zs_memory_page_insets(UIView *overlay, CGFloat *leftOut, CGFloat *ri
         [self reapplySyslogBlacklistFilter];
         ZLog(@"[UserInterface] syslog blacklist updated, now %lu term(s)", (unsigned long)self.syslogBlacklist.count);
     }
-    [textField resignFirstResponder];
-    return YES;
 }
 
 - (void)zs_rebuildSyslogBlacklistEntries {
