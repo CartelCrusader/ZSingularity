@@ -5590,6 +5590,17 @@ static void zs_parseSyslogLineHeader(NSString *line, NSString **outHeader, NSStr
 
 static const CGFloat kZSSyslogIndexColumnWidth = 22;
 
+@interface ZSAssetPreviewClipView : UIView
+@property (nonatomic, weak) UIView *contentView;
+@end
+
+@implementation ZSAssetPreviewClipView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.hidden || self.contentView.hidden) return nil;
+    return [super hitTest:point withEvent:event];
+}
+@end
+
 @interface ZSAssetCheckerboardView : UIView
 @end
 
@@ -5970,6 +5981,12 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 @property (nonatomic, strong) UIButton *assetExplorerTextureBackButton;
 @property (nonatomic, strong) UIButton *assetExplorerTextureExportButton;
 @property (nonatomic, strong) UIImageView *assetExplorerTextureImageView;
+@property (nonatomic, strong) UIView *assetExplorerPreviewClipView;
+@property (nonatomic, assign) CGFloat assetExplorerPreviewScale;
+@property (nonatomic, assign) CGPoint assetExplorerPreviewOffset;
+@property (nonatomic, assign) CGFloat assetExplorerPreviewGestureBaseScale;
+@property (nonatomic, assign) CGPoint assetExplorerPreviewGestureBaseOffset;
+@property (nonatomic, assign) CGPoint assetExplorerPreviewGestureFocal;
 @property (nonatomic, strong) UITextView *assetExplorerTextView;
 @property (nonatomic, strong) UILabel *assetExplorerTextureMessageLabel;
 @property (nonatomic, strong) UILabel *assetExplorerTextureCaptionLabel;
@@ -8081,6 +8098,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     self.assetExplorerTextureBackButton = nil;
     self.assetExplorerTextureExportButton = nil;
     self.assetExplorerTextureImageView = nil;
+    self.assetExplorerPreviewClipView = nil;
     self.assetExplorerTextView = nil;
     self.assetExplorerTextureMessageLabel = nil;
     self.assetExplorerTextureCaptionLabel = nil;
@@ -8171,6 +8189,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
 
 - (void)panelSwiped:(UIPanGestureRecognizer *)gesture {
     if (!self.panelOpen) return;
+    if (self.assetExplorerFullScreenOpen && self.assetExplorerTextureOpen && self.assetExplorerPreviewScale > 1.01) return;
     if (gesture.state != UIGestureRecognizerStateEnded) return;
     CGPoint translation = [gesture translationInView:self.contentOverlay ?: gesture.view];
     BOOL mostlyHorizontal = fabs(translation.x) > fabs(translation.y) * 1.5;
@@ -15225,6 +15244,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
 }
 
 - (void)zs_fullScreenPinched:(UIPinchGestureRecognizer *)pinch {
+    if (self.assetExplorerFullScreenOpen && self.assetExplorerTextureOpen) return;
     if (pinch.state != UIGestureRecognizerStateChanged) return;
     if (pinch.numberOfTouches < 2 || pinch.scale > 0.8) return;
     pinch.enabled = NO;
@@ -15399,10 +15419,33 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     textureImageView.contentMode = UIViewContentModeScaleAspectFit;
     textureImageView.backgroundColor = UIColor.clearColor;
     textureImageView.userInteractionEnabled = YES;
-    [textureImageView addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(zs_assetExplorerPreviewTapped)]];
+    UITapGestureRecognizer *previewTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(zs_assetExplorerPreviewTapped)];
+    UITapGestureRecognizer *previewDoubleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(zs_assetExplorerPreviewDoubleTapped:)];
+    previewDoubleTap.numberOfTapsRequired = 2;
+    previewDoubleTap.delegate = self;
+    [previewTap requireGestureRecognizerToFail:previewDoubleTap];
+    [textureImageView addGestureRecognizer:previewTap];
+    [textureImageView addGestureRecognizer:previewDoubleTap];
     textureImageView.hidden = YES;
-    [overlay addSubview:textureImageView];
+
+    ZSAssetPreviewClipView *previewClip = [[ZSAssetPreviewClipView alloc] init];
+    previewClip.translatesAutoresizingMaskIntoConstraints = NO;
+    previewClip.backgroundColor = UIColor.clearColor;
+    previewClip.clipsToBounds = YES;
+    previewClip.contentView = textureImageView;
+    UIPinchGestureRecognizer *previewPinch = [[UIPinchGestureRecognizer alloc] initWithTarget:self action:@selector(zs_assetExplorerPreviewPinched:)];
+    previewPinch.delegate = self;
+    UIPanGestureRecognizer *previewPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(zs_assetExplorerPreviewPanned:)];
+    previewPan.delegate = self;
+    previewPan.maximumNumberOfTouches = 2;
+    [previewClip addGestureRecognizer:previewPinch];
+    [previewClip addGestureRecognizer:previewPan];
+    [previewClip addSubview:textureImageView];
+    [overlay addSubview:previewClip];
     self.assetExplorerTextureImageView = textureImageView;
+    self.assetExplorerPreviewClipView = previewClip;
+    self.assetExplorerPreviewScale = 1;
+    self.assetExplorerPreviewOffset = CGPointZero;
 
     UITextView *textView = [[UITextView alloc] init];
     textView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -15619,10 +15662,15 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
         [textureCaption.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
         [textureCaption.bottomAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.bottomAnchor constant:-8],
 
-        [textureImageView.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
-        [textureImageView.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
-        [textureImageView.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
-        [textureImageView.bottomAnchor constraintEqualToAnchor:textureCaption.topAnchor constant:-8],
+        [previewClip.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
+        [previewClip.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
+        [previewClip.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
+        [previewClip.bottomAnchor constraintEqualToAnchor:textureCaption.topAnchor constant:-8],
+
+        [textureImageView.topAnchor constraintEqualToAnchor:previewClip.topAnchor],
+        [textureImageView.leadingAnchor constraintEqualToAnchor:previewClip.leadingAnchor],
+        [textureImageView.trailingAnchor constraintEqualToAnchor:previewClip.trailingAnchor],
+        [textureImageView.bottomAnchor constraintEqualToAnchor:previewClip.bottomAnchor],
 
         [textView.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
         [textView.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
@@ -15750,7 +15798,117 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerFullScreenOverlay.hidden = YES;
 }
 
+- (void)zs_assetExplorerApplyPreviewTransform {
+    UIImageView *imageView = self.assetExplorerTextureImageView;
+    if (!imageView) return;
+    CGFloat scale = self.assetExplorerPreviewScale > 0 ? self.assetExplorerPreviewScale : 1;
+    CGPoint offset = self.assetExplorerPreviewOffset;
+    imageView.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(offset.x, offset.y), scale, scale);
+    imageView.layer.magnificationFilter = scale >= 3 ? kCAFilterNearest : kCAFilterLinear;
+}
+
+- (CGPoint)zs_assetExplorerClampedPreviewOffset:(CGPoint)offset scale:(CGFloat)scale {
+    CGSize size = self.assetExplorerPreviewClipView.bounds.size;
+    CGFloat maxX = MAX(0, (size.width * scale - size.width) / 2);
+    CGFloat maxY = MAX(0, (size.height * scale - size.height) / 2);
+    offset.x = MIN(MAX(offset.x, -maxX), maxX);
+    offset.y = MIN(MAX(offset.y, -maxY), maxY);
+    return offset;
+}
+
+- (void)zs_assetExplorerResetPreviewZoomAnimated:(BOOL)animated {
+    self.assetExplorerPreviewScale = 1;
+    self.assetExplorerPreviewOffset = CGPointZero;
+    if (!animated) {
+        [self zs_assetExplorerApplyPreviewTransform];
+        return;
+    }
+    [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction animations:^{
+        [self zs_assetExplorerApplyPreviewTransform];
+    } completion:nil];
+}
+
+- (void)zs_assetExplorerPreviewPinched:(UIPinchGestureRecognizer *)pinch {
+    UIView *clip = self.assetExplorerPreviewClipView;
+    if (!clip || !self.assetExplorerTextureOpen || self.assetExplorerTextureImageView.hidden) return;
+    CGPoint center = CGPointMake(CGRectGetMidX(clip.bounds), CGRectGetMidY(clip.bounds));
+    CGFloat currentScale = self.assetExplorerPreviewScale > 0 ? self.assetExplorerPreviewScale : 1;
+    switch (pinch.state) {
+        case UIGestureRecognizerStateBegan: {
+            CGPoint location = [pinch locationInView:clip];
+            self.assetExplorerPreviewGestureBaseScale = currentScale;
+            self.assetExplorerPreviewGestureBaseOffset = self.assetExplorerPreviewOffset;
+            self.assetExplorerPreviewGestureFocal = CGPointMake(location.x - center.x, location.y - center.y);
+            break;
+        }
+        case UIGestureRecognizerStateChanged: {
+            CGFloat base = self.assetExplorerPreviewGestureBaseScale > 0 ? self.assetExplorerPreviewGestureBaseScale : 1;
+            CGFloat scale = MIN(MAX(base * pinch.scale, 0.4), 16);
+            CGPoint startOffset = self.assetExplorerPreviewGestureBaseOffset;
+            CGPoint startFocal = self.assetExplorerPreviewGestureFocal;
+            CGPoint content = CGPointMake((startFocal.x - startOffset.x) / base, (startFocal.y - startOffset.y) / base);
+            CGPoint location = [pinch locationInView:clip];
+            CGPoint focal = CGPointMake(location.x - center.x, location.y - center.y);
+            CGPoint offset = CGPointMake(focal.x - content.x * scale, focal.y - content.y * scale);
+            self.assetExplorerPreviewScale = scale;
+            self.assetExplorerPreviewOffset = [self zs_assetExplorerClampedPreviewOffset:offset scale:scale];
+            [self zs_assetExplorerApplyPreviewTransform];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed:
+            if (currentScale < 1) {
+                [self zs_assetExplorerResetPreviewZoomAnimated:YES];
+            } else {
+                self.assetExplorerPreviewOffset = [self zs_assetExplorerClampedPreviewOffset:self.assetExplorerPreviewOffset scale:currentScale];
+                [self zs_assetExplorerApplyPreviewTransform];
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+- (void)zs_assetExplorerPreviewPanned:(UIPanGestureRecognizer *)pan {
+    UIView *clip = self.assetExplorerPreviewClipView;
+    if (!clip || !self.assetExplorerTextureOpen || self.assetExplorerTextureImageView.hidden) return;
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        self.assetExplorerPreviewGestureBaseOffset = self.assetExplorerPreviewOffset;
+        return;
+    }
+    if (pan.state != UIGestureRecognizerStateChanged) return;
+    if (pan.numberOfTouches > 1) return;
+    CGFloat scale = self.assetExplorerPreviewScale > 0 ? self.assetExplorerPreviewScale : 1;
+    if (scale <= 1.01) return;
+    CGPoint translation = [pan translationInView:clip];
+    CGPoint base = self.assetExplorerPreviewGestureBaseOffset;
+    CGPoint offset = CGPointMake(base.x + translation.x, base.y + translation.y);
+    self.assetExplorerPreviewOffset = [self zs_assetExplorerClampedPreviewOffset:offset scale:scale];
+    [self zs_assetExplorerApplyPreviewTransform];
+}
+
+- (void)zs_assetExplorerPreviewDoubleTapped:(UITapGestureRecognizer *)tap {
+    UIView *clip = self.assetExplorerPreviewClipView;
+    if (!clip || tap.state != UIGestureRecognizerStateEnded) return;
+    CGFloat scale = self.assetExplorerPreviewScale > 0 ? self.assetExplorerPreviewScale : 1;
+    if (fabs(scale - 1) > 0.01) {
+        [self zs_assetExplorerResetPreviewZoomAnimated:YES];
+        return;
+    }
+    CGPoint location = [tap locationInView:clip];
+    CGPoint focal = CGPointMake(location.x - CGRectGetMidX(clip.bounds), location.y - CGRectGetMidY(clip.bounds));
+    CGFloat target = 3;
+    CGPoint offset = CGPointMake(focal.x - focal.x * target, focal.y - focal.y * target);
+    self.assetExplorerPreviewScale = target;
+    self.assetExplorerPreviewOffset = [self zs_assetExplorerClampedPreviewOffset:offset scale:target];
+    [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction animations:^{
+        [self zs_assetExplorerApplyPreviewTransform];
+    } completion:nil];
+}
+
 - (void)zs_assetExplorerSetTextureModeVisible:(BOOL)visible {
+    [self zs_assetExplorerResetPreviewZoomAnimated:NO];
     self.assetExplorerTextureOpen = visible;
     self.assetExplorerTableView.hidden = visible;
     self.assetExplorerTitleLabel.hidden = visible;
@@ -15819,6 +15977,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerTextureImageView.alpha = 1;
     self.assetExplorerVisual = nil;
     self.assetExplorerPageIndex = 0;
+    [self zs_assetExplorerResetPreviewZoomAnimated:NO];
     self.assetExplorerTextureImageView.image = nil;
     self.assetExplorerTextureImageView.hidden = NO;
     self.assetExplorerTextView.hidden = YES;
@@ -15884,6 +16043,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerLivePaused = NO;
     self.assetExplorerLiveElapsed = 0;
     self.assetExplorerTextureImageView.alpha = 1;
+    [self zs_assetExplorerResetPreviewZoomAnimated:NO];
     self.assetExplorerTextureImageView.image = nil;
     self.assetExplorerTextureMessageLabel.hidden = YES;
     [self.assetExplorerTextureSpinner startAnimating];
@@ -16707,27 +16867,19 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 - (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
     if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle || self.assetExplorerDisplayedBundles.count == 0) return nil;
 
-    UIVisualEffectView *header = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-    UIView *stripes = [[UIView alloc] init];
-    stripes.translatesAutoresizingMaskIntoConstraints = NO;
-    stripes.userInteractionEnabled = NO;
-    stripes.backgroundColor = [UIColor colorWithWhite:0 alpha:0.38];
-    [header.contentView addSubview:stripes];
+    UIView *header = [[UIView alloc] init];
+    header.backgroundColor = [UIColor colorWithWhite:0 alpha:0.38];
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     label.font = zs_mono_font(10, UIFontWeightSemibold);
     label.textColor = [UIColor colorWithWhite:1 alpha:0.7];
     label.text = [self zs_assetExplorerSectionIsModded:section] ? @"MODDED" : @"STOCK";
-    [header.contentView addSubview:label];
-    UILayoutGuide *safeArea = header.contentView.safeAreaLayoutGuide;
+    [header addSubview:label];
+    UILayoutGuide *safeArea = header.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [stripes.leadingAnchor constraintEqualToAnchor:header.contentView.leadingAnchor],
-        [stripes.trailingAnchor constraintEqualToAnchor:header.contentView.trailingAnchor],
-        [stripes.topAnchor constraintEqualToAnchor:header.contentView.topAnchor],
-        [stripes.bottomAnchor constraintEqualToAnchor:header.contentView.bottomAnchor],
         [label.leadingAnchor constraintEqualToAnchor:safeArea.leadingAnchor constant:kPanelPadding],
         [label.trailingAnchor constraintLessThanOrEqualToAnchor:safeArea.trailingAnchor constant:-kPanelPadding],
-        [label.centerYAnchor constraintEqualToAnchor:header.contentView.centerYAnchor],
+        [label.centerYAnchor constraintEqualToAnchor:header.centerYAnchor],
     ]];
     return header;
 }
