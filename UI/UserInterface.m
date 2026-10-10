@@ -7,6 +7,7 @@
 #import <objc/message.h>
 #import <Metal/Metal.h>
 #import <os/lock.h>
+#import <sys/stat.h>
 #import <string.h>
 #import "ZSEngine.h"
 #import "ZSDiagnostics.h"
@@ -15679,20 +15680,34 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSArray<ZSAssetExplorerBundle *> *bundles = [ZSAssetExplorer cachedBundles:&error];
+        void (^deliver)(NSArray<ZSAssetExplorerBundle *> *, NSError *) = ^(NSArray<ZSAssetExplorerBundle *> *list, NSError *deliverError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen || strongSelf.assetExplorerGeneration != generation) return;
+                strongSelf.assetExplorerBundles = list ?: @[];
+                strongSelf.assetExplorerStatusMessage = deliverError ? deliverError.localizedDescription : nil;
+                [strongSelf zs_assetExplorerRefreshListResettingScroll:NO];
+                [strongSelf zs_assetExplorerSyncControls];
+            });
+        };
+        deliver(bundles, error);
+
+        NSArray<NSString *> *moddedBefore = zs_modded_bundle_cabs();
+        NSDictionary *indexBefore = [ZSFileIndex persistedCABMap];
         static dispatch_once_t reconcileOnce;
         dispatch_once(&reconcileOnce, ^{
             [ZTranscoderInstaller reconcileModdedBundles];
         });
-        NSError *error = nil;
-        NSArray<ZSAssetExplorerBundle *> *bundles = [ZSAssetExplorer cachedBundles:&error];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            typeof(self) strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen || strongSelf.assetExplorerGeneration != generation) return;
-            strongSelf.assetExplorerBundles = bundles ?: @[];
-            strongSelf.assetExplorerStatusMessage = error ? error.localizedDescription : nil;
-            [strongSelf zs_assetExplorerRefreshListResettingScroll:NO];
-            [strongSelf zs_assetExplorerSyncControls];
-        });
+        [ZSFileIndex ensureIndexUpToDate];
+        NSDictionary *indexAfter = [ZSFileIndex persistedCABMap];
+        BOOL moddedChanged = ![moddedBefore isEqualToArray:zs_modded_bundle_cabs()];
+        BOOL indexChanged = indexBefore != indexAfter && ![indexBefore isEqualToDictionary:indexAfter];
+        if (!moddedChanged && !indexChanged) return;
+        NSError *refreshError = nil;
+        NSArray<ZSAssetExplorerBundle *> *refreshed = indexChanged ? [ZSAssetExplorer cachedBundles:&refreshError] : bundles;
+        deliver(refreshed, indexChanged ? refreshError : error);
     });
 }
 
@@ -16444,8 +16459,9 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         if (bySize) {
             sizes = [NSMutableDictionary dictionary];
             for (ZSAssetExplorerBundle *bundle in self.assetExplorerBundles) {
-                NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:bundle.filePath error:nil];
-                sizes[bundle.filePath] = attributes[NSFileSize] ?: @0;
+                struct stat fileStat;
+                unsigned long long fileSize = (bundle.filePath.length > 0 && stat(bundle.filePath.fileSystemRepresentation, &fileStat) == 0) ? (unsigned long long)fileStat.st_size : 0;
+                sizes[bundle.filePath] = @(fileSize);
             }
         }
         self.assetExplorerBundleSizes = sizes;
@@ -16654,6 +16670,28 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     self.assetExplorerFilterButton.showsMenuAsPrimaryAction = YES;
 }
 
+static UIColor *zs_zebra_strip_pattern_color(BOOL modded) {
+    static UIColor *moddedColor = nil;
+    static UIColor *stockColor = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const CGFloat bandHeight = 6;
+        UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+        format.opaque = NO;
+        UIColor *(^makePattern)(UIColor *) = ^UIColor *(UIColor *tint) {
+            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1, bandHeight * 2) format:format];
+            UIImage *tile = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+                CGContextSetFillColorWithColor(context.CGContext, tint.CGColor);
+                CGContextFillRect(context.CGContext, CGRectMake(0, 0, 1, bandHeight));
+            }];
+            return [UIColor colorWithPatternImage:tile];
+        };
+        moddedColor = makePattern([zs_accent_green_color() colorWithAlphaComponent:0.22]);
+        stockColor = makePattern([UIColor colorWithRed:0.45 green:0.62 blue:1.0 alpha:0.16]);
+    });
+    return modded ? moddedColor : stockColor;
+}
+
 - (NSUInteger)zs_assetExplorerModdedDisplayCount {
     return MIN(self.assetExplorerDisplayedModdedCount, self.assetExplorerDisplayedBundles.count);
 }
@@ -16692,15 +16730,25 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle || self.assetExplorerDisplayedBundles.count == 0) return nil;
 
     UIVisualEffectView *header = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+    UIView *stripes = [[UIView alloc] init];
+    stripes.translatesAutoresizingMaskIntoConstraints = NO;
+    stripes.userInteractionEnabled = NO;
+    stripes.backgroundColor = zs_zebra_strip_pattern_color([self zs_assetExplorerSectionIsModded:section]);
+    [header.contentView addSubview:stripes];
     UILabel *label = [[UILabel alloc] init];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     label.font = zs_mono_font(10, UIFontWeightSemibold);
-    label.textColor = [UIColor colorWithWhite:1 alpha:0.5];
+    label.textColor = [UIColor colorWithWhite:1 alpha:0.7];
     label.text = [self zs_assetExplorerSectionIsModded:section] ? @"MODDED" : @"STOCK";
     [header.contentView addSubview:label];
+    UILayoutGuide *safeArea = header.contentView.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [label.leadingAnchor constraintEqualToAnchor:header.contentView.leadingAnchor constant:kPanelPadding],
-        [label.trailingAnchor constraintEqualToAnchor:header.contentView.trailingAnchor constant:-kPanelPadding],
+        [stripes.leadingAnchor constraintEqualToAnchor:header.contentView.leadingAnchor],
+        [stripes.trailingAnchor constraintEqualToAnchor:header.contentView.trailingAnchor],
+        [stripes.topAnchor constraintEqualToAnchor:header.contentView.topAnchor],
+        [stripes.bottomAnchor constraintEqualToAnchor:header.contentView.bottomAnchor],
+        [label.leadingAnchor constraintEqualToAnchor:safeArea.leadingAnchor constant:kPanelPadding],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:safeArea.trailingAnchor constant:-kPanelPadding],
         [label.centerYAnchor constraintEqualToAnchor:header.contentView.centerYAnchor],
     ]];
     return header;

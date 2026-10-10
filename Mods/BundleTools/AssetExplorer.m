@@ -2,6 +2,7 @@
 #import "UnityBundleTools.h"
 #import <Metal/Metal.h>
 #import <CoreText/CoreText.h>
+#import <unistd.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -5881,14 +5882,13 @@ static ZSAssetExplorerVisual *ZSAEBuildParticleVisual(ZSAEContext *context, ZSAE
 }
 
 + (NSArray<ZSAssetExplorerBundle *> *)zs_bundlesFromIndexedCABMap:(NSDictionary<NSString *, NSArray<NSString *> *> *)map {
-    NSFileManager *fm = NSFileManager.defaultManager;
     NSMutableArray<ZSAssetExplorerBundle *> *bundles = [NSMutableArray arrayWithCapacity:map.count];
     for (NSString *cab in map) {
         NSArray<NSString *> *paths = map[cab];
         if (![cab isKindOfClass:[NSString class]] || ![paths isKindOfClass:[NSArray class]]) continue;
         NSString *livePath = nil;
         for (NSString *path in paths) {
-            if ([path isKindOfClass:[NSString class]] && [fm fileExistsAtPath:path]) {
+            if ([path isKindOfClass:[NSString class]] && access(path.fileSystemRepresentation, F_OK) == 0) {
                 livePath = path;
                 break;
             }
@@ -5922,68 +5922,21 @@ static ZSAssetExplorerVisual *ZSAEBuildParticleVisual(ZSAEContext *context, ZSAE
     NSArray<ZSAssetExplorerBundle *> *bundles = [self zs_bundlesFromIndexedCABMap:indexed ?: @{}];
     if (bundles.count > 0) return bundles;
 
-    if (indexed.count == 0) {
+    if (indexed.count > 0) {
+        [ZSFileIndex forceReindex];
+        indexed = [ZSFileIndex persistedCABMap];
+        bundles = [self zs_bundlesFromIndexedCABMap:indexed ?: @{}];
+        if (bundles.count > 0) return bundles;
+    }
+
+    if (error) {
         if ([self zs_sharedRoots].count == 0) {
-            if (error) *error = ZSAEError(ZSAssetExplorerErrorSharedDirectoryNotFound, @"Library/UnityCache/Shared was not found.");
-        } else if (error) {
+            *error = ZSAEError(ZSAssetExplorerErrorSharedDirectoryNotFound, @"Library/UnityCache/Shared was not found.");
+        } else {
             *error = ZSAEError(ZSAssetExplorerErrorNoBundles, @"No UnityFS AssetBundles were found in Library/UnityCache/Shared.");
         }
-        return @[];
     }
-
-    return [self zs_liveScannedBundles:error];
-}
-
-+ (NSArray<ZSAssetExplorerBundle *> *)zs_liveScannedBundles:(NSError **)error {
-    NSArray<NSString *> *roots = [self zs_sharedRoots];
-    if (roots.count == 0) {
-        if (error) *error = ZSAEError(ZSAssetExplorerErrorSharedDirectoryNotFound, @"Library/UnityCache/Shared was not found.");
-        return @[];
-    }
-
-    NSFileManager *fm = NSFileManager.defaultManager;
-    NSMutableDictionary<NSString *, ZSAssetExplorerBundle *> *byCAB = [NSMutableDictionary dictionary];
-    for (NSString *root in roots) {
-        NSDirectoryEnumerator<NSString *> *enumerator = [fm enumeratorAtPath:root];
-        NSString *relativePath = nil;
-        while ((relativePath = [enumerator nextObject])) {
-            @autoreleasepool {
-                NSDictionary *attributes = enumerator.fileAttributes;
-                if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) continue;
-                NSString *fullPath = [root stringByAppendingPathComponent:relativePath];
-                if (![UnityBundleCAB isUnityFSBundleAtPath:fullPath]) continue;
-
-                NSError *cabError = nil;
-                NSString *cab = [UnityBundleCAB primaryCABForBundleAtPath:fullPath error:&cabError];
-                if (cab.length == 0) continue;
-                ZSAssetExplorerBundle *existing = byCAB[cab];
-                if (existing) {
-                    NSDate *oldDate = [fm attributesOfItemAtPath:existing.filePath error:nil][NSFileModificationDate];
-                    NSDate *newDate = attributes[NSFileModificationDate];
-                    if (newDate && (!oldDate || [newDate compare:oldDate] == NSOrderedDescending)) existing.filePath = fullPath;
-                    continue;
-                }
-
-                ZSAssetExplorerBundle *bundle = [ZSAssetExplorerBundle new];
-                bundle.cabIdentifier = cab;
-                NSString *identifier = [cab hasPrefix:@"CAB-"] ? [cab substringFromIndex:4] : cab;
-                NSUInteger count = MIN((NSUInteger)7, identifier.length);
-                NSString *shortIdentifier = count > 0 ? [identifier substringToIndex:count] : identifier;
-                bundle.displayName = [NSString stringWithFormat:@"CAB-%@", shortIdentifier];
-                bundle.filePath = fullPath;
-                byCAB[cab] = bundle;
-            }
-        }
-    }
-
-    NSArray<ZSAssetExplorerBundle *> *bundles = [byCAB.allValues sortedArrayUsingComparator:^NSComparisonResult(ZSAssetExplorerBundle *a, ZSAssetExplorerBundle *b) {
-        NSComparisonResult result = [a.displayName caseInsensitiveCompare:b.displayName];
-        if (result != NSOrderedSame) return result;
-        return [a.cabIdentifier caseInsensitiveCompare:b.cabIdentifier];
-    }];
-
-    if (bundles.count == 0 && error) *error = ZSAEError(ZSAssetExplorerErrorNoBundles, @"No UnityFS AssetBundles were found in Library/UnityCache/Shared.");
-    return bundles;
+    return @[];
 }
 
 + (ZSAssetExplorerTexture *)textureForPathID:(int64_t)pathID inBundleAtPath:(NSString *)path error:(NSError **)error {

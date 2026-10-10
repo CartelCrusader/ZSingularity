@@ -1465,8 +1465,6 @@ static const NSUInteger kZSFIMaxPathLength = 1024;
 + (NSDictionary<NSString *, NSArray<NSString *> *> *)zsfi_buildCABMapForRoots:(NSArray<NSString *> *)roots {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSMutableDictionary<NSString *, NSMutableArray<NSString *> *> *map = [NSMutableDictionary dictionary];
-    // Captured once, from attributes we already fetched during the walk, so the
-    // later sort never has to touch the filesystem again (see below).
     NSMutableDictionary<NSString *, NSDate *> *mtimeByPath = [NSMutableDictionary dictionary];
     NSUInteger filesScanned = 0;
 
@@ -1504,12 +1502,6 @@ static const NSUInteger kZSFIMaxPathLength = 1024;
         }
     }
 
-    // Sort using the modification dates gathered above instead of re-stat'ing
-    // every path from inside the comparator. The old comparator called
-    // -attributesOfItemAtPath: twice per comparison, which is O(n log n) extra
-    // filesystem round-trips for every CAB bucket - on a large cache that adds
-    // up to enormous syscall/allocation churn during a single sort and was a
-    // major contributor to the crashes under heavy indexing load.
     for (NSString *cab in map) {
         [map[cab] sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
             NSDate *da = mtimeByPath[a] ?: NSDate.distantPast;
@@ -1710,6 +1702,30 @@ static const NSUInteger kZSFIMaxPathLength = 1024;
         if (![saved isKindOfClass:[NSDictionary class]] || [(NSDictionary *)saved count] == 0) return nil;
         s_cabMap = saved;
         return s_cabMap;
+    }
+}
+
+static NSDictionary<NSString *, NSString *> *s_pathToCAB = nil;
+static NSDictionary<NSString *, NSArray<NSString *> *> *s_pathToCABSource = nil;
+
++ (nullable NSString *)persistedCABForPath:(NSString *)path {
+    if (path.length == 0) return nil;
+    NSDictionary<NSString *, NSArray<NSString *> *> *map = [self persistedCABMap];
+    if (map.count == 0) return nil;
+    @synchronized (self) {
+        if (s_pathToCABSource != map || !s_pathToCAB) {
+            NSMutableDictionary<NSString *, NSString *> *reverse = [NSMutableDictionary dictionaryWithCapacity:map.count];
+            for (NSString *cab in map) {
+                NSArray<NSString *> *paths = map[cab];
+                if (![cab isKindOfClass:[NSString class]] || ![paths isKindOfClass:[NSArray class]]) continue;
+                for (NSString *candidate in paths) {
+                    if ([candidate isKindOfClass:[NSString class]]) reverse[candidate] = cab;
+                }
+            }
+            s_pathToCAB = reverse;
+            s_pathToCABSource = map;
+        }
+        return s_pathToCAB[path];
     }
 }
 

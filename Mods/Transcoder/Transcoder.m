@@ -13,6 +13,7 @@
 #import <lz4hc.h>
 #import <objc/runtime.h>
 #import <errno.h>
+#import <sys/stat.h>
 #import <fcntl.h>
 #import <unistd.h>
 
@@ -2671,6 +2672,38 @@ static void zt_set_modded(NSString *cab, BOOL modded) {
     if (cab.length > 0) zs_set_bundle_modded(cab, modded);
 }
 
+static NSString *zt_cab_for_installed_bundle(NSString *path) {
+    NSString *cab = zt_cab_for_bundle_file(path);
+    if (cab.length > 0) return cab;
+    return [ZSFileIndex persistedCABForPath:path];
+}
+
+static BOOL zt_files_have_identical_bytes(NSString *pathA, NSString *pathB) {
+    struct stat statA, statB;
+    if (stat(pathA.fileSystemRepresentation, &statA) != 0 || stat(pathB.fileSystemRepresentation, &statB) != 0) return NO;
+    if (statA.st_size != statB.st_size) return NO;
+    int fdA = open(pathA.fileSystemRepresentation, O_RDONLY);
+    if (fdA < 0) return NO;
+    int fdB = open(pathB.fileSystemRepresentation, O_RDONLY);
+    if (fdB < 0) { close(fdA); return NO; }
+    const size_t chunk = 256 * 1024;
+    uint8_t *bufA = malloc(chunk);
+    uint8_t *bufB = malloc(chunk);
+    BOOL identical = (bufA && bufB);
+    while (identical) {
+        ssize_t readA = read(fdA, bufA, chunk);
+        ssize_t readB = read(fdB, bufB, chunk);
+        if (readA != readB || readA < 0) { identical = NO; break; }
+        if (readA == 0) break;
+        if (memcmp(bufA, bufB, (size_t)readA) != 0) identical = NO;
+    }
+    free(bufA);
+    free(bufB);
+    close(fdA);
+    close(fdB);
+    return identical;
+}
+
 @implementation ZTranscoderInstaller
 
 + (NSString *)bundleBackupDirectory {
@@ -2791,8 +2824,20 @@ static void zt_set_modded(NSString *cab, BOOL modded) {
 
     zs_track_asset_path(stockBundleURL.path);
 
-    zt_set_modded(zt_cab_for_bundle_file(stockBundleURL.path), YES);
-    zt_set_modded(zt_cab_for_bundle_file(backupPath), YES);
+    NSMutableOrderedSet<NSString *> *moddedCABs = [NSMutableOrderedSet orderedSet];
+    NSString *doctoredCAB = zt_cab_for_bundle_file(doctoredURL.path);
+    NSString *installedCAB = zt_cab_for_installed_bundle(stockBundleURL.path);
+    NSString *backupCAB = [fm fileExistsAtPath:backupPath] ? zt_cab_for_bundle_file(backupPath) : nil;
+    if (doctoredCAB.length > 0) [moddedCABs addObject:doctoredCAB];
+    if (installedCAB.length > 0) [moddedCABs addObject:installedCAB];
+    if (backupCAB.length > 0) [moddedCABs addObject:backupCAB];
+    if (moddedCABs.count == 0) {
+        ZLog(@"[ZTranscoderInstaller] installed %@ but couldn't resolve its CAB, so it was not recorded in moddedBundles", stockBundleURL.path.lastPathComponent);
+    }
+    for (NSString *cab in moddedCABs) {
+        zt_set_modded(cab, YES);
+        ZLog(@"[ZTranscoderInstaller] recorded %@ in moddedBundles", cab);
+    }
 
     return YES;
 }
@@ -2810,9 +2855,9 @@ static void zt_set_modded(NSString *cab, BOOL modded) {
         if (![fm fileExistsAtPath:backupPath]) continue;
 
         BOOL liveExists = [fm fileExistsAtPath:livePath];
-        BOOL modded = liveExists && ![fm contentsEqualAtPath:livePath andPath:backupPath];
+        BOOL modded = liveExists && !zt_files_have_identical_bytes(livePath, backupPath);
         zt_set_modded(zt_cab_for_bundle_file(backupPath), modded);
-        if (liveExists) zt_set_modded(zt_cab_for_bundle_file(livePath), modded);
+        if (liveExists) zt_set_modded(zt_cab_for_installed_bundle(livePath), modded);
     }
 }
 

@@ -528,23 +528,11 @@ static NSString *zs_file_index_file_path(void) {
     return [documentsDir stringByAppendingPathComponent:@"Index.json"];
 }
 
-// Index.json can grow to hold thousands of cached file paths (CAB map, FMOD
-// names, localization paths). Loading/writing it as one NSData blob means one
-// single contiguous allocation for the whole thing - on iOS that has to be
-// satisfied by one vm_allocate call, and a large-enough or unlucky-enough one
-// can fail even when there's technically free memory elsewhere (address space
-// fragmentation, not just total free RAM). When that allocation fails, malloc
-// aborts the process outright. Both sides below stream instead of building
-// one giant buffer, and the write goes through a temp file + rename so a
-// crash or kill mid-write can never leave Index.json half-written/corrupt.
 
 static NSDictionary *zs_load_file_index_dictionary(void) {
     NSString *path = zs_file_index_file_path();
     if (!path) return nil;
 
-    // Memory-map rather than copy the file into a fresh heap buffer; the
-    // pages are paged in on demand instead of requiring one upfront
-    // contiguous allocation the size of the whole file.
     NSError *readError = nil;
     NSData *data = [NSData dataWithContentsOfFile:path
                                            options:NSDataReadingMappedIfSafe
@@ -590,9 +578,6 @@ static void zs_write_file_index_dictionary(NSDictionary *dict) {
     NSOutputStream *stream = [NSOutputStream outputStreamToFileAtPath:tmpPath append:NO];
     [stream open];
 
-    // Streams the encoded JSON out incrementally instead of materializing the
-    // whole encoded document as one NSData first - the fix for the single
-    // huge allocation described above.
     NSError *error = nil;
     NSInteger written = 0;
     @try {
@@ -631,19 +616,29 @@ NSDictionary *zs_load_settings_dictionary(void) {
     return (NSDictionary *)obj;
 }
 
-void zs_write_settings_dictionary(NSDictionary *dict) {
+static BOOL zs_write_settings_dictionary_checked(NSDictionary *dict) {
     NSString *path = zs_settings_file_path();
-    if (!path) return;
+    if (!path) return NO;
+    if (![NSJSONSerialization isValidJSONObject:dict]) {
+        ZLog(@"[ZSScripts] refusing to write settings JSON: not a valid JSON object");
+        return NO;
+    }
     NSError *error = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:NSJSONWritingPrettyPrinted error:&error];
     if (error || !data) {
         ZLog(@"[ZSScripts] failed to encode settings JSON: %@", error);
-        return;
+        return NO;
     }
     NSError *writeError = nil;
     if (![data writeToFile:path options:NSDataWritingAtomic error:&writeError]) {
         ZLog(@"[ZSScripts] failed to write settings JSON: %@", writeError);
+        return NO;
     }
+    return YES;
+}
+
+void zs_write_settings_dictionary(NSDictionary *dict) {
+    (void)zs_write_settings_dictionary_checked(dict);
 }
 
 NSDictionary *zs_settings_section(NSString *sectionKey) {
@@ -692,7 +687,10 @@ void zs_clear_tracked_asset_paths(void) {
 
 #pragma mark - Modded bundles (settings.json "moddedBundles")
 
+static BOOL zs_persist_current_settings_checked(void);
+
 static NSMutableArray<NSString *> *g_moddedBundles = nil;
+static BOOL g_moddedBundlesDirty = NO;
 
 static NSObject *zs_modded_bundles_lock(void) {
     static NSObject *lock = nil;
@@ -731,30 +729,41 @@ BOOL zs_bundle_is_modded(NSString *cab) {
 }
 
 void zs_set_bundle_modded(NSString *cab, BOOL modded) {
+    cab = [cab stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (cab.length == 0) return;
     zs_ensure_modded_bundles_loaded();
-    BOOL changed = NO;
+    BOOL needsFlush = NO;
     @synchronized (zs_modded_bundles_lock()) {
         BOOL present = [g_moddedBundles containsObject:cab];
         if (modded && !present) {
             [g_moddedBundles addObject:cab];
-            changed = YES;
+            g_moddedBundlesDirty = YES;
         } else if (!modded && present) {
             [g_moddedBundles removeObject:cab];
-            changed = YES;
+            g_moddedBundlesDirty = YES;
         }
+        needsFlush = g_moddedBundlesDirty;
     }
-    if (changed) zs_persist_current_settings();
+    if (!needsFlush) return;
+    if (zs_persist_current_settings_checked()) {
+        @synchronized (zs_modded_bundles_lock()) { g_moddedBundlesDirty = NO; }
+    } else {
+        ZLog(@"[ZSScripts] couldn't persist moddedBundles yet, will retry on the next change");
+    }
 }
 
 void zs_clear_modded_bundles(void) {
     zs_ensure_modded_bundles_loaded();
     BOOL changed = NO;
     @synchronized (zs_modded_bundles_lock()) {
-        changed = g_moddedBundles.count > 0;
+        changed = g_moddedBundles.count > 0 || g_moddedBundlesDirty;
         [g_moddedBundles removeAllObjects];
+        g_moddedBundlesDirty = changed;
     }
-    if (changed) zs_persist_current_settings();
+    if (!changed) return;
+    if (zs_persist_current_settings_checked()) {
+        @synchronized (zs_modded_bundles_lock()) { g_moddedBundlesDirty = NO; }
+    }
 }
 
 #pragma mark - File index (Mod Loader Pipeline caching, stored in its own Index.json)
@@ -884,10 +893,31 @@ NSDictionary *zs_current_settings_dictionary(void) {
     };
 }
 
+static NSObject *zs_settings_persist_lock(void) {
+    static NSObject *lock = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+static BOOL zs_persist_current_settings_checked(void) {
+    @synchronized (zs_settings_persist_lock()) {
+        NSMutableDictionary *whole = [zs_load_settings_dictionary() mutableCopy] ?: [NSMutableDictionary new];
+        NSDictionary *current = zs_current_settings_dictionary();
+        for (NSString *key in current) {
+            id value = current[key];
+            if ([NSJSONSerialization isValidJSONObject:@{key: value}]) {
+                whole[key] = value;
+            } else {
+                ZLog(@"[ZSScripts] settings section \"%@\" isn't valid JSON, keeping its previous on-disk value", key);
+            }
+        }
+        return zs_write_settings_dictionary_checked(whole);
+    }
+}
+
 void zs_persist_current_settings(void) {
-    NSMutableDictionary *whole = [zs_load_settings_dictionary() mutableCopy] ?: [NSMutableDictionary new];
-    [whole addEntriesFromDictionary:zs_current_settings_dictionary()];
-    zs_write_settings_dictionary(whole);
+    (void)zs_persist_current_settings_checked();
 }
 
 #pragma mark - FPS120Controller
