@@ -1284,11 +1284,16 @@ static void ucl_search(NSString *dirPath, NSUInteger depthRemaining, NSMutableSe
 }
 
 + (NSArray<NSString *> *)allBundlePathsForCAB:(NSString *)cab {
+    NSArray<NSString *> *persisted = [ZSFileIndex persistedPathsForCAB:cab];
+    if (persisted.count > 0) return persisted;
     [ZSFileIndex ensureIndexUpToDate];
     return [ZSFileIndex cachedPathsForCAB:cab] ?: @[];
 }
 
 + (nullable NSString *)locateBundlePathForCAB:(NSString *)cab error:(NSError **)error {
+    NSString *indexedPath = [ZSFileIndex persistedPathsForCAB:cab].firstObject;
+    if (indexedPath.length > 0) return indexedPath;
+
     NSArray<NSString *> *roots = [self unityCacheSharedDirectories];
     if (roots.count == 0) {
         if (error) {
@@ -1451,7 +1456,7 @@ static const NSUInteger kZSFIMaxPathLength = 1024;
     return @{
         @"fileCount": @(fileCount),
         @"totalSize": @(totalSize),
-        @"newestModified": @(newestModified),
+        @"newestModified": @((long long)llround(newestModified * 1000.0)),
     };
 }
 
@@ -1695,6 +1700,30 @@ static const NSUInteger kZSFIMaxPathLength = 1024;
         ZLog(@"[ZSFileIndex] manual re-index forced: %lu CAB(s) across %lu file(s), %lu FMOD file name(s)",
              (unsigned long)cabMap.count, (unsigned long)totalIndexedFiles, (unsigned long)fmodNamesArr.count);
     }
+}
+
++ (nullable NSDictionary<NSString *, NSArray<NSString *> *> *)persistedCABMap {
+    @synchronized (self) {
+        if (s_cabMap) return s_cabMap;
+        zs_ensure_file_index_snapshot_loaded();
+        id saved = g_fileIndexSnapshot[@"unityCacheCABMap"];
+        if (![saved isKindOfClass:[NSDictionary class]] || [(NSDictionary *)saved count] == 0) return nil;
+        s_cabMap = saved;
+        return s_cabMap;
+    }
+}
+
++ (nullable NSArray<NSString *> *)persistedPathsForCAB:(NSString *)cab {
+    if (cab.length == 0) return nil;
+    NSArray<NSString *> *paths = [self persistedCABMap][cab];
+    if (![paths isKindOfClass:[NSArray class]] || paths.count == 0) return nil;
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSString *> *existing = [NSMutableArray arrayWithCapacity:paths.count];
+    for (NSString *path in paths) {
+        if ([path isKindOfClass:[NSString class]] && [fm fileExistsAtPath:path]) [existing addObject:path];
+    }
+    return existing.count > 0 ? existing : nil;
 }
 
 + (nullable NSArray<NSString *> *)cachedPathsForCAB:(NSString *)cab {

@@ -2661,6 +2661,16 @@ static NSString * const kBackupSuffix = @".orig-bak";
 
 static NSString * const kManifestFileName = @"manifest.json";
 
+static NSString *zt_cab_for_bundle_file(NSString *path) {
+    if (path.length == 0 || ![NSFileManager.defaultManager fileExistsAtPath:path]) return nil;
+    NSString *cab = [UnityBundleCAB primaryCABForBundleAtPath:path error:nil];
+    return cab.length > 0 ? cab : nil;
+}
+
+static void zt_set_modded(NSString *cab, BOOL modded) {
+    if (cab.length > 0) zs_set_bundle_modded(cab, modded);
+}
+
 @implementation ZTranscoderInstaller
 
 + (NSString *)bundleBackupDirectory {
@@ -2781,7 +2791,29 @@ static NSString * const kManifestFileName = @"manifest.json";
 
     zs_track_asset_path(stockBundleURL.path);
 
+    zt_set_modded(zt_cab_for_bundle_file(stockBundleURL.path), YES);
+    zt_set_modded(zt_cab_for_bundle_file(backupPath), YES);
+
     return YES;
+}
+
++ (void)reconcileModdedBundles {
+    NSString *dir = [self bundleBackupDirectory];
+    if (!dir) return;
+
+    NSDictionary<NSString *, NSString *> *manifest = [self bds_loadManifest];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *backupKey in manifest) {
+        NSString *livePath = manifest[backupKey];
+        if (![livePath isKindOfClass:[NSString class]] || livePath.length == 0) continue;
+        NSString *backupPath = [dir stringByAppendingPathComponent:[backupKey stringByAppendingString:kBackupSuffix]];
+        if (![fm fileExistsAtPath:backupPath]) continue;
+
+        BOOL liveExists = [fm fileExistsAtPath:livePath];
+        BOOL modded = liveExists && ![fm contentsEqualAtPath:livePath andPath:backupPath];
+        zt_set_modded(zt_cab_for_bundle_file(backupPath), modded);
+        if (liveExists) zt_set_modded(zt_cab_for_bundle_file(livePath), modded);
+    }
 }
 
 + (BOOL)bds_fileAtPath:(NSString *)pathA hasIdenticalBytesToFileAtPath:(NSString *)pathB {
@@ -2816,15 +2848,19 @@ static NSString * const kManifestFileName = @"manifest.json";
         if (![fm fileExistsAtPath:backupPath] || originalPath.length == 0) continue;
 
         if (!force && [self bds_fileAtPath:originalPath hasIdenticalBytesToFileAtPath:backupPath]) {
+            zt_set_modded(zt_cab_for_bundle_file(backupPath), NO);
             continue;
         }
 
         NSData *backupData = [NSData dataWithContentsOfFile:backupPath];
         if (!backupData) continue;
 
+        NSString *liveCAB = zt_cab_for_bundle_file(originalPath);
         NSError *writeError = nil;
         if ([backupData writeToFile:originalPath options:NSDataWritingAtomic error:&writeError]) {
             restored++;
+            zt_set_modded(liveCAB, NO);
+            zt_set_modded(zt_cab_for_bundle_file(backupPath), NO);
         } else {
             ZLog(@"[ZTranscoderInstaller] couldn't restore %@ to %@: %@", backupKey, originalPath, writeError);
         }
@@ -2862,6 +2898,7 @@ static NSString * const kManifestFileName = @"manifest.json";
         return NO;
     }
 
+    NSString *liveCAB = zt_cab_for_bundle_file(stockBundleURL.path);
     BOOL scoped = [stockBundleURL startAccessingSecurityScopedResource];
     NSError *writeError = nil;
     BOOL wrote = [backupData writeToURL:stockBundleURL options:NSDataWritingAtomic error:&writeError];
@@ -2875,6 +2912,9 @@ static NSString * const kManifestFileName = @"manifest.json";
         }
         return NO;
     }
+
+    zt_set_modded(liveCAB, NO);
+    zt_set_modded(zt_cab_for_bundle_file(backupPath), NO);
 
     ZLog(@"[ZTranscoderInstaller] cached %@ - live bytes swapped back to the backed-up original", stockBundleURL.lastPathComponent);
     return YES;

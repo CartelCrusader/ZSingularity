@@ -5985,6 +5985,7 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 @property (nonatomic, strong) UIButton *assetExplorerSortButton;
 @property (nonatomic, strong) UIButton *assetExplorerShareButton;
 @property (nonatomic, strong) NSArray<ZSAssetExplorerBundle *> *assetExplorerDisplayedBundles;
+@property (nonatomic, assign) NSUInteger assetExplorerDisplayedModdedCount;
 @property (nonatomic, strong) NSArray<ZSAssetExplorerAsset *> *assetExplorerDisplayedAssets;
 @property (nonatomic, copy) NSString *assetExplorerFilterKind;
 @property (nonatomic, copy) NSString *assetExplorerSortKind;
@@ -11698,6 +11699,7 @@ static BOOL zs_keep_alive_background_mode_declared(void) {
         }
     }
     zs_clear_tracked_asset_paths();
+    zs_clear_modded_bundles();
 
     NSString *bankBackupDir = [BankTransplant bankBackupDirectory];
     if (bankBackupDir) [fm removeItemAtPath:bankBackupDir error:nil];
@@ -15365,6 +15367,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     tableView.showsHorizontalScrollIndicator = NO;
     tableView.rowHeight = 48;
     tableView.estimatedRowHeight = 48;
+    if (@available(iOS 15.0, *)) tableView.sectionHeaderTopPadding = 0;
     tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
     tableView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     tableView.dataSource = self;
@@ -15668,7 +15671,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerAssets = @[];
     self.assetExplorerCloseButton.hidden = NO;
     self.assetExplorerTitleLabel.text = @"Asset Explorer";
-    self.assetExplorerStatusMessage = @"Scanning…";
+    self.assetExplorerStatusMessage = @"Loading…";
     self.assetExplorerBackButton.hidden = YES;
     self.assetExplorerTableView.hidden = NO;
     [self zs_assetExplorerResetViewState];
@@ -15676,6 +15679,10 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        static dispatch_once_t reconcileOnce;
+        dispatch_once(&reconcileOnce, ^{
+            [ZTranscoderInstaller reconcileModdedBundles];
+        });
         NSError *error = nil;
         NSArray<ZSAssetExplorerBundle *> *bundles = [ZSAssetExplorer cachedBundles:&error];
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -16183,7 +16190,55 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     }];
 }
 
+- (NSString *)zs_assetExplorerSafeBaseNameForBundle:(ZSAssetExplorerBundle *)bundle {
+    NSString *baseName = bundle.displayName.length > 0 ? bundle.displayName : (bundle.cabIdentifier.length > 0 ? bundle.cabIdentifier : @"Bundle");
+    NSMutableCharacterSet *allowed = [NSMutableCharacterSet alphanumericCharacterSet];
+    [allowed addCharactersInString:@"-_. "];
+    NSMutableString *safeName = [NSMutableString string];
+    for (NSUInteger i = 0; i < baseName.length; i++) {
+        unichar c = [baseName characterAtIndex:i];
+        [safeName appendString:[allowed characterIsMember:c] ? [NSString stringWithCharacters:&c length:1] : @"_"];
+    }
+    return safeName;
+}
+
 - (void)zs_assetExplorerShareBundleTapped {
+    ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
+    NSArray<ZSAssetExplorerAsset *> *assets = self.assetExplorerAssets;
+    if (!bundle || assets.count == 0 || self.assetExplorerTextureOpen) return;
+
+    UIViewController *presenter = zs_key_window().rootViewController;
+    if (!presenter) return;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+
+    UIButton *sourceButton = self.assetExplorerShareButton;
+    __weak typeof(self) weakSelf = self;
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Export"
+                                                                      message:nil
+                                                               preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Asset Kinds" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf zs_assetExplorerExportAssetKinds];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Full Raws" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf zs_assetExplorerExportFullRaws];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Bundle" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf zs_assetExplorerExportBundleFile];
+    }]];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+
+    alert.popoverPresentationController.sourceView = sourceButton;
+    alert.popoverPresentationController.sourceRect = sourceButton.bounds;
+
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)zs_assetExplorerExportAssetKinds {
     ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
     NSArray<ZSAssetExplorerAsset *> *assets = self.assetExplorerAssets;
     if (!bundle || assets.count == 0 || self.assetExplorerTextureOpen) return;
@@ -16201,26 +16256,92 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         @"kinds": kinds,
     };
 
-    NSString *baseName = bundle.displayName.length > 0 ? bundle.displayName : (bundle.cabIdentifier.length > 0 ? bundle.cabIdentifier : @"Bundle");
-    NSMutableCharacterSet *allowed = [NSMutableCharacterSet alphanumericCharacterSet];
-    [allowed addCharactersInString:@"-_. "];
-    NSMutableString *safeName = [NSMutableString string];
-    for (NSUInteger i = 0; i < baseName.length; i++) {
-        unichar c = [baseName characterAtIndex:i];
-        [safeName appendString:[allowed characterIsMember:c] ? [NSString stringWithCharacters:&c length:1] : @"_"];
-    }
-    NSString *fileName = [[safeName stringByAppendingString:@"_asset_kinds"] stringByAppendingPathExtension:@"json"];
+    NSString *fileName = [[[self zs_assetExplorerSafeBaseNameForBundle:bundle] stringByAppendingString:@"_asset_kinds"] stringByAppendingPathExtension:@"json"];
 
+    [self zs_assetExplorerPerformExportNamed:fileName bundle:bundle writer:^BOOL(NSString *path) {
+        NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
+        return json.length > 0 && [json writeToFile:path atomically:YES];
+    }];
+}
+
+- (void)zs_assetExplorerExportFullRaws {
+    ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
+    NSArray<ZSAssetExplorerAsset *> *assets = [self.assetExplorerAssets copy];
+    if (!bundle || assets.count == 0 || self.assetExplorerTextureOpen) return;
+
+    NSDictionary<NSString *, NSNumber *> *counts = [self zs_assetExplorerKindCounts];
+    NSArray<NSString *> *sortedKinds = [self zs_assetExplorerSortedKinds:counts];
+    NSString *bundleName = bundle.displayName ?: @"";
+    NSString *cab = bundle.cabIdentifier ?: @"";
+
+    NSString *fileName = [[[self zs_assetExplorerSafeBaseNameForBundle:bundle] stringByAppendingString:@"_full_raws"] stringByAppendingPathExtension:@"json"];
+
+    [self zs_assetExplorerPerformExportNamed:fileName bundle:bundle writer:^BOOL(NSString *path) {
+        NSMutableDictionary<NSString *, NSMutableArray<NSDictionary *> *> *grouped = [NSMutableDictionary dictionary];
+        for (ZSAssetExplorerAsset *asset in assets) {
+            NSString *kind = asset.typeName.length > 0 ? asset.typeName : @"Unknown";
+            NSMutableArray<NSDictionary *> *bucket = grouped[kind];
+            if (!bucket) {
+                bucket = [NSMutableArray array];
+                grouped[kind] = bucket;
+            }
+            [bucket addObject:@{
+                @"pathID": @(asset.pathID),
+                @"classID": @(asset.classID),
+                @"name": asset.assetName.length > 0 ? asset.assetName : (id)[NSNull null],
+                @"size": @(asset.objectSize),
+            }];
+        }
+
+        NSMutableArray<NSDictionary *> *kindEntries = [NSMutableArray array];
+        for (NSString *kind in sortedKinds) {
+            NSArray<NSDictionary *> *items = [grouped[kind] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                return [a[@"pathID"] compare:b[@"pathID"]];
+            }] ?: @[];
+            [kindEntries addObject:@{
+                @"kind": kind,
+                @"count": @(items.count),
+                @"assets": items,
+            }];
+        }
+
+        NSDictionary *payload = @{
+            @"bundle": bundleName,
+            @"cab": cab,
+            @"totalAssets": @(assets.count),
+            @"kindCount": @(kindEntries.count),
+            @"kinds": kindEntries,
+        };
+        NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
+        return json.length > 0 && [json writeToFile:path atomically:YES];
+    }];
+}
+
+- (void)zs_assetExplorerExportBundleFile {
+    ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
+    if (!bundle || bundle.filePath.length == 0 || self.assetExplorerTextureOpen) return;
+
+    NSString *sourcePath = [bundle.filePath copy];
+    NSString *identifier = [bundle.cabIdentifier hasPrefix:@"CAB-"] ? [bundle.cabIdentifier substringFromIndex:4] : (bundle.cabIdentifier ?: @"");
+    NSString *shortIdentifier = identifier.length > 5 ? [identifier substringToIndex:5] : identifier;
+    NSString *originalName = sourcePath.lastPathComponent.length > 0 ? sourcePath.lastPathComponent : @"__data";
+    NSString *fileName = shortIdentifier.length > 0 ? [NSString stringWithFormat:@"%@ (CAB-%@)", originalName, shortIdentifier] : originalName;
+
+    [self zs_assetExplorerPerformExportNamed:fileName bundle:bundle writer:^BOOL(NSString *path) {
+        return [NSFileManager.defaultManager copyItemAtPath:sourcePath toPath:path error:nil];
+    }];
+}
+
+- (void)zs_assetExplorerPerformExportNamed:(NSString *)fileName bundle:(ZSAssetExplorerBundle *)bundle writer:(BOOL (^)(NSString *path))writer {
     UIButton *sourceButton = self.assetExplorerShareButton;
     sourceButton.enabled = NO;
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
         NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"ZSAssetExport-%@", NSUUID.UUID.UUIDString]];
         NSString *path = [directory stringByAppendingPathComponent:fileName];
         BOOL written = NO;
-        if (json.length > 0 && [NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil]) {
-            written = [json writeToFile:path atomically:YES];
+        if ([NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil]) {
+            written = writer(path);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
@@ -16328,7 +16449,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
             }
         }
         self.assetExplorerBundleSizes = sizes;
-        self.assetExplorerDisplayedBundles = [matches sortedArrayUsingComparator:^NSComparisonResult(ZSAssetExplorerBundle *a, ZSAssetExplorerBundle *b) {
+        NSArray<ZSAssetExplorerBundle *> *sortedBundles = [matches sortedArrayUsingComparator:^NSComparisonResult(ZSAssetExplorerBundle *a, ZSAssetExplorerBundle *b) {
             if (bySize) {
                 unsigned long long sizeA = sizes[a.filePath].unsignedLongLongValue;
                 unsigned long long sizeB = sizes[b.filePath].unsignedLongLongValue;
@@ -16345,6 +16466,18 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
             }
             return result;
         }];
+        NSSet<NSString *> *moddedCABs = [NSSet setWithArray:zs_modded_bundle_cabs()];
+        NSMutableArray<ZSAssetExplorerBundle *> *moddedBundles = [NSMutableArray array];
+        NSMutableArray<ZSAssetExplorerBundle *> *stockBundles = [NSMutableArray array];
+        for (ZSAssetExplorerBundle *bundle in sortedBundles) {
+            if (bundle.cabIdentifier.length > 0 && [moddedCABs containsObject:bundle.cabIdentifier]) {
+                [moddedBundles addObject:bundle];
+            } else {
+                [stockBundles addObject:bundle];
+            }
+        }
+        self.assetExplorerDisplayedModdedCount = moddedBundles.count;
+        self.assetExplorerDisplayedBundles = [moddedBundles arrayByAddingObjectsFromArray:stockBundles];
         self.assetExplorerDisplayedAssets = @[];
         shown = self.assetExplorerDisplayedBundles.count;
         total = self.assetExplorerBundles.count;
@@ -16521,9 +16654,56 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     self.assetExplorerFilterButton.showsMenuAsPrimaryAction = YES;
 }
 
+- (NSUInteger)zs_assetExplorerModdedDisplayCount {
+    return MIN(self.assetExplorerDisplayedModdedCount, self.assetExplorerDisplayedBundles.count);
+}
+
+- (BOOL)zs_assetExplorerSectionIsModded:(NSInteger)section {
+    return section == 0 && [self zs_assetExplorerModdedDisplayCount] > 0;
+}
+
+- (NSInteger)zs_assetExplorerBundleIndexForIndexPath:(NSIndexPath *)indexPath {
+    if ([self zs_assetExplorerSectionIsModded:indexPath.section]) return indexPath.row;
+    return (NSInteger)[self zs_assetExplorerModdedDisplayCount] + indexPath.row;
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle) return 1;
+    NSUInteger moddedCount = [self zs_assetExplorerModdedDisplayCount];
+    NSUInteger stockCount = self.assetExplorerDisplayedBundles.count - moddedCount;
+    NSInteger sections = (moddedCount > 0 ? 1 : 0) + (stockCount > 0 ? 1 : 0);
+    return MAX(sections, 1);
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (tableView != self.assetExplorerTableView) return 0;
-    return self.assetExplorerSelectedBundle ? (NSInteger)self.assetExplorerDisplayedAssets.count : (NSInteger)self.assetExplorerDisplayedBundles.count;
+    if (self.assetExplorerSelectedBundle) return (NSInteger)self.assetExplorerDisplayedAssets.count;
+    NSUInteger moddedCount = [self zs_assetExplorerModdedDisplayCount];
+    if ([self zs_assetExplorerSectionIsModded:section]) return (NSInteger)moddedCount;
+    return (NSInteger)(self.assetExplorerDisplayedBundles.count - moddedCount);
+}
+
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+    if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle || self.assetExplorerDisplayedBundles.count == 0) return CGFLOAT_MIN;
+    return 26;
+}
+
+- (UIView *)tableView:(UITableView *)tableView viewForHeaderInSection:(NSInteger)section {
+    if (tableView != self.assetExplorerTableView || self.assetExplorerSelectedBundle || self.assetExplorerDisplayedBundles.count == 0) return nil;
+
+    UIVisualEffectView *header = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+    UILabel *label = [[UILabel alloc] init];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.font = zs_mono_font(10, UIFontWeightSemibold);
+    label.textColor = [UIColor colorWithWhite:1 alpha:0.5];
+    label.text = [self zs_assetExplorerSectionIsModded:section] ? @"MODDED" : @"STOCK";
+    [header.contentView addSubview:label];
+    [NSLayoutConstraint activateConstraints:@[
+        [label.leadingAnchor constraintEqualToAnchor:header.contentView.leadingAnchor constant:kPanelPadding],
+        [label.trailingAnchor constraintEqualToAnchor:header.contentView.trailingAnchor constant:-kPanelPadding],
+        [label.centerYAnchor constraintEqualToAnchor:header.contentView.centerYAnchor],
+    ]];
+    return header;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -16551,7 +16731,8 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     cell.selectedBackgroundView = selected;
 
     if (!self.assetExplorerSelectedBundle) {
-        ZSAssetExplorerBundle *bundle = indexPath.row < self.assetExplorerDisplayedBundles.count ? self.assetExplorerDisplayedBundles[(NSUInteger)indexPath.row] : nil;
+        NSInteger bundleIndex = [self zs_assetExplorerBundleIndexForIndexPath:indexPath];
+        ZSAssetExplorerBundle *bundle = bundleIndex >= 0 && bundleIndex < (NSInteger)self.assetExplorerDisplayedBundles.count ? self.assetExplorerDisplayedBundles[(NSUInteger)bundleIndex] : nil;
         cell.textLabel.text = bundle.displayName ?: @"CAB-???????";
         NSNumber *bundleSize = bundle.filePath ? self.assetExplorerBundleSizes[bundle.filePath] : nil;
         NSString *cabText = bundle.cabIdentifier ?: @"";
@@ -16581,8 +16762,9 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         if ([ZSAssetExplorer hasVisualPreviewForClassID:asset.classID]) [self zs_assetExplorerOpenTextureForAsset:asset];
         return;
     }
-    if (indexPath.row >= self.assetExplorerDisplayedBundles.count) return;
-    [self zs_assetExplorerOpenBundle:self.assetExplorerDisplayedBundles[(NSUInteger)indexPath.row]];
+    NSInteger bundleIndex = [self zs_assetExplorerBundleIndexForIndexPath:indexPath];
+    if (bundleIndex < 0 || bundleIndex >= (NSInteger)self.assetExplorerDisplayedBundles.count) return;
+    [self zs_assetExplorerOpenBundle:self.assetExplorerDisplayedBundles[(NSUInteger)bundleIndex]];
 }
 
 #pragma mark Memory full-screen viewer

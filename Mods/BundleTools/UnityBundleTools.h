@@ -135,6 +135,10 @@ typedef NS_ENUM(NSInteger, UnityCacheLocatorErrorCode) {
 
 + (BOOL)hasIndex;
 
++ (nullable NSDictionary<NSString *, NSArray<NSString *> *> *)persistedCABMap;
+
++ (nullable NSArray<NSString *> *)persistedPathsForCAB:(NSString *)cab;
+
 + (NSSet<NSString *> *)cachedFMODBankFileNames;
 
 + (NSArray<NSString *> *)allCachedBundlePathsMatchingQuery:(NSString *)query;

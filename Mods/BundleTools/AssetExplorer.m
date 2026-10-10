@@ -5880,7 +5880,61 @@ static ZSAssetExplorerVisual *ZSAEBuildParticleVisual(ZSAEContext *context, ZSAE
     return roots;
 }
 
++ (NSArray<ZSAssetExplorerBundle *> *)zs_bundlesFromIndexedCABMap:(NSDictionary<NSString *, NSArray<NSString *> *> *)map {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<ZSAssetExplorerBundle *> *bundles = [NSMutableArray arrayWithCapacity:map.count];
+    for (NSString *cab in map) {
+        NSArray<NSString *> *paths = map[cab];
+        if (![cab isKindOfClass:[NSString class]] || ![paths isKindOfClass:[NSArray class]]) continue;
+        NSString *livePath = nil;
+        for (NSString *path in paths) {
+            if ([path isKindOfClass:[NSString class]] && [fm fileExistsAtPath:path]) {
+                livePath = path;
+                break;
+            }
+        }
+        if (!livePath) continue;
+
+        ZSAssetExplorerBundle *bundle = [ZSAssetExplorerBundle new];
+        bundle.cabIdentifier = cab;
+        NSString *identifier = [cab hasPrefix:@"CAB-"] ? [cab substringFromIndex:4] : cab;
+        NSUInteger count = MIN((NSUInteger)7, identifier.length);
+        NSString *shortIdentifier = count > 0 ? [identifier substringToIndex:count] : identifier;
+        bundle.displayName = [NSString stringWithFormat:@"CAB-%@", shortIdentifier];
+        bundle.filePath = livePath;
+        [bundles addObject:bundle];
+    }
+
+    return [bundles sortedArrayUsingComparator:^NSComparisonResult(ZSAssetExplorerBundle *a, ZSAssetExplorerBundle *b) {
+        NSComparisonResult result = [a.displayName caseInsensitiveCompare:b.displayName];
+        if (result != NSOrderedSame) return result;
+        return [a.cabIdentifier caseInsensitiveCompare:b.cabIdentifier];
+    }];
+}
+
 + (NSArray<ZSAssetExplorerBundle *> *)cachedBundles:(NSError **)error {
+    NSDictionary<NSString *, NSArray<NSString *> *> *indexed = [ZSFileIndex persistedCABMap];
+    if (indexed.count == 0) {
+        [ZSFileIndex ensureIndexUpToDate];
+        indexed = [ZSFileIndex persistedCABMap];
+    }
+
+    NSArray<ZSAssetExplorerBundle *> *bundles = [self zs_bundlesFromIndexedCABMap:indexed ?: @{}];
+    if (bundles.count > 0) return bundles;
+
+    if (indexed.count == 0) {
+        if ([self zs_sharedRoots].count == 0) {
+            if (error) *error = ZSAEError(ZSAssetExplorerErrorSharedDirectoryNotFound, @"Library/UnityCache/Shared was not found.");
+        } else if (error) {
+            *error = ZSAEError(ZSAssetExplorerErrorNoBundles, @"No UnityFS AssetBundles were found in Library/UnityCache/Shared.");
+        }
+        return @[];
+    }
+
+    return [self zs_liveScannedBundles:error];
+}
+
++ (NSArray<ZSAssetExplorerBundle *> *)zs_liveScannedBundles:(NSError **)error {
     NSArray<NSString *> *roots = [self zs_sharedRoots];
     if (roots.count == 0) {
         if (error) *error = ZSAEError(ZSAssetExplorerErrorSharedDirectoryNotFound, @"Library/UnityCache/Shared was not found.");
