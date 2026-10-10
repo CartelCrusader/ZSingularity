@@ -13868,6 +13868,12 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     buttonRow.spacing = 8;
     buttonRow.alignment = UIStackViewAlignmentCenter;
     buttonRow.alpha = 0;
+    [buttonRow setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [buttonRow setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    for (UIView *rowButton in rowButtons) {
+        [rowButton setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [rowButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    }
     [unityView addSubview:buttonRow];
     zs_mark_host_owned(buttonRow);
     zs_force_dark(buttonRow);
@@ -13889,7 +13895,9 @@ static NSURL *zs_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         hintLabel = [[UILabel alloc] init];
         hintLabel.translatesAutoresizingMaskIntoConstraints = NO;
         hintLabel.text = hintText;
-        hintLabel.font = zs_mono_font(10, UIFontWeightRegular);
+        hintLabel.font = zs_mono_font(12, UIFontWeightRegular);
+        [hintLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+        [hintLabel setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
         hintLabel.textColor = [UIColor colorWithWhite:1 alpha:0.78];
         hintLabel.numberOfLines = 0;
         hintLabel.backgroundColor = UIColor.clearColor;
