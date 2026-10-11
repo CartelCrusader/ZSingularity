@@ -6,6 +6,7 @@
 #import <mach-o/loader.h>
 #import <os/lock.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -326,7 +327,7 @@ static float zsa_accept_mse(ZSAstcQuality quality) {
     switch (quality) {
         case ZSAstcQualityFast: return 6.0f;
         case ZSAstcQualityHigh: return 0.75f;
-        default: return 6.0f;
+        default: return INFINITY;
     }
 }
 
