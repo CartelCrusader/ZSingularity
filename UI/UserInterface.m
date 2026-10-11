@@ -2807,29 +2807,6 @@ static ZSRow *zs_make_switch_row(NSString *title, BOOL val) {
     return row;
 }
 
-static void zs_add_unavailable_subtext(ZSRow *row, NSString *text) {
-    UILabel *subLabel = [[UILabel alloc] init];
-    subLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    subLabel.font = zs_mono_font(9, UIFontWeightRegular);
-    subLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
-    subLabel.text = text;
-    subLabel.numberOfLines = 2;
-    [row addSubview:subLabel];
-
-    for (NSLayoutConstraint *constraint in row.constraints) {
-        if (constraint.firstItem == row.titleLabel && constraint.firstAttribute == NSLayoutAttributeCenterY) {
-            constraint.active = NO;
-        }
-    }
-
-    [NSLayoutConstraint activateConstraints:@[
-        [row.titleLabel.topAnchor constraintEqualToAnchor:row.topAnchor constant:3],
-        [subLabel.topAnchor constraintEqualToAnchor:row.titleLabel.bottomAnchor constant:1],
-        [subLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [subLabel.trailingAnchor constraintLessThanOrEqualToAnchor:row.toggle.leadingAnchor constant:-6],
-    ]];
-}
-
 static ZSRow *zs_make_button_pair_row(NSString *leftTitle, UIColor *leftTint,
                                        NSString *rightTitle, UIColor *rightTint) {
     ZSRow *row = [[ZSRow alloc] initWithFrame:CGRectZero];
@@ -2871,6 +2848,35 @@ static ZSRow *zs_make_button_pair_row(NSString *leftTitle, UIColor *leftTint,
 #pragma mark Grouped action card (CONFIG)
 
 static const CGFloat kZSGroupedCardRowHeight = 40;
+
+static void zs_add_unavailable_subtext(ZSRow *row, NSString *text) {
+    UILabel *subLabel = [[UILabel alloc] init];
+    subLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    subLabel.font = zs_mono_font(8, UIFontWeightRegular);
+    subLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+    subLabel.text = text;
+    subLabel.numberOfLines = 0;
+    [row addSubview:subLabel];
+
+    for (NSLayoutConstraint *constraint in row.constraints) {
+        BOOL isTitle = constraint.firstItem == row.titleLabel;
+        BOOL isToggle = constraint.firstItem == row.toggle;
+        if ((isTitle || isToggle) && constraint.firstAttribute == NSLayoutAttributeCenterY) {
+            constraint.active = NO;
+        }
+    }
+
+    CGFloat topBandHeight = kZSGroupedCardRowHeight;
+    [NSLayoutConstraint activateConstraints:@[
+        [row.titleLabel.centerYAnchor constraintEqualToAnchor:row.topAnchor constant:topBandHeight / 2.0],
+        [row.toggle.centerYAnchor constraintEqualToAnchor:row.topAnchor constant:topBandHeight / 2.0],
+        [subLabel.topAnchor constraintEqualToAnchor:row.topAnchor constant:topBandHeight - 4],
+        [subLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [subLabel.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [subLabel.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-9],
+    ]];
+    objc_setAssociatedObject(row, "zs_selfSizingRow", @YES, OBJC_ASSOCIATION_RETAIN);
+}
 static const CGFloat kZSGroupedCardHorizontalPadding = 14;
 static const CGFloat kZSGroupedCardCornerRadius = 14;
 
@@ -2992,7 +2998,9 @@ static UIView *zs_make_grouped_action_card(NSArray<UIView *> *rows) {
         UIView *row = rows[i];
         row.translatesAutoresizingMaskIntoConstraints = NO;
         [innerStack addArrangedSubview:row];
-        [row.heightAnchor constraintEqualToConstant:kZSGroupedCardRowHeight].active = YES;
+        if (![objc_getAssociatedObject(row, "zs_selfSizingRow") boolValue]) {
+            [row.heightAnchor constraintEqualToConstant:kZSGroupedCardRowHeight].active = YES;
+        }
         if (i + 1 < rows.count) {
             [innerStack addArrangedSubview:zs_make_grouped_row_separator()];
         }
