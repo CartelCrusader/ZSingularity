@@ -5,6 +5,8 @@
 
 #import <dlfcn.h>
 #import <limits.h>
+#import <malloc/malloc.h>
+#import <errno.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -18,6 +20,33 @@
 static NSString * const kZSRamBypassSection = @"ramBypass";
 static NSString * const kZSRamBypassEnabledKey = @"enabled";
 static NSString * const kZSRamBypassHudKey = @"hud";
+
+#define ZS_MALLOC_ALLOCATION_MAGIC 0x5A534D414C4C4F43ull
+#define ZS_MALLOC_SLAB_MAGIC 0x5A53534C41424D47ull
+#define ZS_MALLOC_SMALL_CLASS_COUNT 4096
+#define ZS_MALLOC_KIND_LARGE 1u
+#define ZS_MALLOC_KIND_SMALL 2u
+
+typedef struct __attribute__((aligned(16))) {
+    uint64_t magic;
+    uint32_t requestedSize;
+    uint32_t capacity;
+    uint32_t allocationSize;
+    uint32_t ownerOffset;
+    uint32_t kind;
+    uint32_t classIndex;
+} ZSMallocAllocationHeader;
+
+typedef struct ZSMallocSlab {
+    uint64_t magic;
+    uint32_t classIndex;
+    uint32_t blockSize;
+    uint32_t totalBlocks;
+    uint32_t freeBlocks;
+    uintptr_t freeList;
+    struct ZSMallocSlab *next;
+    uint64_t reserved;
+} ZSMallocSlab;
 
 #ifndef VM_FLAGS_OVERWRITE
 #define VM_FLAGS_OVERWRITE 0x4000
@@ -46,6 +75,16 @@ static struct {
 } g_pool;
 
 static _Atomic(uint8_t) g_poolReady;
+static _Atomic(uint8_t) g_mallocAllocationEnabled;
+static _Atomic(uint8_t) g_mallocZoneRegistered;
+static os_unfair_lock g_mallocZoneLock = OS_UNFAIR_LOCK_INIT;
+static ZSMallocSlab *g_mallocSlabs[ZS_MALLOC_SMALL_CLASS_COUNT];
+static malloc_zone_t g_mallocZone;
+static malloc_introspection_t g_mallocIntrospection;
+static _Atomic(uint64_t) g_mallocBlocksInUse;
+static _Atomic(uint64_t) g_mallocBytesInUse;
+static _Atomic(uint64_t) g_mallocPeakBytesInUse;
+static _Atomic(uint64_t) g_mallocBytesAllocated;
 static _Atomic(uint64_t) g_servedCount;
 static _Atomic(uint64_t) g_fallbackCount;
 static _Atomic(uint8_t) g_freeOverflowLogged;
@@ -58,6 +97,19 @@ static _Atomic(uint64_t) g_reserveCalls;
 
 static void *(*g_origMmap)(void *, size_t, int, int, int, off_t);
 static int (*g_origMunmap)(void *, size_t);
+static void *(*g_origMalloc)(size_t);
+static void *(*g_origCalloc)(size_t, size_t);
+static void *(*g_origRealloc)(void *, size_t);
+static void (*g_origFree)(void *);
+static size_t (*g_origMallocSize)(const void *);
+static void *(*g_origValloc)(size_t);
+static int (*g_origPosixMemalign)(void **, size_t, size_t);
+static void *(*g_origAlignedAlloc)(size_t, size_t);
+static void *(*g_origMemalign)(size_t, size_t);
+static void *(*g_origMallocTypeMalloc)(size_t, uintptr_t);
+static void *(*g_origMallocTypeCalloc)(size_t, size_t, uintptr_t);
+static void *(*g_origMallocTypeRealloc)(void *, size_t, uintptr_t);
+static void *(*g_origMallocTypeMemalign)(size_t, size_t, uintptr_t);
 static kern_return_t (*g_origVmAllocate)(vm_map_t, vm_address_t *, vm_size_t, int);
 static kern_return_t (*g_origMachVmAllocate)(vm_map_t, mach_vm_address_t *, mach_vm_size_t, int);
 static kern_return_t (*g_origVmDeallocate)(vm_map_t, vm_address_t, vm_size_t);
@@ -66,6 +118,8 @@ static kern_return_t (*g_origMachVmDeallocate)(vm_map_t, mach_vm_address_t, mach
 static void *g_selfBase;
 static char g_bundlePrefix[PATH_MAX];
 static size_t g_bundlePrefixLength;
+
+static void zs_malloc_zone_register(void);
 
 BOOL zs_ram_bypass_enabled(void)
 {
@@ -77,6 +131,22 @@ BOOL zs_ram_bypass_enabled(void)
 BOOL zs_ram_bypass_available(void)
 {
     return ZSRamDonor.donorBundleIdentifier.length > 0;
+}
+
+BOOL zs_malloc_allocation_enabled(void)
+{
+    return atomic_load_explicit(&g_mallocAllocationEnabled, memory_order_acquire) != 0;
+}
+
+void zs_set_malloc_allocation_enabled(BOOL enabled)
+{
+    const BOOL active = enabled && zs_ram_bypass_enabled();
+    atomic_store_explicit(&g_mallocAllocationEnabled, active, memory_order_release);
+
+    if (active && atomic_load_explicit(&g_poolReady, memory_order_acquire))
+    {
+        zs_malloc_zone_register();
+    }
 }
 
 BOOL zs_ram_hud_enabled(void)
@@ -95,6 +165,7 @@ void zs_set_ram_hud_enabled(BOOL enabled)
 
 void zs_set_donated_heap_enabled(BOOL enabled)
 {
+    atomic_store_explicit(&g_mallocAllocationEnabled, 0, memory_order_release);
     NSMutableDictionary *section = [zs_settings_section(kZSRamBypassSection) mutableCopy] ?: [NSMutableDictionary new];
     section[kZSRamBypassEnabledKey] = @(enabled);
     zs_write_settings_section(kZSRamBypassSection, section);
@@ -344,6 +415,11 @@ static void zs_pool_install(void *base, uint64_t size)
 
     atomic_store_explicit(&g_poolReady, 1, memory_order_release);
 
+    if (atomic_load_explicit(&g_mallocAllocationEnabled, memory_order_acquire))
+    {
+        zs_malloc_zone_register();
+    }
+
     ZLog(@"[RamBypass] pool ready: %llu MB at %p, serving anonymous mappings of %llu KB or more",
          size / (1024 * 1024), base, kZSDonatedMinAllocation / 1024);
 }
@@ -517,6 +593,756 @@ static kern_return_t zs_hook_mach_vm_deallocate(vm_map_t target, mach_vm_address
     return g_origMachVmDeallocate(target, address, size);
 }
 
+static size_t zs_malloc_align_size(size_t value, size_t alignment)
+{
+    if (value > SIZE_MAX - (alignment - 1))
+    {
+        return 0;
+    }
+
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static ZSMallocAllocationHeader *zs_malloc_header_for_pointer(const void *pointer)
+{
+    if (!pointer || !atomic_load_explicit(&g_poolReady, memory_order_acquire))
+    {
+        return NULL;
+    }
+
+    const uintptr_t value = (uintptr_t)pointer;
+
+    if (value < sizeof(ZSMallocAllocationHeader))
+    {
+        return NULL;
+    }
+
+    ZSMallocAllocationHeader *header = (ZSMallocAllocationHeader *)(value - sizeof(ZSMallocAllocationHeader));
+
+    if (!zs_pool_contains(header, sizeof(*header)) || header->magic != ZS_MALLOC_ALLOCATION_MAGIC)
+    {
+        return NULL;
+    }
+
+    if (header->kind != ZS_MALLOC_KIND_LARGE && header->kind != ZS_MALLOC_KIND_SMALL)
+    {
+        return NULL;
+    }
+
+    if (header->ownerOffset >= g_pool.size)
+    {
+        return NULL;
+    }
+
+    const uintptr_t owner = g_pool.base + header->ownerOffset;
+    const uintptr_t headerAddress = (uintptr_t)header;
+    const uintptr_t poolEnd = g_pool.base + g_pool.size;
+
+    if (header->requestedSize > header->capacity)
+    {
+        return NULL;
+    }
+
+    if (header->kind == ZS_MALLOC_KIND_SMALL)
+    {
+        if (header->ownerOffset % vm_page_size != 0 || owner + vm_page_size > poolEnd)
+        {
+            return NULL;
+        }
+
+        ZSMallocSlab *slab = (ZSMallocSlab *)owner;
+        const uintptr_t firstBlock = owner + sizeof(*slab);
+
+        if (slab->magic != ZS_MALLOC_SLAB_MAGIC || slab->blockSize < sizeof(*header) ||
+            headerAddress < firstBlock || headerAddress + sizeof(*header) > owner + vm_page_size ||
+            (headerAddress - firstBlock) % slab->blockSize != 0 ||
+            header->allocationSize != slab->blockSize ||
+            header->capacity != slab->blockSize - sizeof(*header) ||
+            header->classIndex != slab->classIndex)
+        {
+            return NULL;
+        }
+    }
+    else if (header->ownerOffset % vm_page_size != 0 || header->allocationSize == 0 ||
+             header->allocationSize % vm_page_size != 0 || owner + header->allocationSize > poolEnd ||
+             headerAddress < owner || headerAddress + sizeof(*header) > owner + header->allocationSize ||
+             header->capacity > header->allocationSize || header->classIndex < 16 ||
+             (header->classIndex & (header->classIndex - 1)) != 0)
+    {
+        return NULL;
+    }
+
+    return header;
+}
+
+static void zs_malloc_update_peak(uint64_t bytes)
+{
+    uint64_t peak = atomic_load_explicit(&g_mallocPeakBytesInUse, memory_order_relaxed);
+
+    while (bytes > peak && !atomic_compare_exchange_weak_explicit(&g_mallocPeakBytesInUse, &peak, bytes,
+                                                                   memory_order_relaxed, memory_order_relaxed))
+    {
+    }
+}
+
+static void zs_malloc_record_allocation(size_t requested)
+{
+    atomic_fetch_add_explicit(&g_mallocBlocksInUse, 1, memory_order_relaxed);
+    const uint64_t used = atomic_fetch_add_explicit(&g_mallocBytesInUse, requested, memory_order_relaxed) + requested;
+    zs_malloc_update_peak(used);
+}
+
+static void zs_malloc_record_free(size_t requested)
+{
+    atomic_fetch_sub_explicit(&g_mallocBlocksInUse, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&g_mallocBytesInUse, requested, memory_order_relaxed);
+}
+
+static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL zeroed)
+{
+    if (!atomic_load_explicit(&g_poolReady, memory_order_acquire))
+    {
+        return NULL;
+    }
+
+    const size_t actualSize = MAX(requested, (size_t)1);
+    alignment = MAX(alignment, (size_t)16);
+
+    if ((alignment & (alignment - 1)) != 0 || alignment > UINT32_MAX || actualSize > UINT32_MAX ||
+        actualSize > SIZE_MAX - sizeof(ZSMallocAllocationHeader) - (alignment - 1) - ((size_t)vm_page_size - 1))
+    {
+        return NULL;
+    }
+
+    const size_t smallLimit = (size_t)vm_page_size / 2;
+
+    if (alignment <= 16 && actualSize <= smallLimit)
+    {
+        const size_t blockSize = zs_malloc_align_size(actualSize + sizeof(ZSMallocAllocationHeader), 16);
+        const size_t classIndex = blockSize / 16;
+
+        if (blockSize == 0 || classIndex >= ZS_MALLOC_SMALL_CLASS_COUNT)
+        {
+            return NULL;
+        }
+
+        os_unfair_lock_lock(&g_mallocZoneLock);
+
+        ZSMallocSlab *slab = g_mallocSlabs[classIndex];
+
+        while (slab && !slab->freeList)
+        {
+            slab = slab->next;
+        }
+
+        if (!slab)
+        {
+            void *page = zs_pool_take(vm_page_size);
+
+            if (!page)
+            {
+                os_unfair_lock_unlock(&g_mallocZoneLock);
+                return NULL;
+            }
+
+            slab = (ZSMallocSlab *)page;
+            memset(slab, 0, sizeof(*slab));
+            slab->magic = ZS_MALLOC_SLAB_MAGIC;
+            slab->classIndex = (uint32_t)classIndex;
+            slab->blockSize = (uint32_t)blockSize;
+            slab->totalBlocks = (uint32_t)(((size_t)vm_page_size - sizeof(*slab)) / blockSize);
+            slab->freeBlocks = slab->totalBlocks;
+
+            if (slab->totalBlocks == 0)
+            {
+                os_unfair_lock_unlock(&g_mallocZoneLock);
+                zs_pool_give(page, vm_page_size);
+                return NULL;
+            }
+
+            uint8_t *firstBlock = (uint8_t *)page + sizeof(*slab);
+
+            for (uint32_t i = 0; i < slab->totalBlocks; i++)
+            {
+                uintptr_t block = (uintptr_t)(firstBlock + (size_t)i * blockSize);
+                *(uintptr_t *)block = slab->freeList;
+                slab->freeList = block;
+            }
+
+            slab->next = g_mallocSlabs[classIndex];
+            g_mallocSlabs[classIndex] = slab;
+            atomic_fetch_add_explicit(&g_mallocBytesAllocated, vm_page_size, memory_order_relaxed);
+        }
+
+        uintptr_t block = slab->freeList;
+        slab->freeList = *(uintptr_t *)block;
+        slab->freeBlocks--;
+
+        ZSMallocAllocationHeader *header = (ZSMallocAllocationHeader *)block;
+        header->magic = ZS_MALLOC_ALLOCATION_MAGIC;
+        header->requestedSize = (uint32_t)requested;
+        header->capacity = (uint32_t)(blockSize - sizeof(*header));
+        header->allocationSize = (uint32_t)blockSize;
+        header->ownerOffset = (uint32_t)((uintptr_t)slab - g_pool.base);
+        header->kind = ZS_MALLOC_KIND_SMALL;
+        header->classIndex = (uint32_t)classIndex;
+
+        void *result = (uint8_t *)header + sizeof(*header);
+        os_unfair_lock_unlock(&g_mallocZoneLock);
+
+        if (zeroed && requested)
+        {
+            memset(result, 0, requested);
+        }
+
+        zs_malloc_record_allocation(requested);
+        return result;
+    }
+
+    const size_t totalSize = actualSize + sizeof(ZSMallocAllocationHeader) + alignment - 1;
+    void *base = zs_pool_take(totalSize);
+
+    if (!base)
+    {
+        return NULL;
+    }
+
+    const uint64_t mappedSize = zs_round_page(totalSize);
+    const uintptr_t firstUserAddress = (uintptr_t)base + sizeof(ZSMallocAllocationHeader);
+    const uintptr_t alignedUserAddress = (firstUserAddress + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    ZSMallocAllocationHeader *header = (ZSMallocAllocationHeader *)(alignedUserAddress - sizeof(*header));
+
+    header->magic = ZS_MALLOC_ALLOCATION_MAGIC;
+    header->requestedSize = (uint32_t)requested;
+    header->capacity = (uint32_t)((uintptr_t)base + mappedSize - alignedUserAddress);
+    header->allocationSize = (uint32_t)mappedSize;
+    header->ownerOffset = (uint32_t)((uintptr_t)base - g_pool.base);
+    header->kind = ZS_MALLOC_KIND_LARGE;
+    header->classIndex = (uint32_t)alignment;
+
+    void *result = (void *)alignedUserAddress;
+
+    if (zeroed && requested)
+    {
+        memset(result, 0, requested);
+    }
+
+    atomic_fetch_add_explicit(&g_mallocBytesAllocated, mappedSize, memory_order_relaxed);
+    zs_malloc_record_allocation(requested);
+    return result;
+}
+
+static void zs_malloc_zone_free_pointer(void *pointer)
+{
+    ZSMallocAllocationHeader *header = zs_malloc_header_for_pointer(pointer);
+
+    if (!header)
+    {
+        return;
+    }
+
+    const uint64_t requested = header->requestedSize;
+    const uint64_t allocationSize = header->allocationSize;
+    const uintptr_t owner = g_pool.base + header->ownerOffset;
+    const uint32_t kind = header->kind;
+    header->magic = 0;
+    zs_malloc_record_free(requested);
+
+    if (kind == ZS_MALLOC_KIND_SMALL)
+    {
+        ZSMallocSlab *slab = (ZSMallocSlab *)owner;
+
+        if (slab->magic != ZS_MALLOC_SLAB_MAGIC)
+        {
+            return;
+        }
+
+        os_unfair_lock_lock(&g_mallocZoneLock);
+        *(uintptr_t *)header = slab->freeList;
+        slab->freeList = (uintptr_t)header;
+        slab->freeBlocks++;
+        os_unfair_lock_unlock(&g_mallocZoneLock);
+        return;
+    }
+
+    atomic_fetch_sub_explicit(&g_mallocBytesAllocated, allocationSize, memory_order_relaxed);
+    zs_pool_give((void *)owner, allocationSize);
+}
+
+static void *zs_malloc_zone_reallocate(void *pointer, size_t requested)
+{
+    if (!pointer)
+    {
+        return zs_malloc_zone_allocate(requested, 16, NO);
+    }
+
+    ZSMallocAllocationHeader *header = zs_malloc_header_for_pointer(pointer);
+
+    if (!header)
+    {
+        return NULL;
+    }
+
+    if (requested == 0)
+    {
+        zs_malloc_zone_free_pointer(pointer);
+        return NULL;
+    }
+
+    const uint64_t oldRequested = header->requestedSize;
+
+    if (requested <= header->capacity)
+    {
+        header->requestedSize = (uint32_t)requested;
+
+        if (requested > oldRequested)
+        {
+            const uint64_t used = atomic_fetch_add_explicit(&g_mallocBytesInUse, requested - oldRequested, memory_order_relaxed) + requested - oldRequested;
+            zs_malloc_update_peak(used);
+        }
+        else if (requested < oldRequested)
+        {
+            atomic_fetch_sub_explicit(&g_mallocBytesInUse, oldRequested - requested, memory_order_relaxed);
+        }
+
+        return pointer;
+    }
+
+    const size_t alignment = header->kind == ZS_MALLOC_KIND_LARGE ? MAX((size_t)header->classIndex, (size_t)16) : 16;
+    void *replacement = zs_malloc_zone_allocate(requested, alignment, NO);
+
+    if (!replacement && g_origMalloc)
+    {
+        replacement = g_origMalloc(requested);
+    }
+
+    if (!replacement)
+    {
+        return NULL;
+    }
+
+    memcpy(replacement, pointer, MIN((size_t)oldRequested, requested));
+    zs_malloc_zone_free_pointer(pointer);
+    return replacement;
+}
+
+static size_t zs_malloc_zone_size(malloc_zone_t *zone, const void *pointer)
+{
+    ZSMallocAllocationHeader *header = zs_malloc_header_for_pointer(pointer);
+    return header ? (size_t)header->capacity : 0;
+}
+
+static void *zs_malloc_zone_malloc(malloc_zone_t *zone, size_t size)
+{
+    return zs_malloc_zone_allocate(size, 16, NO);
+}
+
+static void *zs_malloc_zone_calloc(malloc_zone_t *zone, size_t count, size_t size)
+{
+    if (count && size > SIZE_MAX / count)
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    return zs_malloc_zone_allocate(count * size, 16, YES);
+}
+
+static void *zs_malloc_zone_valloc(malloc_zone_t *zone, size_t size)
+{
+    return zs_malloc_zone_allocate(size, vm_page_size, NO);
+}
+
+static void zs_malloc_zone_free(malloc_zone_t *zone, void *pointer)
+{
+    zs_malloc_zone_free_pointer(pointer);
+}
+
+static void *zs_malloc_zone_realloc(malloc_zone_t *zone, void *pointer, size_t size)
+{
+    return zs_malloc_zone_reallocate(pointer, size);
+}
+
+static void zs_malloc_zone_destroy(malloc_zone_t *zone)
+{
+}
+
+static unsigned zs_malloc_zone_batch_malloc(malloc_zone_t *zone, size_t size, void **results, unsigned count)
+{
+    unsigned allocated = 0;
+
+    while (allocated < count)
+    {
+        void *pointer = zs_malloc_zone_allocate(size, 16, NO);
+
+        if (!pointer)
+        {
+            break;
+        }
+
+        results[allocated++] = pointer;
+    }
+
+    return allocated;
+}
+
+static void zs_malloc_zone_batch_free(malloc_zone_t *zone, void **pointers, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++)
+    {
+        zs_malloc_zone_free_pointer(pointers[i]);
+    }
+}
+
+static void *zs_malloc_zone_memalign(malloc_zone_t *zone, size_t alignment, size_t size)
+{
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0)
+    {
+        return NULL;
+    }
+
+    return zs_malloc_zone_allocate(size, alignment, NO);
+}
+
+static void zs_malloc_zone_free_definite_size(malloc_zone_t *zone, void *pointer, size_t size)
+{
+    zs_malloc_zone_free_pointer(pointer);
+}
+
+static size_t zs_malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal)
+{
+    return 0;
+}
+
+static boolean_t zs_malloc_zone_claimed_address(malloc_zone_t *zone, void *pointer)
+{
+    return zs_malloc_header_for_pointer(pointer) != NULL;
+}
+
+static kern_return_t zs_malloc_zone_enumerator(task_t task, void *context, unsigned typeMask,
+                                                vm_address_t zoneAddress, memory_reader_t reader,
+                                                vm_range_recorder_t recorder)
+{
+    return KERN_FAILURE;
+}
+
+static size_t zs_malloc_zone_good_size(malloc_zone_t *zone, size_t size)
+{
+    const size_t actualSize = MAX(size, (size_t)1);
+    const size_t smallLimit = (size_t)vm_page_size / 2;
+
+    if (actualSize <= smallLimit)
+    {
+        return zs_malloc_align_size(actualSize + sizeof(ZSMallocAllocationHeader), 16) - sizeof(ZSMallocAllocationHeader);
+    }
+
+    if (actualSize > SIZE_MAX - sizeof(ZSMallocAllocationHeader) - ((size_t)vm_page_size - 1))
+    {
+        return 0;
+    }
+
+    return (size_t)zs_round_page(actualSize + sizeof(ZSMallocAllocationHeader)) - sizeof(ZSMallocAllocationHeader);
+}
+
+static boolean_t zs_malloc_zone_check(malloc_zone_t *zone)
+{
+    return atomic_load_explicit(&g_poolReady, memory_order_acquire) != 0;
+}
+
+static void zs_malloc_zone_print(malloc_zone_t *zone, boolean_t verbose)
+{
+}
+
+static void zs_malloc_zone_log(malloc_zone_t *zone, void *address)
+{
+}
+
+static void zs_malloc_zone_force_lock(malloc_zone_t *zone)
+{
+    os_unfair_lock_lock(&g_mallocZoneLock);
+}
+
+static void zs_malloc_zone_force_unlock(malloc_zone_t *zone)
+{
+    os_unfair_lock_unlock(&g_mallocZoneLock);
+}
+
+static void zs_malloc_zone_statistics(malloc_zone_t *zone, malloc_statistics_t *stats)
+{
+    if (!stats)
+    {
+        return;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    stats->blocks_in_use = (unsigned)atomic_load_explicit(&g_mallocBlocksInUse, memory_order_relaxed);
+    stats->size_in_use = atomic_load_explicit(&g_mallocBytesInUse, memory_order_relaxed);
+    stats->max_size_in_use = atomic_load_explicit(&g_mallocPeakBytesInUse, memory_order_relaxed);
+    stats->size_allocated = atomic_load_explicit(&g_mallocBytesAllocated, memory_order_relaxed);
+}
+
+static boolean_t zs_malloc_zone_locked(malloc_zone_t *zone)
+{
+    return false;
+}
+
+static void zs_malloc_zone_reinit_lock(malloc_zone_t *zone)
+{
+    g_mallocZoneLock = OS_UNFAIR_LOCK_INIT;
+}
+
+static void zs_malloc_zone_register(void)
+{
+    uint8_t expected = 0;
+
+    if (!atomic_compare_exchange_strong_explicit(&g_mallocZoneRegistered, &expected, 1,
+                                                  memory_order_acq_rel, memory_order_acquire))
+    {
+        return;
+    }
+
+    memset(&g_mallocZone, 0, sizeof(g_mallocZone));
+    memset(&g_mallocIntrospection, 0, sizeof(g_mallocIntrospection));
+
+    g_mallocIntrospection.enumerator = zs_malloc_zone_enumerator;
+    g_mallocIntrospection.good_size = zs_malloc_zone_good_size;
+    g_mallocIntrospection.check = zs_malloc_zone_check;
+    g_mallocIntrospection.print = zs_malloc_zone_print;
+    g_mallocIntrospection.log = zs_malloc_zone_log;
+    g_mallocIntrospection.force_lock = zs_malloc_zone_force_lock;
+    g_mallocIntrospection.force_unlock = zs_malloc_zone_force_unlock;
+    g_mallocIntrospection.statistics = zs_malloc_zone_statistics;
+    g_mallocIntrospection.zone_locked = zs_malloc_zone_locked;
+    g_mallocIntrospection.reinit_lock = zs_malloc_zone_reinit_lock;
+
+    g_mallocZone.size = zs_malloc_zone_size;
+    g_mallocZone.malloc = zs_malloc_zone_malloc;
+    g_mallocZone.calloc = zs_malloc_zone_calloc;
+    g_mallocZone.valloc = zs_malloc_zone_valloc;
+    g_mallocZone.free = zs_malloc_zone_free;
+    g_mallocZone.realloc = zs_malloc_zone_realloc;
+    g_mallocZone.destroy = zs_malloc_zone_destroy;
+    g_mallocZone.zone_name = "ZSingularity Donated Malloc";
+    g_mallocZone.batch_malloc = zs_malloc_zone_batch_malloc;
+    g_mallocZone.batch_free = zs_malloc_zone_batch_free;
+    g_mallocZone.introspect = &g_mallocIntrospection;
+    g_mallocZone.version = 10;
+    g_mallocZone.memalign = zs_malloc_zone_memalign;
+    g_mallocZone.free_definite_size = zs_malloc_zone_free_definite_size;
+    g_mallocZone.pressure_relief = zs_malloc_zone_pressure_relief;
+    g_mallocZone.claimed_address = zs_malloc_zone_claimed_address;
+
+    malloc_zone_register(&g_mallocZone);
+    atomic_store_explicit(&g_mallocZoneRegistered, 2, memory_order_release);
+}
+
+static BOOL zs_malloc_redirect_enabled(void)
+{
+    return atomic_load_explicit(&g_mallocAllocationEnabled, memory_order_acquire) != 0 &&
+           atomic_load_explicit(&g_poolReady, memory_order_acquire) != 0 &&
+           atomic_load_explicit(&g_mallocZoneRegistered, memory_order_acquire) == 2;
+}
+
+static void *zs_hook_malloc(size_t size)
+{
+    if (zs_malloc_redirect_enabled())
+    {
+        void *pointer = zs_malloc_zone_allocate(size, 16, NO);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origMalloc(size);
+}
+
+static void *zs_hook_calloc(size_t count, size_t size)
+{
+    if (zs_malloc_redirect_enabled())
+    {
+        if (count && size > SIZE_MAX / count)
+        {
+            return g_origCalloc(count, size);
+        }
+
+        void *pointer = zs_malloc_zone_allocate(count * size, 16, YES);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origCalloc(count, size);
+}
+
+static void zs_hook_free(void *pointer)
+{
+    if (zs_malloc_header_for_pointer(pointer))
+    {
+        zs_malloc_zone_free_pointer(pointer);
+        return;
+    }
+
+    g_origFree(pointer);
+}
+
+static void *zs_hook_realloc(void *pointer, size_t size)
+{
+    if (!pointer)
+    {
+        return zs_hook_malloc(size);
+    }
+
+    if (zs_malloc_header_for_pointer(pointer))
+    {
+        return zs_malloc_zone_reallocate(pointer, size);
+    }
+
+    return g_origRealloc(pointer, size);
+}
+
+static size_t zs_hook_malloc_size(const void *pointer)
+{
+    ZSMallocAllocationHeader *header = zs_malloc_header_for_pointer(pointer);
+    return header ? (size_t)header->capacity : g_origMallocSize(pointer);
+}
+
+static void *zs_hook_valloc(size_t size)
+{
+    if (zs_malloc_redirect_enabled())
+    {
+        void *pointer = zs_malloc_zone_allocate(size, vm_page_size, NO);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origValloc(size);
+}
+
+static int zs_hook_posix_memalign(void **pointer, size_t alignment, size_t size)
+{
+    if (!pointer)
+    {
+        return EINVAL;
+    }
+
+    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+        (alignment & (alignment - 1)) == 0)
+    {
+        void *allocated = zs_malloc_zone_allocate(size, alignment, NO);
+
+        if (allocated)
+        {
+            *pointer = allocated;
+            return 0;
+        }
+    }
+
+    return g_origPosixMemalign(pointer, alignment, size);
+}
+
+static void *zs_hook_aligned_alloc(size_t alignment, size_t size)
+{
+    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+        (alignment & (alignment - 1)) == 0 && size % alignment == 0)
+    {
+        void *pointer = zs_malloc_zone_allocate(size, alignment, NO);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origAlignedAlloc(alignment, size);
+}
+
+static void *zs_hook_memalign(size_t alignment, size_t size)
+{
+    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+        (alignment & (alignment - 1)) == 0)
+    {
+        void *pointer = zs_malloc_zone_allocate(size, alignment, NO);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origMemalign(alignment, size);
+}
+
+static void *zs_hook_malloc_type_malloc(size_t size, uintptr_t typeID)
+{
+    if (zs_malloc_redirect_enabled())
+    {
+        void *pointer = zs_malloc_zone_allocate(size, 16, NO);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origMallocTypeMalloc ? g_origMallocTypeMalloc(size, typeID) : g_origMalloc(size);
+}
+
+static void *zs_hook_malloc_type_calloc(size_t count, size_t size, uintptr_t typeID)
+{
+    if (zs_malloc_redirect_enabled())
+    {
+        if (!count || size <= SIZE_MAX / count)
+        {
+            void *pointer = zs_malloc_zone_allocate(count * size, 16, YES);
+
+            if (pointer)
+            {
+                return pointer;
+            }
+        }
+    }
+
+    return g_origMallocTypeCalloc ? g_origMallocTypeCalloc(count, size, typeID) : g_origCalloc(count, size);
+}
+
+static void *zs_hook_malloc_type_realloc(void *pointer, size_t size, uintptr_t typeID)
+{
+    if (!pointer)
+    {
+        return zs_hook_malloc_type_malloc(size, typeID);
+    }
+
+    if (zs_malloc_header_for_pointer(pointer))
+    {
+        return zs_malloc_zone_reallocate(pointer, size);
+    }
+
+    return g_origMallocTypeRealloc ? g_origMallocTypeRealloc(pointer, size, typeID) : g_origRealloc(pointer, size);
+}
+
+static void *zs_hook_malloc_type_memalign(size_t alignment, size_t size, uintptr_t typeID)
+{
+    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+        (alignment & (alignment - 1)) == 0)
+    {
+        void *pointer = zs_malloc_zone_allocate(size, alignment, NO);
+
+        if (pointer)
+        {
+            return pointer;
+        }
+    }
+
+    return g_origMallocTypeMemalign ? g_origMallocTypeMemalign(alignment, size, typeID) : g_origMemalign(alignment, size);
+}
+
 static void zs_rebind_section(const struct section_64 *section, intptr_t slide,
                               const struct nlist_64 *symbols, const char *strings,
                               const uint32_t *indirect)
@@ -557,6 +1383,58 @@ static void zs_rebind_section(const struct section_64 *section, intptr_t slide,
         else if (strcmp(name + 1, "munmap") == 0)
         {
             replacement = (void *)zs_hook_munmap;
+        }
+        else if (strcmp(name + 1, "malloc_type_malloc") == 0 && g_origMallocTypeMalloc)
+        {
+            replacement = (void *)zs_hook_malloc_type_malloc;
+        }
+        else if (strcmp(name + 1, "malloc_type_calloc") == 0 && g_origMallocTypeCalloc)
+        {
+            replacement = (void *)zs_hook_malloc_type_calloc;
+        }
+        else if (strcmp(name + 1, "malloc_type_realloc") == 0 && g_origMallocTypeRealloc)
+        {
+            replacement = (void *)zs_hook_malloc_type_realloc;
+        }
+        else if (strcmp(name + 1, "malloc_type_memalign") == 0 && g_origMallocTypeMemalign)
+        {
+            replacement = (void *)zs_hook_malloc_type_memalign;
+        }
+        else if (strcmp(name + 1, "malloc") == 0 && g_origMalloc)
+        {
+            replacement = (void *)zs_hook_malloc;
+        }
+        else if (strcmp(name + 1, "calloc") == 0 && g_origCalloc)
+        {
+            replacement = (void *)zs_hook_calloc;
+        }
+        else if (strcmp(name + 1, "free") == 0 && g_origFree)
+        {
+            replacement = (void *)zs_hook_free;
+        }
+        else if (strcmp(name + 1, "realloc") == 0 && g_origRealloc)
+        {
+            replacement = (void *)zs_hook_realloc;
+        }
+        else if (strcmp(name + 1, "malloc_size") == 0 && g_origMallocSize)
+        {
+            replacement = (void *)zs_hook_malloc_size;
+        }
+        else if (strcmp(name + 1, "valloc") == 0 && g_origValloc)
+        {
+            replacement = (void *)zs_hook_valloc;
+        }
+        else if (strcmp(name + 1, "posix_memalign") == 0 && g_origPosixMemalign)
+        {
+            replacement = (void *)zs_hook_posix_memalign;
+        }
+        else if (strcmp(name + 1, "aligned_alloc") == 0 && g_origAlignedAlloc)
+        {
+            replacement = (void *)zs_hook_aligned_alloc;
+        }
+        else if (strcmp(name + 1, "memalign") == 0 && g_origMemalign)
+        {
+            replacement = (void *)zs_hook_memalign;
         }
         else if (strcmp(name + 1, "vm_allocate") == 0)
         {
@@ -709,6 +1587,19 @@ static BOOL zs_install_rebinds(void)
     dispatch_once(&once, ^{
         g_origMmap = dlsym(RTLD_DEFAULT, "mmap");
         g_origMunmap = dlsym(RTLD_DEFAULT, "munmap");
+        g_origMalloc = dlsym(RTLD_DEFAULT, "malloc");
+        g_origCalloc = dlsym(RTLD_DEFAULT, "calloc");
+        g_origRealloc = dlsym(RTLD_DEFAULT, "realloc");
+        g_origFree = dlsym(RTLD_DEFAULT, "free");
+        g_origMallocSize = dlsym(RTLD_DEFAULT, "malloc_size");
+        g_origValloc = dlsym(RTLD_DEFAULT, "valloc");
+        g_origPosixMemalign = dlsym(RTLD_DEFAULT, "posix_memalign");
+        g_origAlignedAlloc = dlsym(RTLD_DEFAULT, "aligned_alloc");
+        g_origMemalign = dlsym(RTLD_DEFAULT, "memalign");
+        g_origMallocTypeMalloc = dlsym(RTLD_DEFAULT, "malloc_type_malloc");
+        g_origMallocTypeCalloc = dlsym(RTLD_DEFAULT, "malloc_type_calloc");
+        g_origMallocTypeRealloc = dlsym(RTLD_DEFAULT, "malloc_type_realloc");
+        g_origMallocTypeMemalign = dlsym(RTLD_DEFAULT, "malloc_type_memalign");
         g_origVmAllocate = dlsym(RTLD_DEFAULT, "vm_allocate");
         g_origMachVmAllocate = dlsym(RTLD_DEFAULT, "mach_vm_allocate");
         g_origVmDeallocate = dlsym(RTLD_DEFAULT, "vm_deallocate");

@@ -9329,7 +9329,8 @@ static const CGFloat kContentFadeHeight = 22;
     [self.stack setCustomSpacing:8 afterView:entitlementsCard];
 
     BOOL ramBypassAvailable = zs_ram_bypass_available();
-    ZSRow *ramBypassRow = zs_make_switch_row(@"Extend Memory Usage", ramBypassAvailable && zs_ram_bypass_enabled());
+    BOOL ramBypassActiveAtLaunch = ramBypassAvailable && zs_ram_bypass_enabled();
+    ZSRow *ramBypassRow = zs_make_switch_row(@"Extend Memory Usage", ramBypassActiveAtLaunch);
     [ramBypassRow.toggle addTarget:self action:@selector(ramBypassChanged:) forControlEvents:UIControlEventValueChanged];
     if (!ramBypassAvailable) {
         ramBypassRow.toggle.on = NO;
@@ -9337,6 +9338,18 @@ static const CGFloat kContentFadeHeight = 22;
         ramBypassRow.titleLabel.alpha = 0.35;
         ramBypassRow.toggle.alpha = 0.35;
         zs_add_unavailable_subtext(ramBypassRow, @"Unavailable, RamDonor extension not registered");
+    }
+
+    ZSRow *mallocAllocationRow = zs_make_switch_row(@"Malloc allocation", zs_malloc_allocation_enabled());
+    [mallocAllocationRow.toggle addTarget:self action:@selector(mallocAllocationChanged:) forControlEvents:UIControlEventValueChanged];
+    objc_setAssociatedObject(ramBypassRow.toggle, @"zs_mallocAllocationRow", mallocAllocationRow, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(ramBypassRow.toggle, @"zs_ramBypassActiveAtLaunch", @(ramBypassActiveAtLaunch), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (!ramBypassActiveAtLaunch) {
+        mallocAllocationRow.toggle.on = NO;
+        mallocAllocationRow.toggle.enabled = NO;
+        mallocAllocationRow.titleLabel.alpha = 0.35;
+        mallocAllocationRow.toggle.alpha = 0.35;
+        zs_add_unavailable_subtext(mallocAllocationRow, ramBypassAvailable ? @"Requires Extend Memory Usage after restart" : @"Unavailable, RamDonor extension not registered");
     }
 
     ZSRow *ramHudRow = zs_make_switch_row(@"Memory Usage HUD", zs_ram_hud_enabled());
@@ -9354,6 +9367,7 @@ static const CGFloat kContentFadeHeight = 22;
 
     UIView *memoryActionsCard = zs_make_grouped_action_card(@[
         ramBypassRow,
+        mallocAllocationRow,
         ramHudRow,
         memoryCleanupButton,
         self.memoryUsageAnalyzeButton,
@@ -21465,6 +21479,18 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
 
 - (void)ramBypassChanged:(UISwitch *)toggle {
     zs_set_donated_heap_enabled(toggle.on);
+    ZSRow *mallocAllocationRow = objc_getAssociatedObject(toggle, @"zs_mallocAllocationRow");
+    BOOL activeAtLaunch = [objc_getAssociatedObject(toggle, @"zs_ramBypassActiveAtLaunch") boolValue];
+    BOOL mallocAvailable = activeAtLaunch && toggle.on && zs_ram_bypass_available();
+    mallocAllocationRow.toggle.enabled = mallocAvailable;
+    mallocAllocationRow.titleLabel.alpha = mallocAvailable ? 1.0 : 0.35;
+    mallocAllocationRow.toggle.alpha = mallocAvailable ? 1.0 : 0.35;
+
+    if (!mallocAvailable) {
+        mallocAllocationRow.toggle.on = NO;
+        zs_set_malloc_allocation_enabled(NO);
+    }
+
     UIViewController *presenter = zs_key_window().rootViewController;
     if (presenter) {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Restart Required"
@@ -21474,6 +21500,10 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
         zs_add_restart_action(alert);
         [presenter presentViewController:alert animated:YES completion:nil];
     }
+}
+
+- (void)mallocAllocationChanged:(UISwitch *)toggle {
+    zs_set_malloc_allocation_enabled(toggle.on);
 }
 
 - (void)ramHudChanged:(UISwitch *)toggle {
