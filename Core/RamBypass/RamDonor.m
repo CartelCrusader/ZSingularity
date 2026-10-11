@@ -23,6 +23,11 @@ extern kern_return_t mach_vm_remap(vm_map_t target, mach_vm_address_t *address,
                                    boolean_t copy, vm_prot_t *currentProtection,
                                    vm_prot_t *maxProtection, vm_inherit_t inheritance);
 
+extern kern_return_t mach_vm_region_recurse(vm_map_read_t target, mach_vm_address_t *address,
+                                            mach_vm_size_t *size, natural_t *depth,
+                                            vm_region_recurse_info_t info,
+                                            mach_msg_type_number_t *count);
+
 #ifndef VM_FLAGS_OVERWRITE
 #define VM_FLAGS_OVERWRITE 0x4000
 #endif
@@ -556,6 +561,59 @@ static ZSRamDonor *sharedDonor;
     {
         [self tearDownRegion:region];
     }
+}
+
+static uint64_t ZSTouchedBytesInRange(mach_vm_address_t start, mach_vm_size_t length)
+{
+    const mach_vm_address_t end = start + length;
+    mach_vm_address_t address = start;
+    natural_t depth = 0;
+    uint64_t pages = 0;
+
+    while (address < end)
+    {
+        mach_vm_size_t size = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+        kern_return_t kr = mach_vm_region_recurse(mach_task_self(), &address, &size, &depth,
+                                                  (vm_region_recurse_info_t)&info, &count);
+
+        if (kr != KERN_SUCCESS || address >= end)
+        {
+            break;
+        }
+
+        if (info.is_submap)
+        {
+            depth++;
+            continue;
+        }
+
+        pages += info.pages_dirtied + info.pages_swapped_out;
+        address += size;
+    }
+
+    return pages * vm_page_size;
+}
+
+- (uint64_t)donatedBytes
+{
+    NSArray<ZSDonatedRegion *> *regions;
+
+    @synchronized (self)
+    {
+        regions = self.regions.allValues;
+    }
+
+    uint64_t bytes = 0;
+
+    for (ZSDonatedRegion *region in regions)
+    {
+        bytes += ZSTouchedBytesInRange(region.base, region.size);
+    }
+
+    return bytes;
 }
 
 - (void)killDonorProcesses

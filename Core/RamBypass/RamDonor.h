@@ -18,6 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
                        minimum:(uint64_t)minimum
                         actual:(uint64_t *_Nullable)actual;
 - (void)releaseRegionAt:(void *)base;
+- (uint64_t)donatedBytes;
 - (void)killDonorProcesses;
 - (void)shutdown;
 

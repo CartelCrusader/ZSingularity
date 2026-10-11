@@ -19,6 +19,10 @@ static NSString * const kZSRamBypassSection = @"ramBypass";
 static NSString * const kZSRamBypassEnabledKey = @"enabled";
 static NSString * const kZSRamBypassHudKey = @"hud";
 
+#ifndef VM_FLAGS_OVERWRITE
+#define VM_FLAGS_OVERWRITE 0x4000
+#endif
+
 static const uint64_t kZSDonatedTargetBytes = 3ull * 1024ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinimumBytes = 256ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinAllocation = 2ull * 1024ull * 1024ull;
@@ -45,9 +49,18 @@ static _Atomic(uint8_t) g_poolReady;
 static _Atomic(uint64_t) g_servedCount;
 static _Atomic(uint64_t) g_fallbackCount;
 static _Atomic(uint8_t) g_freeOverflowLogged;
+static _Atomic(uint64_t) g_mmapCalls;
+static _Atomic(uint64_t) g_largeCalls;
+static _Atomic(uint64_t) g_rejectedCalls;
+static _Atomic(uint32_t) g_rejectLogged;
+static _Atomic(uint64_t) g_vmLargeCalls;
 
 static void *(*g_origMmap)(void *, size_t, int, int, int, off_t);
 static int (*g_origMunmap)(void *, size_t);
+static kern_return_t (*g_origVmAllocate)(vm_map_t, vm_address_t *, vm_size_t, int);
+static kern_return_t (*g_origMachVmAllocate)(vm_map_t, mach_vm_address_t *, mach_vm_size_t, int);
+static kern_return_t (*g_origVmDeallocate)(vm_map_t, vm_address_t, vm_size_t);
+static kern_return_t (*g_origMachVmDeallocate)(vm_map_t, mach_vm_address_t, mach_vm_size_t);
 
 static void *g_selfBase;
 static char g_bundlePrefix[PATH_MAX];
@@ -132,7 +145,7 @@ void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
     zs_ram_bypass_get_stats(&stats);
 
     outSnapshot->donatedBytes = stats.active ? stats.poolBytes : 0;
-    outSnapshot->donatedUsedBytes = stats.active ? stats.usedBytes : 0;
+    outSnapshot->donatedUsedBytes = stats.active ? [ZSRamDonor.shared donatedBytes] : 0;
     outSnapshot->totalBytes = outSnapshot->appBytes + outSnapshot->donatedUsedBytes;
 }
 
@@ -334,13 +347,42 @@ static void zs_pool_install(void *base, uint64_t size)
          size / (1024 * 1024), base, kZSDonatedMinAllocation / (1024 * 1024));
 }
 
+static void zs_log_rejected_mmap(size_t length, void *address, int prot, int flags, int fd)
+{
+    if (atomic_fetch_add(&g_rejectLogged, 1) >= 8)
+    {
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        ZLog(@"[RamBypass] large mmap of %zu MB not eligible: addr=%p prot=0x%x flags=0x%x fd=%d",
+             length / (1024 * 1024), address, prot, flags, fd);
+    });
+}
+
 static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset)
 {
     const BOOL anonymous = (flags & MAP_ANON) != 0 && (fd == -1 || ((uint32_t)fd & 0xff000000u) != 0);
 
-    if (address == NULL && length >= kZSDonatedMinAllocation && anonymous &&
+    const BOOL large = length >= kZSDonatedMinAllocation;
+    const BOOL eligible = address == NULL && large && anonymous &&
         (flags & MAP_PRIVATE) != 0 && (flags & (MAP_FIXED | MAP_JIT | MAP_SHARED)) == 0 &&
-        prot == (PROT_READ | PROT_WRITE))
+        prot == (PROT_READ | PROT_WRITE);
+
+    atomic_fetch_add(&g_mmapCalls, 1);
+
+    if (large)
+    {
+        atomic_fetch_add(&g_largeCalls, 1);
+    }
+
+    if (large && !eligible)
+    {
+        atomic_fetch_add(&g_rejectedCalls, 1);
+        zs_log_rejected_mmap(length, address, prot, flags, fd);
+    }
+
+    if (eligible)
     {
         if (atomic_load_explicit(&g_poolReady, memory_order_acquire))
         {
@@ -367,6 +409,103 @@ static int zs_hook_munmap(void *address, size_t length)
     }
 
     return g_origMunmap(address, length);
+}
+
+static void zs_log_rejected_vm(const char *api, uint64_t length, int flags)
+{
+    if (atomic_fetch_add(&g_rejectLogged, 1) >= 8)
+    {
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        ZLog(@"[RamBypass] large %s of %llu MB not eligible: flags=0x%x", api, length / (1024 * 1024), flags);
+    });
+}
+
+static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *address, uint64_t size, int flags)
+{
+    if (!address || target != mach_task_self() || size < kZSDonatedMinAllocation)
+    {
+        return NO;
+    }
+
+    atomic_fetch_add(&g_vmLargeCalls, 1);
+
+    if ((flags & VM_FLAGS_ANYWHERE) == 0 || (flags & (VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE)) != 0)
+    {
+        zs_log_rejected_vm(api, size, flags);
+        return NO;
+    }
+
+    if (!atomic_load_explicit(&g_poolReady, memory_order_acquire))
+    {
+        return NO;
+    }
+
+    void *served = zs_pool_take(size);
+
+    if (!served)
+    {
+        atomic_fetch_add(&g_fallbackCount, 1);
+        return NO;
+    }
+
+    *address = (uint64_t)(uintptr_t)served;
+
+    return YES;
+}
+
+static kern_return_t zs_hook_vm_allocate(vm_map_t target, vm_address_t *address, vm_size_t size, int flags)
+{
+    uint64_t served = 0;
+
+    if (zs_vm_allocate_common("vm_allocate", target, &served, size, flags))
+    {
+        *address = (vm_address_t)served;
+
+        return KERN_SUCCESS;
+    }
+
+    return g_origVmAllocate(target, address, size, flags);
+}
+
+static kern_return_t zs_hook_mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags)
+{
+    uint64_t served = 0;
+
+    if (zs_vm_allocate_common("mach_vm_allocate", target, &served, size, flags))
+    {
+        *address = (mach_vm_address_t)served;
+
+        return KERN_SUCCESS;
+    }
+
+    return g_origMachVmAllocate(target, address, size, flags);
+}
+
+static kern_return_t zs_hook_vm_deallocate(vm_map_t target, vm_address_t address, vm_size_t size)
+{
+    if (target == mach_task_self() && size != 0 && zs_pool_contains((const void *)address, size))
+    {
+        zs_pool_give((void *)address, size);
+
+        return KERN_SUCCESS;
+    }
+
+    return g_origVmDeallocate(target, address, size);
+}
+
+static kern_return_t zs_hook_mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size)
+{
+    if (target == mach_task_self() && size != 0 && zs_pool_contains((const void *)(uintptr_t)address, size))
+    {
+        zs_pool_give((void *)(uintptr_t)address, size);
+
+        return KERN_SUCCESS;
+    }
+
+    return g_origMachVmDeallocate(target, address, size);
 }
 
 static void zs_rebind_section(const struct section_64 *section, intptr_t slide,
@@ -409,6 +548,22 @@ static void zs_rebind_section(const struct section_64 *section, intptr_t slide,
         else if (strcmp(name + 1, "munmap") == 0)
         {
             replacement = (void *)zs_hook_munmap;
+        }
+        else if (strcmp(name + 1, "vm_allocate") == 0)
+        {
+            replacement = (void *)zs_hook_vm_allocate;
+        }
+        else if (strcmp(name + 1, "mach_vm_allocate") == 0)
+        {
+            replacement = (void *)zs_hook_mach_vm_allocate;
+        }
+        else if (strcmp(name + 1, "vm_deallocate") == 0)
+        {
+            replacement = (void *)zs_hook_vm_deallocate;
+        }
+        else if (strcmp(name + 1, "mach_vm_deallocate") == 0)
+        {
+            replacement = (void *)zs_hook_mach_vm_deallocate;
         }
         else
         {
@@ -545,10 +700,15 @@ static BOOL zs_install_rebinds(void)
     dispatch_once(&once, ^{
         g_origMmap = dlsym(RTLD_DEFAULT, "mmap");
         g_origMunmap = dlsym(RTLD_DEFAULT, "munmap");
+        g_origVmAllocate = dlsym(RTLD_DEFAULT, "vm_allocate");
+        g_origMachVmAllocate = dlsym(RTLD_DEFAULT, "mach_vm_allocate");
+        g_origVmDeallocate = dlsym(RTLD_DEFAULT, "vm_deallocate");
+        g_origMachVmDeallocate = dlsym(RTLD_DEFAULT, "mach_vm_deallocate");
 
         const char *bundlePath = NSBundle.mainBundle.bundlePath.fileSystemRepresentation;
 
-        if (!g_origMmap || !g_origMunmap || !bundlePath || !realpath(bundlePath, g_bundlePrefix))
+        if (!g_origMmap || !g_origMunmap || !g_origVmAllocate || !g_origMachVmAllocate ||
+            !g_origVmDeallocate || !g_origMachVmDeallocate || !bundlePath || !realpath(bundlePath, g_bundlePrefix))
         {
             ZLog(@"[RamBypass] could not resolve libsystem symbols or the bundle path, hooks not installed");
             return;
@@ -575,6 +735,19 @@ static void zs_ram_bypass_start(void)
     if (!zs_install_rebinds())
     {
         return;
+    }
+
+    for (NSNumber *delay in @[@20, @60, @120])
+    {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            ZLog(@"[RamBypass] after %@s: hook saw %llu mmap calls (%llu large, %llu not eligible) and %llu large vm_allocate calls, %llu served, %llu fell through, pool %@",
+                 delay,
+                 atomic_load(&g_mmapCalls), atomic_load(&g_largeCalls), atomic_load(&g_rejectedCalls),
+                 atomic_load(&g_vmLargeCalls),
+                 atomic_load(&g_servedCount), atomic_load(&g_fallbackCount),
+                 atomic_load(&g_poolReady) ? @"ready" : @"not ready");
+        });
     }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
