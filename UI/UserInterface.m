@@ -9,26 +9,26 @@
 #import <os/lock.h>
 #import <sys/stat.h>
 #import <string.h>
-#import "ZSEngine.h"
-#import "ZSDiagnostics.h"
+#import "Engine.h"
+#import "Diagnostics.h"
 #import "ZTweakLog.h"
 #import "Mods.h"
 #import "Transcoder.h"
-#import "ZSLowRes.h"
+#import "TexComp.h"
 #import "PatchManifestNetwork.h"
-#import "ZSVersion.h"
-#import "ZSUpdater.h"
+#import "Version.h"
+#import "Updater.h"
 
 #import "UnityBundleTools.h"
 #import "AssetExplorer.h"
 #import "IL2CppIntrospection.h"
-#import "Dumper/ZSDumper.h"
+#import "Dumper/Dumper.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-#import "ZSEmbeddedFont.h"
-#import "ZSEmbeddedSignature.h"
-#import "ZSDocs.h"
-#import "ZSGifTint.h"
+#import "EmbeddedFont.h"
+#import "EmbeddedSignature.h"
+#import "Docs.h"
+#import "GifTint.h"
 
 @class ZSCapsuleSlider, ZSModeSlider, ZSWheelPicker;
 
@@ -3162,7 +3162,7 @@ static NSString *zs_lowres_swap_shared_folders(void) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *shared = [UnityCacheLocator unityCacheSharedDirectories].firstObject;
     if (!shared) return @"Couldn't find the UnityCache/Shared folder.";
-    NSString *lowRes = [ZSLowRes stagingDirectory];
+    NSString *lowRes = [TexComp stagingDirectory];
     BOOL isDirectory = NO;
     if (![fm fileExistsAtPath:lowRes isDirectory:&isDirectory] || !isDirectory) return @"Documents/LowRes doesn't exist.";
 
@@ -3180,7 +3180,7 @@ static NSString *zs_lowres_swap_shared_folders(void) {
         if ([fm fileExistsAtPath:candidate isDirectory:&candidateIsDirectory] && candidateIsDirectory) source = candidate;
     }
 
-    NSString *mergeError = [ZSLowRes mergeOriginalsIntoDirectory:source copied:NULL];
+    NSString *mergeError = [TexComp mergeOriginalsIntoDirectory:source copied:NULL];
     if (mergeError) return mergeError;
 
     if (![source isEqualToString:lowRes]) {
@@ -3210,7 +3210,7 @@ static NSString *zs_lowres_swap_shared_folders(void) {
         }
         return [NSString stringWithFormat:@"Couldn't move the compressed textures into place: %@. Shared was restored.", reason];
     }
-    NSString *restoreError = [ZSLowRes restoreMissingFilesIntoDirectory:shared fromBackup:backup restored:NULL];
+    NSString *restoreError = [TexComp restoreMissingFilesIntoDirectory:shared fromBackup:backup restored:NULL];
     if (restoreError) return [NSString stringWithFormat:@"The compressed textures are in place, but %@ The game may ask to download them again.", restoreError];
     return nil;
 }
@@ -3220,10 +3220,10 @@ typedef struct {
     BOOL diskTranscoded;
     BOOL backupExists;
     BOOL backupTranscoded;
-} ZSLowResFolderState;
+} TexCompFolderState;
 
-static ZSLowResFolderState zs_lowres_folder_state(NSString *shared) {
-    ZSLowResFolderState state = {0};
+static TexCompFolderState zs_lowres_folder_state(NSString *shared) {
+    TexCompFolderState state = {0};
     if (!shared) return state;
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *backup = [shared stringByAppendingString:@".backup"];
@@ -3240,7 +3240,7 @@ static NSString *zs_lowres_exchange_shared_folders(NSString *shared) {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *backup = [shared stringByAppendingString:@".backup"];
     NSString *temp = [shared stringByAppendingString:@".swap"];
-    ZSLowResFolderState state = zs_lowres_folder_state(shared);
+    TexCompFolderState state = zs_lowres_folder_state(shared);
     if (!state.diskExists) return @"Couldn't find the UnityCache/Shared folder.";
     if (!state.backupExists) return @"Couldn't find Shared.backup.";
     NSError *error = nil;
@@ -10920,7 +10920,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
 - (void)lowResCompressTapped:(UIButton *)sender {
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
-    if ([ZSLowRes.shared status].running) {
+    if ([TexComp.shared status].running) {
         if (!g_zsLowResUserCancelled) return;
         if (g_zsLowResReopenPending) {
             g_zsLowResReopenPending = NO;
@@ -10973,7 +10973,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
         zs_reveal_set_expanded(g_zsLowResDeleteWrapper, NO);
     }];
     __weak typeof(self) weakSelf = self;
-    BOOL accepted = [ZSLowRes.shared prepareWithCompletion:^(NSUInteger textures, NSUInteger bundles, BOOL ok) {
+    BOOL accepted = [TexComp.shared prepareWithCompletion:^(NSUInteger textures, NSUInteger bundles, BOOL ok) {
         if (generation != g_zsLowResGeneration || g_zsLowResStage != 1) return;
         [weakSelf zs_lowResShowSummaryWithTextures:textures bundles:bundles ok:ok];
     }];
@@ -11111,7 +11111,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
 - (void)zs_lowResStartTranscodeWithBlockSize:(NSUInteger)blockSize {
     if (g_zsLowResStage != 2) return;
     __weak typeof(self) weakSelf = self;
-    BOOL started = [ZSLowRes.shared startWithMode:ZSLowResModeTranscode blockSize:blockSize completion:^(ZSLowResStatus status) {
+    BOOL started = [TexComp.shared startWithMode:TexCompModeTranscode blockSize:blockSize completion:^(TexCompStatus status) {
         [weakSelf zs_lowResFinishedWithCancelled:status.cancelled];
     }];
     if (!started) {
@@ -11133,7 +11133,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     [g_zsLowResTimer invalidate];
     __weak typeof(self) weakSelf = self;
     g_zsLowResTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
-        if (![ZSLowRes.shared status].running) {
+        if (![TexComp.shared status].running) {
             [timer invalidate];
             g_zsLowResTimer = nil;
             return;
@@ -11172,8 +11172,8 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     g_zsLowResReopenPending = NO;
     g_zsLowResStage = 0;
     g_zsLowResGeneration++;
-    ZSLowResStatus st = [ZSLowRes.shared status];
-    if (st.running && st.mode == ZSLowResModeTranscode && !g_zsLowResUserCancelled) {
+    TexCompStatus st = [TexComp.shared status];
+    if (st.running && st.mode == TexCompModeTranscode && !g_zsLowResUserCancelled) {
         g_zsLowResStage = 3;
         [self zs_lowResRefreshProgressUI];
         [self zs_lowResSetPanelActive:YES animated:NO];
@@ -11183,7 +11183,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
 }
 
 - (void)zs_lowResRefreshProgressUI {
-    ZSLowResStatus st = [ZSLowRes.shared status];
+    TexCompStatus st = [TexComp.shared status];
     double fraction = st.texturesTotal > 0 ? (double)st.texturesProcessed / (double)st.texturesTotal : 0.0;
     NSUInteger percent = (NSUInteger)floor(fraction * 100.0);
     g_zsLowResPercentLabel.text = [NSString stringWithFormat:@"%lu%%", (unsigned long)percent];
@@ -11206,7 +11206,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     }
 }
 
-- (void)zs_lowResApplySwapState:(ZSLowResFolderState)state {
+- (void)zs_lowResApplySwapState:(TexCompFolderState)state {
     UIColor *green = zs_accent_green_color();
     UIColor *blue = zs_lowres_original_folder_color();
     UIColor *missing = [UIColor colorWithWhite:1 alpha:0.2];
@@ -11225,8 +11225,8 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *shared = [UnityCacheLocator unityCacheSharedDirectories].firstObject;
-        ZSLowResFolderState state = zs_lowres_folder_state(shared);
-        BOOL stagedLedger = [NSFileManager.defaultManager fileExistsAtPath:[[ZSLowRes stagingDirectory] stringByAppendingPathComponent:@"ledger.json"]];
+        TexCompFolderState state = zs_lowres_folder_state(shared);
+        BOOL stagedLedger = [NSFileManager.defaultManager fileExistsAtPath:[[TexComp stagingDirectory] stringByAppendingPathComponent:@"ledger.json"]];
         BOOL eligible = state.backupExists && (state.backupTranscoded || state.diskTranscoded || stagedLedger);
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
@@ -11234,7 +11234,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
             g_zsLowResSharedPath = shared;
             g_zsLowResSwapEligible = eligible;
             [strongSelf zs_lowResApplySwapState:state];
-            if (g_zsLowResStage != 0 || [ZSLowRes.shared status].running) return;
+            if (g_zsLowResStage != 0 || [TexComp.shared status].running) return;
             if (!eligible) g_zsLowResDeleteOpen = NO;
             dispatch_block_t changes = ^{
                 zs_reveal_set_expanded(g_zsLowResSwapWrapper, eligible && !g_zsLowResDeleteOpen);
@@ -11268,14 +11268,14 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *shared = [UnityCacheLocator unityCacheSharedDirectories].firstObject;
         NSString *failure = zs_lowres_swap_shared_folders();
-        ZSLowResFolderState state = zs_lowres_folder_state(shared);
+        TexCompFolderState state = zs_lowres_folder_state(shared);
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
             g_zsLowResSwapBusy = NO;
             g_zsLowResCancelButton.enabled = YES;
             g_zsLowResSharedPath = shared;
             if (!strongSelf) return;
-            BOOL stagedLedger = [NSFileManager.defaultManager fileExistsAtPath:[[ZSLowRes stagingDirectory] stringByAppendingPathComponent:@"ledger.json"]];
+            BOOL stagedLedger = [NSFileManager.defaultManager fileExistsAtPath:[[TexComp stagingDirectory] stringByAppendingPathComponent:@"ledger.json"]];
             g_zsLowResSwapEligible = state.backupExists && (state.backupTranscoded || state.diskTranscoded || stagedLedger);
             [strongSelf zs_lowResApplySwapState:state];
             g_zsLowResStage = 0;
@@ -11287,7 +11287,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
 }
 
 - (UIContextMenuConfiguration *)contextMenuInteraction:(UIContextMenuInteraction *)interaction configurationForMenuAtLocation:(CGPoint)location {
-    if (g_zsLowResSwapBusy || g_zsLowResStage != 0 || [ZSLowRes.shared status].running) return nil;
+    if (g_zsLowResSwapBusy || g_zsLowResStage != 0 || [TexComp.shared status].running) return nil;
     BOOL isDisk = interaction.view.tag == 2;
     if (isDisk ? !g_zsLowResDiskExists : !g_zsLowResBackupExists) return nil;
     __weak typeof(self) weakSelf = self;
@@ -11342,7 +11342,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
 }
 
 - (void)lowResDeleteConfirmTapped:(UIButton *)sender {
-    if (g_zsLowResSwapBusy || g_zsLowResStage != 0 || [ZSLowRes.shared status].running) return;
+    if (g_zsLowResSwapBusy || g_zsLowResStage != 0 || [TexComp.shared status].running) return;
     NSString *shared = g_zsLowResSharedPath;
     if (!shared) return;
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
@@ -11366,7 +11366,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
 }
 
 - (void)lowResSwapTapped:(UIButton *)sender {
-    if (g_zsLowResSwapBusy || g_zsLowResStage != 0 || [ZSLowRes.shared status].running) return;
+    if (g_zsLowResSwapBusy || g_zsLowResStage != 0 || [TexComp.shared status].running) return;
     NSString *shared = g_zsLowResSharedPath;
     if (!shared) return;
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -11376,7 +11376,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *failure = zs_lowres_exchange_shared_folders(shared);
-        ZSLowResFolderState state = zs_lowres_folder_state(shared);
+        TexCompFolderState state = zs_lowres_folder_state(shared);
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
             if (!strongSelf) {
@@ -11394,7 +11394,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     });
 }
 
-- (void)zs_lowResAnimateSwapToState:(ZSLowResFolderState)state {
+- (void)zs_lowResAnimateSwapToState:(TexCompFolderState)state {
     UIView *leftSlot = g_zsLowResSwapLeftSlot;
     UIView *rightSlot = g_zsLowResSwapRightSlot;
     UIImageView *leftIcon = g_zsLowResSwapLeftIcon;
@@ -11439,7 +11439,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
         g_zsLowResUserCancelled = YES;
         g_zsLowResStage = 0;
         g_zsLowResGeneration++;
-        [ZSLowRes.shared cancel];
+        [TexComp.shared cancel];
         [weakSelf zs_lowResSetPanelActive:NO animated:YES];
     }]];
     [presenter presentViewController:alert animated:YES completion:nil];
@@ -11474,7 +11474,7 @@ static void zs_collect_rows_recursive(UIView *view, NSMutableArray<ZSRow *> *out
     while (presenter.presentedViewController) presenter = presenter.presentedViewController;
     if (!presenter) return;
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Compression complete"
-                                                                   message:[ZSLowRes.shared summary]
+                                                                   message:[TexComp.shared summary]
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [presenter presentViewController:alert animated:YES completion:nil];

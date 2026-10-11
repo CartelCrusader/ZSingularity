@@ -10,7 +10,7 @@
 #include "Crunch/crn_decomp.h"
 #pragma clang diagnostic pop
 
-#import "ZSCrunch.h"
+#import "Crunch.h"
 #import "ZTweakLog.h"
 
 static const uint32_t kZSCrunchMaxDimension = 16384u;

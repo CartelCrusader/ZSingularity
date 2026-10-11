@@ -1,5 +1,5 @@
 #import "IL2CppIntrospection.h"
-#import "ZSDumpTypeRegistry.h"
+#import "DumpTypeRegistry.h"
 #import "ZTweakLog.h"
 #import <dlfcn.h>
 #import <string.h>

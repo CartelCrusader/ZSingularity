@@ -1,4 +1,4 @@
-#import "ZSAstc.h"
+#import "Astc.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>

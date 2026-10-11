@@ -1,4 +1,4 @@
-#import "ZSDumper.h"
+#import "Dumper.h"
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <stdint.h>

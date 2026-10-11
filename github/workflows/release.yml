@@ -1,21 +1,19 @@
-name: Build Nightly release
+name: Release Tweak
 
 on:
   workflow_dispatch:
-  push:
-    paths-ignore:
-      - 'Documentation/**'
-      - 'README.md'
-      - 'assets/**'
-      - '.github/workflows/**'
-      - 'demo/**'
+    inputs:
+      version:
+        description: Version
+        required: false
+        type: string
 
 env:
   LZ4_REF: v1.10.0
   ASTCENC_REF: 4.8.0
 
 jobs:
-  nightly:
+  release:
     runs-on: macos-26
     permissions:
       contents: write
@@ -23,6 +21,55 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          if [[ -z "$VERSION" ]]; then
+            MAJOR=$(grep -oE '#define ZS_VERSION_MAJOR [0-9]+' Core/Version.h | grep -oE '[0-9]+$')
+            MINOR=$(grep -oE '#define ZS_VERSION_MINOR [0-9]+' Core/Version.h | grep -oE '[0-9]+$')
+            PATCH=$(grep -oE '#define ZS_VERSION_PATCH [0-9]+' Core/Version.h | grep -oE '[0-9]+$')
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "Version must be in X.Y.Z format, got: $VERSION" >&2
+              exit 1
+            fi
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Version.h
+        if: steps.version.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          [[ "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          VERSION_MAJOR="${BASH_REMATCH[1]}"
+          VERSION_MINOR="${BASH_REMATCH[2]}"
+          VERSION_PATCH="${BASH_REMATCH[3]}"
+          sed -i '' -E "s/#define ZS_VERSION_MAJOR .*/#define ZS_VERSION_MAJOR ${VERSION_MAJOR}/" Core/Version.h
+          sed -i '' -E "s/#define ZS_VERSION_MINOR .*/#define ZS_VERSION_MINOR ${VERSION_MINOR}/" Core/Version.h
+          sed -i '' -E "s/#define ZS_VERSION_PATCH .*/#define ZS_VERSION_PATCH ${VERSION_PATCH}/" Core/Version.h
+          cat Core/Version.h
+
+      - name: Commit updated Version.h
+        if: steps.version.outputs.bump == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- Core/Version.h; then
+            git add Core/Version.h
+            git commit -m "Bump version to ${{ steps.version.outputs.tag }}"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
@@ -108,8 +155,8 @@ jobs:
       - name: Compile Metal transcoder
         run: |
           set -euo pipefail
-          xcrun -sdk iphoneos metal -c -O3 -std=metal3.0 -target air64-apple-ios15.0 Mods/Transcoder/ZSAstc.metal -o ZSAstc.air
-          xcrun -sdk iphoneos metallib ZSAstc.air -o ZSAstc.metallib
+          xcrun -sdk iphoneos metal -c -O3 -std=metal3.0 -target air64-apple-ios15.0 Mods/Transcoder/Astc.metal -o Astc.air
+          xcrun -sdk iphoneos metallib Astc.air -o Astc.metallib
 
       - name: Compile ASTC encoder
         run: |
@@ -125,8 +172,8 @@ jobs:
             -arch arm64 \
             -miphoneos-version-min=15.0 \
             -I. -IDiagnostics -IMods/Transcoder -Iastcenc \
-            Mods/Transcoder/ZSAstc.mm \
-            -o ZSAstc.o
+            Mods/Transcoder/Astc.mm \
+            -o Astc.o
 
       - name: Compile Crunch decoder
         run: |
@@ -142,8 +189,8 @@ jobs:
             -arch arm64 \
             -miphoneos-version-min=15.0 \
             -I. -IDiagnostics -IMods/Transcoder \
-            Mods/Transcoder/ZSCrunch.mm \
-            -o ZSCrunch.o
+            Mods/Transcoder/Crunch.mm \
+            -o Crunch.o
 
       - name: Compile tweak dylib
         run: |
@@ -156,7 +203,7 @@ jobs:
             -arch arm64 \
             -miphoneos-version-min=15.0 \
             -DZS_BUILD_NUMBER=${{ github.run_number }} \
-            -DZS_BUILD_CHANNEL=nightly \
+            -DZS_BUILD_CHANNEL=release \
             -DZS_BUILD_BRANCH='"${{ github.ref_name }}"' \
             -framework Foundation \
             -framework UIKit \
@@ -173,26 +220,26 @@ jobs:
             -install_name "@rpath/ZSingularity.dylib" \
             -Wl,-ld_classic \
             -Wl,-sectcreate,__DATA,__enkephalin,Resources/Enkephalin.gif \
-            -Wl,-sectcreate,__DATA,__zsastcmetal,ZSAstc.metallib \
+            -Wl,-sectcreate,__DATA,__zsastcmetal,Astc.metallib \
             -I. \
             -ICore -IUI -IMods -IMods/BundleTools -IMods/Transcoder -INetwork -IDiagnostics -IResources -INotifications \
             Mods/BundleTools/UnityBundleTools.m \
             Mods/BundleTools/AssetExplorer.m \
             Core/IL2CppIntrospection.m \
-            Dumper/ZSDumper.m \
-            Core/ZSDumpTypeRegistry.m \
-            Core/ZSEngine.m \
-            Diagnostics/ZSDiagnostics.m \
+            Mods/Dumper/Dumper.m \
+            Core/DumpTypeRegistry.m \
+            Core/Engine.m \
+            Diagnostics/Diagnostics.m \
             Mods/Mods.m \
             Mods/Transcoder/Transcoder.m \
-            Mods/Transcoder/ZSLowRes.m \
-            ZSCrunch.o \
-            ZSAstc.o \
+            Mods/Transcoder/TexComp.m \
+            Crunch.o \
+            Astc.o \
             astcenc-obj/*.o \
             Network/PatchManifestNetwork.m \
-            Network/ZSUpdater.m \
+            Network/Updater.m \
             UI/UserInterface.m \
-            UI/ZSGifTint.m \
+            UI/GifTint.m \
             lz4.c \
             lz4hc.c \
             -o ZSingularity.dylib
@@ -203,23 +250,13 @@ jobs:
       - name: Verify architecture
         run: lipo -info ZSingularity.dylib
 
-      - name: Publish nightly release
+      - name: Create Draft GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          REPO="${{ github.repository }}"
-          
-          # Delete existing nightly release and wait for completion
-          if gh release view nightly --repo "$REPO" > /dev/null 2>&1; then
-            gh release delete nightly --repo "$REPO" --yes --cleanup-tag
-            sleep 2  # Wait for API to process deletion
-          fi
-          
-          # Create new nightly release
-          gh release create nightly ZSingularity.dylib \
-            --repo "$REPO" \
-            --title "Nightly build ${{ github.run_number }}" \
-            --notes "Automated nightly build ${{ github.run_number }} (commit ${{ github.sha }})." \
-            --prerelease \
-            --target "${{ github.sha }}"
+          gh release create "${{ steps.version.outputs.tag }}" ZSingularity.dylib \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes "Automated release ${{ steps.version.outputs.tag }} (build ${{ github.run_number }})" \
+            --draft

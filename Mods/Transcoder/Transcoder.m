@@ -2,11 +2,14 @@
 #import "ZTweakLog.h"
 #import "UnityBundleTools.h"
 #import "Mods.h"
-#import "ZSAstc.h"
-#import "ZSCrunch.h"
-#import "ZSEngine.h"
+#import "Astc.h"
+#import "Crunch.h"
+#import "Engine.h"
 #import "IL2CppIntrospection.h"
 #import <Metal/Metal.h>
+#import <os/lock.h>
+#import <os/proc.h>
+#include <stdatomic.h>
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
 #import <lz4hc.h>
@@ -125,6 +128,139 @@ static uint64_t zt_align_up(uint64_t value, uint64_t alignment) {
     uint64_t mask = alignment - 1;
     if (value > UINT64_MAX - mask) return UINT64_MAX;
     return (value + mask) & ~mask;
+}
+
+#define ZT_MAX_SLOTS 16
+static const uint64_t kZTWorkerMemoryFloor = 160ull * 1024ull * 1024ull;
+
+typedef uint64_t (^ZTEstimateBlock)(NSUInteger index);
+typedef BOOL (^ZTWorkBlock)(NSUInteger index, uint32_t worker, uint32_t threads);
+
+typedef struct {
+    _Atomic(NSUInteger) next;
+    _Atomic(int) stop;
+    _Atomic(NSUInteger) live;
+    NSUInteger count;
+    NSUInteger cap;
+} ZTRunState;
+
+static os_unfair_lock g_ztSlotLock = OS_UNFAIR_LOCK_INIT;
+static BOOL g_ztSlotBusy[ZT_MAX_SLOTS];
+
+static NSUInteger zt_slot_total(void) {
+    NSUInteger cores = NSProcessInfo.processInfo.activeProcessorCount;
+    return MIN((NSUInteger)ZT_MAX_SLOTS, MAX((NSUInteger)1, cores));
+}
+
+static dispatch_semaphore_t zt_slot_semaphore(void) {
+    static dispatch_semaphore_t semaphore;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        semaphore = dispatch_semaphore_create((long)zt_slot_total());
+        ZLog(@"[ZTranscoder] worker pool sized to %lu worker(s)", (unsigned long)zt_slot_total());
+    });
+    return semaphore;
+}
+
+static int zt_slot_take(BOOL wait) {
+    dispatch_time_t when = wait ? DISPATCH_TIME_FOREVER : DISPATCH_TIME_NOW;
+    if (dispatch_semaphore_wait(zt_slot_semaphore(), when) != 0) return -1;
+    int slot = -1;
+    os_unfair_lock_lock(&g_ztSlotLock);
+    for (int i = 0; i < ZT_MAX_SLOTS; i++) {
+        if (!g_ztSlotBusy[i]) {
+            g_ztSlotBusy[i] = YES;
+            slot = i;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&g_ztSlotLock);
+    return slot;
+}
+
+static void zt_slot_give(int slot) {
+    if (slot < 0) return;
+    os_unfair_lock_lock(&g_ztSlotLock);
+    g_ztSlotBusy[slot] = NO;
+    os_unfair_lock_unlock(&g_ztSlotLock);
+    dispatch_semaphore_signal(zt_slot_semaphore());
+}
+
+static BOOL zt_memory_allows(uint64_t need) {
+    int64_t available = (int64_t)os_proc_available_memory();
+    return available <= 0 || (uint64_t)available >= need + kZTWorkerMemoryFloor;
+}
+
+static NSOperationQueue *zt_job_queue(void) {
+    static NSOperationQueue *queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = [NSOperationQueue new];
+        queue.name = @"zs.transcoder.jobs";
+        queue.qualityOfService = NSQualityOfServiceUserInitiated;
+        queue.maxConcurrentOperationCount = (NSInteger)zt_slot_total();
+    });
+    return queue;
+}
+
+static void zt_run_worker(ZTRunState *state, dispatch_group_t group, ZTEstimateBlock estimate, ZTWorkBlock work, int slot);
+
+static void zt_run_spawn(ZTRunState *state, dispatch_group_t group, ZTEstimateBlock estimate, ZTWorkBlock work, int slot) {
+    dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        zt_run_worker(state, group, estimate, work, slot);
+    });
+}
+
+static void zt_run_worker(ZTRunState *state, dispatch_group_t group, ZTEstimateBlock estimate, ZTWorkBlock work, int slot) {
+    uint32_t threads = zt_slot_total() > 1 ? 1u : 0u;
+    ZLog(@"[ZTranscoder] worker %d started", slot);
+    NSUInteger handled = 0;
+    for (;;) {
+        if (atomic_load(&state->stop)) break;
+        NSUInteger peek = atomic_load(&state->next);
+        if (peek >= state->count) break;
+        NSUInteger live = atomic_load(&state->live);
+        if (live < state->cap && state->count - peek > live) {
+            uint64_t need = estimate ? estimate(peek) : 0;
+            if (zt_memory_allows(need)) {
+                int extra = zt_slot_take(NO);
+                if (extra >= 0) {
+                    NSUInteger expected = live;
+                    if (atomic_compare_exchange_strong(&state->live, &expected, live + 1)) {
+                        zt_run_spawn(state, group, estimate, work, extra);
+                    } else {
+                        zt_slot_give(extra);
+                    }
+                }
+            }
+        }
+        NSUInteger index = atomic_fetch_add(&state->next, 1);
+        if (index >= state->count) break;
+        BOOL ok = NO;
+        @autoreleasepool {
+            ok = work(index, (uint32_t)slot, threads);
+        }
+        handled++;
+        if (!ok) atomic_store(&state->stop, 1);
+    }
+    atomic_fetch_sub(&state->live, 1);
+    ZLog(@"[ZTranscoder] worker %d exiting, %lu texture(s) handled", slot, (unsigned long)handled);
+    zt_slot_give(slot);
+}
+
+static void zt_parallel_run(NSUInteger count, ZTEstimateBlock estimate, ZTWorkBlock work) {
+    if (count == 0) return;
+    int slot = zt_slot_take(YES);
+    ZTRunState state;
+    atomic_init(&state.next, 0);
+    atomic_init(&state.stop, 0);
+    atomic_init(&state.live, 1);
+    state.count = count;
+    state.cap = MIN(count, zt_slot_total());
+    ZLog(@"[ZTranscoder] transcoding %lu texture(s) with up to %lu worker(s)", (unsigned long)count, (unsigned long)state.cap);
+    dispatch_group_t group = dispatch_group_create();
+    zt_run_worker(&state, group, estimate, work, slot);
+    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
 }
 
 static NSString *zt_temp_directory(void) {
@@ -1121,7 +1257,7 @@ static NSMutableData *zt_resize_rgba(NSData *rgba, uint32_t srcWidth, uint32_t s
     return output;
 }
 
-static BOOL zt_make_astc_replacement(ZTTextureRecord *source, ZTTextureRecord *destination, NSData *payload, NSString *workDir, NSString **outPath, uint32_t *outSize, NSError **error, void (^progress)(double, NSString *)) {
+static BOOL zt_make_astc_replacement(ZTTextureRecord *source, ZTTextureRecord *destination, NSData *payload, NSString *workDir, NSString **outPath, uint32_t *outSize, NSError **error, void (^progress)(double, NSString *), uint32_t worker, uint32_t threads) {
     if (source.mipCount <= 0) {
         if (error) *error = ZTMakeTranscoderError(ZTranscoderServiceErrorCantReadModdedBundle, @"Texture2D has an invalid mip count.");
         return NO;
@@ -1171,11 +1307,16 @@ static BOOL zt_make_astc_replacement(ZTTextureRecord *source, ZTTextureRecord *d
     }
     uint64_t totalOutput = 0;
     if (ok) {
-        NSError *encodeError = nil;
-        NSData *astc = ZSAstcEncodeRGBA8(rgba, outWidth, outHeight, 6u, destination.colorSpace != 0, ZSAstcQualityHigh, &encodeError);
+        ZSAstcJob astcJob = { outWidth, outHeight, 6u, destination.colorSpace != 0, ZSAstcQualityHigh, ZSAstcSourceRGBA8, worker, threads };
+        uint8_t *encodedBytes = NULL;
+        size_t encodedLength = 0;
+        char encodeWhy[256] = {0};
+        int encodeResult = ZSAstcEncode(&astcJob, (const uint8_t *)rgba.bytes, rgba.length, &encodedBytes, &encodedLength, NULL, encodeWhy, sizeof(encodeWhy));
         rgba = nil;
+        NSData *astc = (encodeResult == 0 && encodedBytes) ? [NSData dataWithBytesNoCopy:encodedBytes length:encodedLength freeWhenDone:YES] : nil;
+        if (astc) ZLog(@"[ASTC] %s", encodeWhy);
         if (!astc) {
-            if (error) *error = encodeError ?: ZTMakeTranscoderError(ZTranscoderServiceErrorCantReadModdedBundle, [NSString stringWithFormat:@"Couldn't encode Texture2D %@ as ASTC 6x6.", source.name]);
+            if (error) *error = ZTMakeTranscoderError(ZTranscoderServiceErrorCantReadModdedBundle, encodeWhy[0] ? [NSString stringWithFormat:@"Couldn't encode Texture2D %@ as ASTC 6x6: %s", source.name, encodeWhy] : [NSString stringWithFormat:@"Couldn't encode Texture2D %@ as ASTC 6x6.", source.name]);
             ok = NO;
         } else if (!zt_write_all(writer, astc.bytes, astc.length, error)) {
             ok = NO;
@@ -1997,41 +2138,62 @@ static BOOL zt_transcode_modded_bundle_in(NSString *workDir, NSString *inputPath
         [pending addObject:texture];
     }
     NSMutableDictionary<NSString *, ZTTextureReplacement *> *replacements = [NSMutableDictionary dictionaryWithCapacity:pending.count];
-    NSUInteger completed = 0;
-    for (ZTTextureRecord *texture in pending) {
-        @autoreleasepool {
-            NSData *payload = nil;
-            if (!zt_texture_payload(texture, sourceArchive, doc.data, &payload, error)) return NO;
-            NSData *objectData = zt_object_data(texture.object, doc.data);
-            if (!objectData) {
-                if (error) *error = ZTMakeTranscoderError(ZTranscoderServiceErrorCantReadModdedBundle, [NSString stringWithFormat:@"Couldn't extract Texture2D PathID=%lld.", (long long)texture.object.pathID]);
-                return NO;
-            }
-            double base = (double)completed / (double)pending.count;
-            double span = 1.0 / (double)pending.count;
-            NSString *encodedPath = nil;
-            uint32_t encodedSize = 0;
-            NSError *transcodeError = nil;
-            BOOL transcoded = zt_make_astc_replacement(texture, texture, payload, workDir, &encodedPath, &encodedSize, &transcodeError, ^(double f, NSString *stage) {
-                if (progress) progress(0.1 + 0.75 * (base + span * f), stage);
-            });
-            if (!transcoded) {
-                if (error) *error = transcodeError;
-                return NO;
-            }
-            ZTTextureReplacement *replacement = [ZTTextureReplacement new];
-            replacement.source = texture;
-            replacement.target = texture;
-            replacement.baseTexture = texture;
-            replacement.baseObjectData = objectData;
-            replacement.outputFormat = 50;
-            replacement.outputMipCount = 1;
-            replacement.encodedPath = encodedPath;
-            replacement.encodedSize = encodedSize;
-            replacements[[NSString stringWithFormat:@"%lld", (long long)texture.object.pathID]] = replacement;
-            ZLog(@"[ZTranscoder] Texture2D '%@' PathID=%lld %ux%u: %@ (%d) -> ASTC 6x6 (50), %lu -> %u bytes", texture.name.length ? texture.name : @"<unnamed>", (long long)texture.object.pathID, texture.width, texture.height, zt_format_name(texture.format), texture.format, (unsigned long)payload.length, encodedSize);
+    __block NSUInteger completed = 0;
+    __block BOOL failed = NO;
+    __block NSError *failure = nil;
+    os_unfair_lock resultLock = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock *resultLockPtr = &resultLock;
+    zt_parallel_run(pending.count, ^uint64_t(NSUInteger index) {
+        ZTTextureRecord *texture = pending[index];
+        return (uint64_t)texture.width * (uint64_t)texture.height * 8u + texture.imageDataLength + texture.streamSize;
+    }, ^BOOL(NSUInteger index, uint32_t worker, uint32_t threads) {
+        ZTTextureRecord *texture = pending[index];
+        NSData *payload = nil;
+        NSError *localError = nil;
+        if (!zt_texture_payload(texture, sourceArchive, doc.data, &payload, &localError)) {
+            os_unfair_lock_lock(resultLockPtr);
+            if (!failed) { failed = YES; failure = localError; }
+            os_unfair_lock_unlock(resultLockPtr);
+            return NO;
         }
+        NSData *objectData = zt_object_data(texture.object, doc.data);
+        if (!objectData) {
+            os_unfair_lock_lock(resultLockPtr);
+            if (!failed) { failed = YES; failure = ZTMakeTranscoderError(ZTranscoderServiceErrorCantReadModdedBundle, [NSString stringWithFormat:@"Couldn't extract Texture2D PathID=%lld.", (long long)texture.object.pathID]); }
+            os_unfair_lock_unlock(resultLockPtr);
+            return NO;
+        }
+        NSString *encodedPath = nil;
+        uint32_t encodedSize = 0;
+        NSError *transcodeError = nil;
+        BOOL transcoded = zt_make_astc_replacement(texture, texture, payload, workDir, &encodedPath, &encodedSize, &transcodeError, nil, worker, threads);
+        if (!transcoded) {
+            os_unfair_lock_lock(resultLockPtr);
+            if (!failed) { failed = YES; failure = transcodeError; }
+            os_unfair_lock_unlock(resultLockPtr);
+            return NO;
+        }
+        ZTTextureReplacement *replacement = [ZTTextureReplacement new];
+        replacement.source = texture;
+        replacement.target = texture;
+        replacement.baseTexture = texture;
+        replacement.baseObjectData = objectData;
+        replacement.outputFormat = 50;
+        replacement.outputMipCount = 1;
+        replacement.encodedPath = encodedPath;
+        replacement.encodedSize = encodedSize;
+        os_unfair_lock_lock(resultLockPtr);
+        replacements[[NSString stringWithFormat:@"%lld", (long long)texture.object.pathID]] = replacement;
         completed++;
+        double fraction = (double)completed / (double)pending.count;
+        os_unfair_lock_unlock(resultLockPtr);
+        ZLog(@"[ZTranscoder] worker %u: Texture2D '%@' PathID=%lld %ux%u: %@ (%d) -> ASTC 6x6 (50), %lu -> %u bytes", worker, texture.name.length ? texture.name : @"<unnamed>", (long long)texture.object.pathID, texture.width, texture.height, zt_format_name(texture.format), texture.format, (unsigned long)payload.length, encodedSize);
+        if (progress) progress(0.1 + 0.75 * fraction, [NSString stringWithFormat:@"Encoded %@ as ASTC 6x6", texture.name.length ? texture.name : @"<unnamed>"]);
+        return YES;
+    });
+    if (failed) {
+        if (error) *error = failure;
+        return NO;
     }
 
     if (progress) progress(0.85, @"Rebuilding the SerializedFile");
@@ -2148,6 +2310,7 @@ static BOOL zt_process_bundle_full(NSURL *moddedURL, ZTranscoderConfig *config, 
     NSMutableArray<ZTSerializedObject *> *addedObjects = [NSMutableArray array];
     NSMutableArray<ZTTextureRecord *> *addedTextures = [NSMutableArray array];
     NSMutableDictionary<NSString *, ZTTextureReplacement *> *replacements = [NSMutableDictionary dictionary];
+    NSMutableArray<NSDictionary *> *encodeTasks = [NSMutableArray array];
     NSUInteger assetCount = 0;
     BOOL layoutShared = carra2Mode || (sourceDoc.trailer.length > 0 && [sourceDoc.trailer isEqualToData:targetDoc.trailer]);
     ZLog(@"[ZTranscoder] SerializedFile externals/script tables %@ between the mod and the original; %@", layoutShared ? @"match" : @"differ", layoutShared ? @"transplanting every changed object" : @"transplanting only texture/sprite/text classes");
@@ -2173,7 +2336,7 @@ static BOOL zt_process_bundle_full(NSURL *moddedURL, ZTranscoderConfig *config, 
             if (probeTexture && !probeTexture.isInline && !sourceArchive) {
                 skippedAssets++;
                 ZLog(@"[ZTranscoder] Texture2D PathID=%lld name=%@ has no readable pixel data in this mod (no resource stream was supplied); leaving the original untouched", (long long)sourceObject.pathID, probeTexture.name.length ? probeTexture.name : @"<unnamed>");
-                if (progress && assetCount) progress(0.1 + 0.7 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
+                if (progress && assetCount) progress(0.1 + 0.1 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
                 continue;
             }
         }
@@ -2185,7 +2348,7 @@ static BOOL zt_process_bundle_full(NSURL *moddedURL, ZTranscoderConfig *config, 
             if (!newTypeIndex) {
                 skippedAssets++;
                 ZLog(@"[ZTranscoder] skipping class=%d PathID=%lld (%@): its type couldn't be copied into the original bundle", sourceObject.classID, (long long)sourceObject.pathID, key);
-                if (progress && assetCount) progress(0.1 + 0.7 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
+                if (progress && assetCount) progress(0.1 + 0.1 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
                 continue;
             }
             ZTSerializedObject *addedObject = [ZTSerializedObject new];
@@ -2251,7 +2414,7 @@ static BOOL zt_process_bundle_full(NSURL *moddedURL, ZTranscoderConfig *config, 
             if (zt_format_is_astc(sourceTexture.format) && sourceTexture.isInline && sourceObjectData) {
                 targetObject.replacementObject = sourceObjectData;
                 ZLog(@"[ZTranscoder] Texture2D PathID=%lld is already %@; copied from the mod without re-encoding", (long long)sourceObject.pathID, zt_format_name(sourceTexture.format));
-                if (progress && assetCount) progress(0.1 + 0.7 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
+                if (progress && assetCount) progress(0.1 + 0.1 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
                 continue;
             }
             ZTTextureRecord *layoutTexture = sourceTexture;
@@ -2263,30 +2426,7 @@ static BOOL zt_process_bundle_full(NSURL *moddedURL, ZTranscoderConfig *config, 
             replacement.baseObjectData = layoutObjectData;
             replacement.outputFormat = 50;
             replacement.outputMipCount = 1;
-            NSString *encodedPath = nil;
-            uint32_t encodedSize = 0;
-            NSError *transcodeError = nil;
-            BOOL transcoded = NO;
-            @autoreleasepool {
-                NSError *innerError = nil;
-                transcoded = zt_make_astc_replacement(sourceTexture, layoutTexture, sourcePayload, workDir, &encodedPath, &encodedSize, &innerError, ^(double f, NSString *stage) {
-                    if (progress) {
-                        double base = assetCount ? ((double)(processedAssets - 1u) / (double)assetCount) : 0.0;
-                        double span = assetCount ? (1.0 / (double)assetCount) : 1.0;
-                        progress(0.1 + 0.7 * (base + span * f), stage);
-                    }
-                });
-                transcodeError = innerError;
-            }
-            if (!transcoded) {
-                if (error) *error = transcodeError;
-                [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
-                return NO;
-            }
-            replacement.encodedPath = encodedPath;
-            replacement.encodedSize = encodedSize;
-            replacements[replacementKey] = replacement;
-            ZLog(@"[ZTranscoder] Texture2D PathID=%lld pixel data written as ASTC 6x6 at %ux%u: %lu -> %u bytes", (long long)sourceObject.pathID, layoutTexture.width, layoutTexture.height, (unsigned long)sourcePayload.length, encodedSize);
+            [encodeTasks addObject:@{ @"replacement": replacement, @"source": sourceTexture, @"layout": layoutTexture, @"payload": sourcePayload, @"key": replacementKey }];
         } else {
             NSData *sourceObjectData = zt_object_data(sourceObject, sourceDoc.data);
             NSData *targetObjectData = zt_object_data(targetObject, targetDoc.data);
@@ -2299,7 +2439,51 @@ static BOOL zt_process_bundle_full(NSURL *moddedURL, ZTranscoderConfig *config, 
             ZLog(@"[ZTranscoder] class=%d PathID=%lld objectBytes source=%lu target=%lu bytesMatch=%@", sourceObject.classID, (long long)sourceObject.pathID, (unsigned long)sourceObjectData.length, (unsigned long)targetObjectData.length, bytesMatch ? @"YES" : @"NO");
             if (isNewAsset || !bytesMatch) targetObject.replacementObject = sourceObjectData;
         }
-        if (progress && assetCount) progress(0.1 + 0.7 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
+        if (progress && assetCount) progress(0.1 + 0.1 * ((double)processedAssets / (double)assetCount), [NSString stringWithFormat:@"Compared asset %lu/%lu", (unsigned long)processedAssets, (unsigned long)assetCount]);
+    }
+    if (encodeTasks.count > 0) {
+        NSUInteger encodeTotal = encodeTasks.count;
+        __block BOOL encodeFailed = NO;
+        __block NSError *encodeFailure = nil;
+        __block NSUInteger encodeDone = 0;
+        os_unfair_lock encodeLock = OS_UNFAIR_LOCK_INIT;
+        os_unfair_lock *encodeLockPtr = &encodeLock;
+        zt_parallel_run(encodeTotal, ^uint64_t(NSUInteger index) {
+            ZTTextureRecord *layout = encodeTasks[index][@"layout"];
+            NSData *payload = encodeTasks[index][@"payload"];
+            return (uint64_t)layout.width * (uint64_t)layout.height * 8u + payload.length;
+        }, ^BOOL(NSUInteger index, uint32_t worker, uint32_t threads) {
+            NSDictionary *task = encodeTasks[index];
+            ZTTextureRecord *taskSource = task[@"source"];
+            ZTTextureRecord *taskLayout = task[@"layout"];
+            NSData *taskPayload = task[@"payload"];
+            ZTTextureReplacement *taskReplacement = task[@"replacement"];
+            NSString *encodedPath = nil;
+            uint32_t encodedSize = 0;
+            NSError *transcodeError = nil;
+            BOOL transcoded = zt_make_astc_replacement(taskSource, taskLayout, taskPayload, workDir, &encodedPath, &encodedSize, &transcodeError, nil, worker, threads);
+            if (!transcoded) {
+                os_unfair_lock_lock(encodeLockPtr);
+                if (!encodeFailed) { encodeFailed = YES; encodeFailure = transcodeError; }
+                os_unfair_lock_unlock(encodeLockPtr);
+                return NO;
+            }
+            taskReplacement.encodedPath = encodedPath;
+            taskReplacement.encodedSize = encodedSize;
+            os_unfair_lock_lock(encodeLockPtr);
+            encodeDone++;
+            double fraction = (double)encodeDone / (double)encodeTotal;
+            os_unfair_lock_unlock(encodeLockPtr);
+            ZLog(@"[ZTranscoder] worker %u: Texture2D PathID=%lld pixel data written as ASTC 6x6 at %ux%u: %lu -> %u bytes", worker, (long long)taskSource.object.pathID, taskLayout.width, taskLayout.height, (unsigned long)taskPayload.length, encodedSize);
+            if (progress) progress(0.2 + 0.6 * fraction, [NSString stringWithFormat:@"Encoded %@ as ASTC 6x6", taskLayout.name.length ? taskLayout.name : (taskSource.name.length ? taskSource.name : @"<unnamed>")]);
+            return YES;
+        });
+        if (encodeFailed) {
+            if (error) *error = encodeFailure;
+            [[NSFileManager defaultManager] removeItemAtPath:workDir error:nil];
+            return NO;
+        }
+        for (NSDictionary *task in encodeTasks) replacements[task[@"key"]] = task[@"replacement"];
     }
     ZLog(@"[ZTranscoder] asset matching finished: matched=%lu skipped=%lu replacementTextures=%lu", (unsigned long)matchedAssets, (unsigned long)skippedAssets, (unsigned long)replacements.count);
     if (addedObjects.count) {
@@ -2542,7 +2726,7 @@ static BOOL zt_load_carra2(NSURL *archiveURL, NSString **outBundlePath, NSArray<
 
 @implementation ZTranscoderService
 + (void)ztranscoderBundleAtURL:(NSURL *)moddedBundleURL config:(ZTranscoderConfig *)config progress:(void (^)(double, NSString *))progress completion:(void (^)(NSURL *, NSError *))completion {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    [zt_job_queue() addOperationWithBlock:^{
         @autoreleasepool {
             NSURL *output = nil;
             NSError *error = nil;
@@ -2553,12 +2737,12 @@ static BOOL zt_load_carra2(NSURL *archiveURL, NSString **outBundlePath, NSArray<
             BOOL ok = zt_process_bundle(moddedBundleURL, config, mainProgress, &output, &error);
             dispatch_async(dispatch_get_main_queue(), ^{ completion(ok ? output : nil, error); });
         }
-    });
+    }];
 }
 
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL carra2Hash1:(NSString *)carra2Hash1 carra2Hash2:(NSString *)carra2Hash2 config:(ZTranscoderConfig *)config previousScratchBranch:(NSString *)previousScratchBranch uploadProgress:(void (^)(int64_t, int64_t))uploadProgress completion:(void (^)(ZTranscoderHandle *, NSError *))completion {
     (void)previousScratchBranch;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    [zt_job_queue() addOperationWithBlock:^{
         @autoreleasepool {
             NSURL *workURL = moddedBundleURL;
             NSArray<ZTCarra2Item *> *carra2Items = nil;
@@ -2621,7 +2805,7 @@ static BOOL zt_load_carra2(NSURL *archiveURL, NSString **outBundlePath, NSArray<
             handle.compressedByteSize = zt_file_size(output.path);
             dispatch_async(dispatch_get_main_queue(), ^{ completion(handle, nil); });
         }
-    });
+    }];
 }
 
 + (BOOL)isUploadCompressionEnabled { return NO; }

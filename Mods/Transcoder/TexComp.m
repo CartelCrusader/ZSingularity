@@ -1,4 +1,4 @@
-#import "ZSLowRes.h"
+#import "TexComp.h"
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -21,13 +21,14 @@
 #include <malloc/malloc.h>
 
 #import "UnityBundleTools.h"
-#import "ZSAstc.h"
+#import "Astc.h"
 #import "ZTweakLog.h"
 #include "lz4.h"
 #include "lz4hc.h"
 
 #define ZSLR_BLOCK_SIZE 131072u
 #define ZSLR_FORMAT_ASTC_6x6 50
+#define ZSLR_FORMAT_RGBA32 4
 
 static volatile int g_zslrQuiet = 0;
 static volatile uint32_t g_zslrTargetBlock = 0;
@@ -40,9 +41,9 @@ static uint32_t zslr_block(void) {
 static int32_t zslr_target_format(void) {
     return ZSAstcUnityFormat(zslr_block());
 }
-#define ZSLR_LOG(label, fmt, ...) do { if (!g_zslrQuiet) ZLog(@"[LowRes] %s: " fmt, (label), ##__VA_ARGS__); } while (0)
+#define ZSLR_LOG(label, fmt, ...) do { if (!g_zslrQuiet) ZLog(@"[TexComp] %s: " fmt, (label), ##__VA_ARGS__); } while (0)
 static volatile int g_zslrVerbose = 0;
-#define ZSLR_VLOG(label, fmt, ...) do { if (g_zslrVerbose && !g_zslrQuiet) ZLog(@"[LowRes] %s: " fmt, (label), ##__VA_ARGS__); } while (0)
+#define ZSLR_VLOG(label, fmt, ...) do { if (g_zslrVerbose && !g_zslrQuiet) ZLog(@"[TexComp] %s: " fmt, (label), ##__VA_ARGS__); } while (0)
 #define ZSLR_MB(bytes) ((unsigned long long)((bytes) / (1024ull * 1024ull)))
 #define ZSLR_MS(since) ((CACurrentMediaTime() - (since)) * 1000.0)
 #define ZSLR_WHY(...) do { if (why && whyLen) snprintf(why, whyLen, __VA_ARGS__); } while (0)
@@ -143,7 +144,7 @@ typedef struct {
     void *user;
     int (*reserve)(void *user, uint64_t workingSetBytes);
     int (*tick)(void *user);
-    int (*transcode)(void *user, const uint8_t *src, size_t srcLen, uint32_t width, uint32_t height, int srgb, uint8_t **out, size_t *outLen, char *why, size_t whyLen);
+    int (*transcode)(void *user, const uint8_t *src, size_t srcLen, uint32_t width, uint32_t height, int32_t format, int srgb, uint8_t **out, size_t *outLen, char *why, size_t whyLen);
     void (*progress)(void *user, uint32_t delta);
     void (*parallel)(void *user, uint32_t count, ZSLRTaskFn task, void *ctx);
     int (*acquire)(void *user, uint64_t bytes);
@@ -507,6 +508,15 @@ static int zslr_bundle_locate(const ZSLRBundle *b, int *serializedIndex, int *st
 
 static uint64_t zslr_astc_size(uint32_t width, uint32_t height, uint32_t blockX, uint32_t blockY) {
     return (uint64_t)((width + blockX - 1) / blockX) * (uint64_t)((height + blockY - 1) / blockY) * 16u;
+}
+
+static int zslr_format_supported(int32_t format) {
+    return format == ZSLR_FORMAT_ASTC_6x6 || format == ZSLR_FORMAT_RGBA32;
+}
+
+static uint64_t zslr_source_size(uint32_t width, uint32_t height, int32_t format) {
+    if (format == ZSLR_FORMAT_RGBA32) return (uint64_t)width * (uint64_t)height * 4u;
+    return zslr_astc_size(width, height, 6, 6);
 }
 
 static void zslr_patch_texture(uint8_t *cab, const ZSLRTexture *t, int32_t newFormat, uint32_t newSize) {
@@ -1397,7 +1407,7 @@ static int zslr_transcode_texture(ZSLRTranscodeCtx *c, uint32_t i, void *worker)
     char why[160] = {0};
     const char *texName = t->name[0] ? t->name : "<unnamed>";
     double texStart = CACurrentMediaTime();
-    int tr = codec->transcode(worker, srcBuf, srcLen, t->width, t->height, t->colorSpace == 1, &out, &outLen, why, sizeof(why));
+    int tr = codec->transcode(worker, srcBuf, srcLen, t->width, t->height, t->format, t->colorSpace == 1, &out, &outLen, why, sizeof(why));
     free(srcBuf);
     if (tr == 0 && out && outLen != newSize) {
         snprintf(why, sizeof(why), "output size %zu, expected %u", outLen, newSize);
@@ -1749,12 +1759,12 @@ static int zslr_process_bundle(const char *label, const char *srcPath, const cha
     uint32_t fFormat = 0, fMips = 0, fDims = 0, fPixels = 0, fSize = 0, fRange = 0, fName = 0, fPath = 0, fOverlap = 0;
     for (uint32_t i = 0; i < texCount; i++) {
         const ZSLRTexture *t = &textures[i];
-        if (t->format != ZSLR_FORMAT_ASTC_6x6) { fFormat++; continue; }
+        if (!zslr_format_supported(t->format)) { fFormat++; continue; }
         if (t->mipCount != 1) { fMips++; continue; }
         if (t->width == 0 || t->height == 0) { fDims++; continue; }
         uint64_t pixels = (uint64_t)t->width * t->height;
         if (pixels < policy->minPixels || pixels > policy->maxPixels) { fPixels++; continue; }
-        uint64_t expected = zslr_astc_size(t->width, t->height, 6, 6);
+        uint64_t expected = zslr_source_size(t->width, t->height, t->format);
         if (t->imageDataLength != 0) {
             if (t->streamSize != 0 || t->imageDataLength != expected || t->completeImageSize != expected) { fSize++; continue; }
             if (t->imageDataPosition < t->objectStart || t->imageDataPosition + 4u + t->imageDataLength > t->objectStart + t->objectSize) { fRange++; continue; }
@@ -1781,7 +1791,7 @@ static int zslr_process_bundle(const char *label, const char *srcPath, const cha
     for (uint32_t i = 0; i < inlCount; i++) cands[candCount++] = inl[i];
     result->candidates = candCount;
     if (candCount == 0) {
-        const char *names[] = { "not ASTC 6x6", "mip count not 1", "zero dimensions", "outside pixel limits", "size mismatch", "stream range invalid", "name filter", "stream path mismatch", "overlapping stream" };
+        const char *names[] = { "unsupported format", "mip count not 1", "zero dimensions", "outside pixel limits", "size mismatch", "stream range invalid", "name filter", "stream path mismatch", "overlapping stream" };
         uint32_t counts[] = { fFormat, fMips, fDims, fPixels, fSize, fRange, fName, fPath, fOverlap };
         uint32_t best = 0;
         for (uint32_t i = 1; i < 9; i++) {
@@ -2038,24 +2048,24 @@ done:
 
 #pragma mark - Objective-C layer
 
-static const uint32_t kZSLowResMinPixels = 256u * 256u;
-static const uint32_t kZSLowResMaxPixels = 4096u * 4096u;
-static const uint64_t kZSLowResMaxResultBytes = UINT64_MAX;
-static const int64_t kZSLowResFullSpeedAbove = 300ll * 1024 * 1024;
-static const int64_t kZSLowResHalfSpeedAbove = 200ll * 1024 * 1024;
-static const int64_t kZSLowResPauseBelow = 110ll * 1024 * 1024;
-static const int64_t kZSLowResResumeAbove = 150ll * 1024 * 1024;
-static const int64_t kZSLowResSlowLaneMin = 72ll * 1024 * 1024;
-static const int64_t kZSLowResReserveBytes = 96ll * 1024 * 1024;
-static const int64_t kZSLowResTextureFloor = 64ll * 1024 * 1024;
-static const NSTimeInterval kZSLowResMemoryWaitLimit = 30.0;
-static const NSTimeInterval kZSLowResTextureWaitLimit = 40.0;
-static const NSTimeInterval kZSLowResStallLimit = 45.0;
-static const NSTimeInterval kZSLowResGiveUpLimit = 240.0;
-static const NSUInteger kZSLowResMaxRetries = 2;
-static const NSTimeInterval kZSLowResWarningPause = 8.0;
+static const uint32_t kTexCompMinPixels = 256u * 256u;
+static const uint32_t kTexCompMaxPixels = 4096u * 4096u;
+static const uint64_t kTexCompMaxResultBytes = UINT64_MAX;
+static const int64_t kTexCompFullSpeedAbove = 300ll * 1024 * 1024;
+static const int64_t kTexCompHalfSpeedAbove = 200ll * 1024 * 1024;
+static const int64_t kTexCompPauseBelow = 110ll * 1024 * 1024;
+static const int64_t kTexCompResumeAbove = 150ll * 1024 * 1024;
+static const int64_t kTexCompSlowLaneMin = 72ll * 1024 * 1024;
+static const int64_t kTexCompReserveBytes = 96ll * 1024 * 1024;
+static const int64_t kTexCompTextureFloor = 64ll * 1024 * 1024;
+static const NSTimeInterval kTexCompMemoryWaitLimit = 30.0;
+static const NSTimeInterval kTexCompTextureWaitLimit = 40.0;
+static const NSTimeInterval kTexCompStallLimit = 45.0;
+static const NSTimeInterval kTexCompGiveUpLimit = 240.0;
+static const NSUInteger kTexCompMaxRetries = 2;
+static const NSTimeInterval kTexCompWarningPause = 8.0;
 #define ZSLR_MAX_WORKERS 8
-static const NSUInteger kZSLowResMaxWorkers = ZSLR_MAX_WORKERS;
+static const NSUInteger kTexCompMaxWorkers = ZSLR_MAX_WORKERS;
 
 typedef struct {
     NSUInteger index;
@@ -2073,7 +2083,7 @@ typedef struct {
 static os_unfair_lock g_zslrLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock g_zslrJobLock = OS_UNFAIR_LOCK_INIT;
 static ZSLRJob *g_zslrJobs[ZSLR_MAX_WORKERS];
-static ZSLowResStatus g_zslrStatus;
+static TexCompStatus g_zslrStatus;
 static volatile BOOL g_zslrCancel = NO;
 static double g_zslrWarningUntil = 0;
 static BOOL g_zslrHoldPaused = NO;
@@ -2092,7 +2102,7 @@ static NSUInteger g_zslrNextItem = 0;
 static NSMutableDictionary<NSString *, NSDictionary *> *g_zslrLedger;
 static NSUInteger g_zslrLedgerDirty = 0;
 static os_unfair_lock g_zslrCountLock = OS_UNFAIR_LOCK_INIT;
-static const NSInteger kZSLRScanCacheVersion = 4;
+static const NSInteger kZSLRScanCacheVersion = 5;
 static double g_zslrTranscodeStart = 0;
 static BOOL g_zslrWorkerActive[ZSLR_MAX_WORKERS];
 static NSUInteger g_zslrWorkerSeq[ZSLR_MAX_WORKERS];
@@ -2121,16 +2131,16 @@ static NSUInteger zslr_allowed_workers(void) {
     } else if (avail <= 0) {
         allowed = g_zslrMaxWorkers;
         state = 5;
-    } else if ((g_zslrHoldPaused && avail < kZSLowResResumeAbove) || avail < kZSLowResPauseBelow) {
+    } else if ((g_zslrHoldPaused && avail < kTexCompResumeAbove) || avail < kTexCompPauseBelow) {
         g_zslrHoldPaused = YES;
         allowed = 0;
         state = 3;
     } else {
         g_zslrHoldPaused = NO;
-        if (avail >= kZSLowResFullSpeedAbove) {
+        if (avail >= kTexCompFullSpeedAbove) {
             allowed = g_zslrMaxWorkers;
             state = 0;
-        } else if (avail >= kZSLowResHalfSpeedAbove) {
+        } else if (avail >= kTexCompHalfSpeedAbove) {
             allowed = MAX((NSUInteger)1, g_zslrMaxWorkers / 2);
             state = 1;
         } else {
@@ -2141,10 +2151,10 @@ static NSUInteger zslr_allowed_workers(void) {
     if (state == 3) {
         if (g_zslrPausedSince == 0) g_zslrPausedSince = now;
         double stalled = now - g_zslrPausedSince;
-        if (stalled >= kZSLowResStallLimit && avail >= kZSLowResSlowLaneMin) {
+        if (stalled >= kTexCompStallLimit && avail >= kTexCompSlowLaneMin) {
             allowed = 1;
             state = 6;
-        } else if (stalled >= kZSLowResGiveUpLimit && !g_zslrCancel) {
+        } else if (stalled >= kTexCompGiveUpLimit && !g_zslrCancel) {
             g_zslrGaveUp = YES;
             g_zslrCancel = YES;
             gaveUp = YES;
@@ -2160,7 +2170,7 @@ static NSUInteger zslr_allowed_workers(void) {
     os_unfair_lock_unlock(&g_zslrLock);
     if (changed) {
         static const char *names[] = { "full speed", "half speed", "single worker", "paused: low memory", "paused: memory warning cooldown", "memory reading unavailable", "single worker: low memory for too long" };
-        ZLog(@"[LowRes] throttle: %s, %lu/%lu worker(s) allowed, available %lld MB", names[state], (unsigned long)allowed, (unsigned long)maxWorkers,
+        ZLog(@"[TexComp] throttle: %s, %lu/%lu worker(s) allowed, available %lld MB", names[state], (unsigned long)allowed, (unsigned long)maxWorkers,
              (long long)(avail / (1024 * 1024)));
         if (state == 3) {
             ZSAstcDrainCaches();
@@ -2168,8 +2178,8 @@ static NSUInteger zslr_allowed_workers(void) {
         }
     }
     if (gaveUp) {
-        ZLog(@"[LowRes] stopping: available memory stayed below %lld MB for %.0fs (now %lld MB), progress is saved", (long long)(kZSLowResSlowLaneMin / (1024 * 1024)),
-             kZSLowResGiveUpLimit, (long long)(avail / (1024 * 1024)));
+        ZLog(@"[TexComp] stopping: available memory stayed below %lld MB for %.0fs (now %lld MB), progress is saved", (long long)(kTexCompSlowLaneMin / (1024 * 1024)),
+             kTexCompGiveUpLimit, (long long)(avail / (1024 * 1024)));
     }
     return allowed;
 }
@@ -2182,7 +2192,7 @@ static void zslr_wait_log(const char *what) {
     NSUInteger allowed = g_zslrStatus.allowedWorkers;
     os_unfair_lock_unlock(&g_zslrLock);
     if (due) {
-        ZLog(@"[LowRes] waiting: %s (allowed %lu, available %lld MB)", what, (unsigned long)allowed, (long long)(zslr_available_memory() / (1024 * 1024)));
+        ZLog(@"[TexComp] waiting: %s (allowed %lu, available %lld MB)", what, (unsigned long)allowed, (long long)(zslr_available_memory() / (1024 * 1024)));
     }
 }
 
@@ -2193,13 +2203,13 @@ static int zslr_codec_tick(void *user) {
 
 static int zslr_codec_reserve(void *user, uint64_t need) {
     (void)user;
-    double deadline = CACurrentMediaTime() + kZSLowResMemoryWaitLimit;
+    double deadline = CACurrentMediaTime() + kTexCompMemoryWaitLimit;
     double nextRelief = 0;
     while (!g_zslrCancel) {
         int64_t avail = zslr_available_memory();
         if (zslr_allowed_workers() > 0) {
             uint64_t after = atomic_fetch_add(&g_zslrBundleReserved, need) + need;
-            if (avail <= 0 || avail - kZSLowResReserveBytes >= (int64_t)after) return 0;
+            if (avail <= 0 || avail - kTexCompReserveBytes >= (int64_t)after) return 0;
             atomic_fetch_sub(&g_zslrBundleReserved, need);
         }
         double now = CACurrentMediaTime();
@@ -2221,14 +2231,14 @@ static void zslr_codec_unreserve(void *user, uint64_t need) {
 
 static int zslr_codec_acquire(void *user, uint64_t need) {
     (void)user;
-    double deadline = CACurrentMediaTime() + kZSLowResTextureWaitLimit;
+    double deadline = CACurrentMediaTime() + kTexCompTextureWaitLimit;
     double nextRelief = 0;
     while (!g_zslrCancel) {
         int64_t avail = zslr_available_memory();
         NSUInteger allowed = zslr_allowed_workers();
         if (allowed > 0) {
             uint64_t after = atomic_fetch_add(&g_zslrTextureInflight, need) + need;
-            if (avail <= 0 || avail - kZSLowResTextureFloor >= (int64_t)after) {
+            if (avail <= 0 || avail - kTexCompTextureFloor >= (int64_t)after) {
                 return 0;
             }
             atomic_fetch_sub(&g_zslrTextureInflight, need);
@@ -2272,7 +2282,7 @@ static void zslr_codec_progress(void *user, uint32_t delta) {
     os_unfair_lock_unlock(&g_zslrLock);
     if (logLine) {
         ZSAstcGpuTelemetry gpu = ZSAstcReadTelemetry(elapsed);
-        ZLog(@"[LowRes] progress: %lu/%lu texture(s), %.1f texture(s)/s, GPU time %.1fs of %.1fs wall, %.1f blocks/ms, chunk %u blocks", (unsigned long)processed, (unsigned long)total, rate,
+        ZLog(@"[TexComp] progress: %lu/%lu texture(s), %.1f texture(s)/s, GPU time %.1fs of %.1fs wall, %.1f blocks/ms, chunk %u blocks", (unsigned long)processed, (unsigned long)total, rate,
              gpu.gpuSeconds, elapsed, gpu.blocksPerMs, (unsigned)gpu.chunkBlocks);
     }
 }
@@ -2333,7 +2343,7 @@ static BOOL zslr_ledger_skips(NSDictionary *item) {
     os_unfair_lock_unlock(&g_zslrLock);
     NSString *state = entry[@"state"];
     if (!entry || [entry[@"size"] unsignedLongLongValue] != size || fabs([entry[@"mtime"] doubleValue] - mtime) >= 0.5) return NO;
-    if ([entry[@"iv"] integerValue] < 1) return NO;
+    if ([entry[@"iv"] integerValue] < 2) return NO;
     if ([state isEqualToString:@"noop"]) return YES;
     if (![state isEqualToString:@"done"]) return NO;
     uint32_t target = g_zslrTargetBlock;
@@ -2359,29 +2369,30 @@ static BOOL zslr_ledger_has_other_block(void) {
     return other;
 }
 
-static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, uint32_t width, uint32_t height, int srgb, uint8_t **out, size_t *outLen, char *why, size_t whyLen) {
-    ZSAstcJob job = { width, height, zslr_block(), srgb != 0, ZSAstcQualityBalanced, ZSAstcSourceASTC6, user ? (uint32_t)((ZSLRWorker *)user)->index : 0u, 1u };
+static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, uint32_t width, uint32_t height, int32_t format, int srgb, uint8_t **out, size_t *outLen, char *why, size_t whyLen) {
+    ZSAstcSource source = format == ZSLR_FORMAT_RGBA32 ? ZSAstcSourceRGBA8 : ZSAstcSourceASTC6;
+    ZSAstcJob job = { width, height, zslr_block(), srgb != 0, ZSAstcQualityBalanced, source, user ? (uint32_t)((ZSLRWorker *)user)->index : 0u, 1u };
     return ZSAstcEncode(&job, src, srcLen, out, outLen, NULL, why, whyLen);
 }
 
-@implementation ZSLowRes
+@implementation TexComp
 
 + (instancetype)shared {
-    static ZSLowRes *instance;
+    static TexComp *instance;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        instance = [ZSLowRes new];
+        instance = [TexComp new];
         [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
                                                         object:nil
                                                          queue:nil
                                                     usingBlock:^(NSNotification *note) {
             os_unfair_lock_lock(&g_zslrLock);
-            g_zslrWarningUntil = CACurrentMediaTime() + kZSLowResWarningPause;
+            g_zslrWarningUntil = CACurrentMediaTime() + kTexCompWarningPause;
             BOOL running = g_zslrStatus.running;
             os_unfair_lock_unlock(&g_zslrLock);
             malloc_zone_pressure_relief(NULL, 0);
-            ZLog(@"[LowRes] memory warning received (available %lld MB), workers paused for %.0fs%@", (long long)(zslr_available_memory() / (1024 * 1024)),
-                 kZSLowResWarningPause, running ? @"" : @" (idle)");
+            ZLog(@"[TexComp] memory warning received (available %lld MB), workers paused for %.0fs%@", (long long)(zslr_available_memory() / (1024 * 1024)),
+                 kTexCompWarningPause, running ? @"" : @" (idle)");
         }];
     });
     return instance;
@@ -2430,7 +2441,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
         }
     }
     if (copiedOut) *copiedOut = copied;
-    ZLog(@"[LowRes] filled %lu untouched file(s) from the original Shared into %@, %lu failed", (unsigned long)copied, destination, (unsigned long)failed);
+    ZLog(@"[TexComp] filled %lu untouched file(s) from the original Shared into %@, %lu failed", (unsigned long)copied, destination, (unsigned long)failed);
     if (failed > 0) return [NSString stringWithFormat:@"Couldn't copy %lu untouched file(s) from Shared (%@).", (unsigned long)failed, firstFailure];
     return nil;
 }
@@ -2482,16 +2493,16 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
             if (ok) {
                 restored++;
                 restoredBytes += sourceSize;
-                ZLog(@"[LowRes] missing from new Shared, restored from backup: %@ (%.1f MB)", rel, (double)sourceSize / 1048576.0);
+                ZLog(@"[TexComp] missing from new Shared, restored from backup: %@ (%.1f MB)", rel, (double)sourceSize / 1048576.0);
             } else {
                 failed++;
                 if (!firstFailure) firstFailure = [NSString stringWithFormat:@"%@: %@", rel, copyError.localizedDescription ?: @"unknown error"];
-                ZLog(@"[LowRes] missing from new Shared and restore FAILED: %@ (%.1f MB): %@", rel, (double)sourceSize / 1048576.0, copyError.localizedDescription ?: @"unknown error");
+                ZLog(@"[TexComp] missing from new Shared and restore FAILED: %@ (%.1f MB): %@", rel, (double)sourceSize / 1048576.0, copyError.localizedDescription ?: @"unknown error");
             }
         }
     }
     if (restoredOut) *restoredOut = restored;
-    ZLog(@"[LowRes] compared %lu backup file(s) against the new Shared: %lu restored (%.1f MB), %lu failed", (unsigned long)compared, (unsigned long)restored, (double)restoredBytes / 1048576.0, (unsigned long)failed);
+    ZLog(@"[TexComp] compared %lu backup file(s) against the new Shared: %lu restored (%.1f MB), %lu failed", (unsigned long)compared, (unsigned long)restored, (double)restoredBytes / 1048576.0, (unsigned long)failed);
     if (failed > 0) return [NSString stringWithFormat:@"%lu file(s) missing from the new Shared couldn't be restored from Shared.backup (%@).", (unsigned long)failed, firstFailure];
     return nil;
 }
@@ -2507,11 +2518,11 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     g_zslrLedger = [NSMutableDictionary dictionary];
     if ([parsed isKindOfClass:NSDictionary.class]) {
         [g_zslrLedger addEntriesFromDictionary:parsed];
-        ZLog(@"[LowRes] ledger loaded: %lu entr%@ from %@", (unsigned long)g_zslrLedger.count, g_zslrLedger.count == 1 ? @"y" : @"ies", path);
+        ZLog(@"[TexComp] ledger loaded: %lu entr%@ from %@", (unsigned long)g_zslrLedger.count, g_zslrLedger.count == 1 ? @"y" : @"ies", path);
     } else if (data) {
-        ZLog(@"[LowRes] ledger at %@ is unreadable (%lu bytes), starting fresh", path, (unsigned long)data.length);
+        ZLog(@"[TexComp] ledger at %@ is unreadable (%lu bytes), starting fresh", path, (unsigned long)data.length);
     } else {
-        ZLog(@"[LowRes] no ledger at %@, starting fresh", path);
+        ZLog(@"[TexComp] no ledger at %@, starting fresh", path);
     }
     g_zslrLedgerDirty = 0;
 }
@@ -2525,15 +2536,15 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     NSError *jsonError = nil;
     NSData *data = [NSJSONSerialization dataWithJSONObject:copy options:0 error:&jsonError];
     if (!data) {
-        ZLog(@"[LowRes] ledger serialization failed: %@", jsonError.localizedDescription ?: @"unknown error");
+        ZLog(@"[TexComp] ledger serialization failed: %@", jsonError.localizedDescription ?: @"unknown error");
         return;
     }
     [NSFileManager.defaultManager createDirectoryAtPath:[self stagingDirectory] withIntermediateDirectories:YES attributes:nil error:nil];
     NSError *writeError = nil;
     if ([data writeToFile:[self ledgerPath] options:NSDataWritingAtomic error:&writeError]) {
-        ZLog(@"[LowRes] ledger saved: %lu entr%@", (unsigned long)copy.count, copy.count == 1 ? @"y" : @"ies");
+        ZLog(@"[TexComp] ledger saved: %lu entr%@", (unsigned long)copy.count, copy.count == 1 ? @"y" : @"ies");
     } else {
-        ZLog(@"[LowRes] ledger save failed: %@", writeError.localizedDescription ?: @"unknown error");
+        ZLog(@"[TexComp] ledger save failed: %@", writeError.localizedDescription ?: @"unknown error");
     }
 }
 
@@ -2541,11 +2552,11 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     NSFileManager *fm = NSFileManager.defaultManager;
     NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
     NSArray<NSString *> *roots = [UnityCacheLocator unityCacheSharedDirectories];
-    ZLog(@"[LowRes] enumerating %lu cache root(s)", (unsigned long)roots.count);
+    ZLog(@"[TexComp] enumerating %lu cache root(s)", (unsigned long)roots.count);
     for (NSString *root in roots) {
         BOOL isDirectory = NO;
         if (![fm fileExistsAtPath:root isDirectory:&isDirectory] || !isDirectory) {
-            ZLog(@"[LowRes] cache root missing or not a directory: %@", root);
+            ZLog(@"[TexComp] cache root missing or not a directory: %@", root);
             continue;
         }
         NSUInteger rootCount = 0;
@@ -2571,7 +2582,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
                 @"mtime": @([attrs.fileModificationDate timeIntervalSince1970]),
             }];
         }
-        ZLog(@"[LowRes] cache root %@: %lu bundle(s), %llu MB, %lu unreadable", root, (unsigned long)rootCount, rootBytes / (1024ull * 1024ull), (unsigned long)unreadable);
+        ZLog(@"[TexComp] cache root %@: %lu bundle(s), %llu MB, %lu unreadable", root, (unsigned long)rootCount, rootBytes / (1024ull * 1024ull), (unsigned long)unreadable);
     }
     [items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         return [b[@"size"] compare:a[@"size"]];
@@ -2591,12 +2602,12 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     NSMutableArray<NSDictionary *> *failures = [NSMutableArray array];
     NSMutableDictionary<NSString *, NSNumber *> *zeroTally = [NSMutableDictionary dictionary];
     NSUInteger poolSize = MIN((NSUInteger)4, MAX((NSUInteger)1, NSProcessInfo.processInfo.activeProcessorCount));
-    ZLog(@"[LowRes] counting candidate textures across %lu bundle(s)", (unsigned long)total);
+    ZLog(@"[TexComp] counting candidate textures across %lu bundle(s)", (unsigned long)total);
     double countStart = CACurrentMediaTime();
     g_zslrQuiet = 1;
 
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0);
-    dispatch_queue_t queue = dispatch_queue_create("zs.lowres.count", attr);
+    dispatch_queue_t queue = dispatch_queue_create("zs.texcomp.count", attr);
     dispatch_group_t group = dispatch_group_create();
     for (NSUInteger w = 0; w < poolSize; w++) {
         dispatch_group_async(group, queue, ^{
@@ -2639,7 +2650,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
                         continue;
                     }
                     ZSLRCodec codec = {0};
-                    ZSLRPolicy policy = { kZSLowResMinPixels, kZSLowResMaxPixels, kZSLowResMaxResultBytes };
+                    ZSLRPolicy policy = { kTexCompMinPixels, kTexCompMaxPixels, kTexCompMaxResultBytes };
                     ZSLRResult result;
                     char err[256] = {0};
                     int rc = zslr_process_bundle(label, [item[@"path"] fileSystemRepresentation], "", 1, &codec, &policy, &result, err, sizeof(err));
@@ -2704,18 +2715,18 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
             if (fail.length > 0) {
                 failedCount++;
                 failedBytes += recordSize;
-                ZLog(@"[LowRes] bundle parse FAILED: %@ (%.1f MB) at %@", record[@"key"], (double)recordSize / 1048576.0, fail);
+                ZLog(@"[TexComp] bundle parse FAILED: %@ (%.1f MB) at %@", record[@"key"], (double)recordSize / 1048576.0, fail);
             } else {
                 partialCount++;
-                ZLog(@"[LowRes] bundle parse PARTIAL: %@ (%.1f MB): %lu Texture2D object(s) failed to parse, %lu parsed", record[@"key"], (double)recordSize / 1048576.0,
+                ZLog(@"[TexComp] bundle parse PARTIAL: %@ (%.1f MB): %lu Texture2D object(s) failed to parse, %lu parsed", record[@"key"], (double)recordSize / 1048576.0,
                      (unsigned long)[record[@"pfail"] unsignedIntegerValue], (unsigned long)[record[@"parsed"] unsignedIntegerValue]);
             }
         }
         if (failedCount > 0) {
-            ZLog(@"[LowRes] %lu of %lu bundle(s) failed to parse, %.1f MB total", (unsigned long)failedCount, (unsigned long)total, (double)failedBytes / 1048576.0);
+            ZLog(@"[TexComp] %lu of %lu bundle(s) failed to parse, %.1f MB total", (unsigned long)failedCount, (unsigned long)total, (double)failedBytes / 1048576.0);
         }
         if (partialCount > 0) {
-            ZLog(@"[LowRes] %lu bundle(s) parsed with Texture2D object failures", (unsigned long)partialCount);
+            ZLog(@"[TexComp] %lu bundle(s) parsed with Texture2D object failures", (unsigned long)partialCount);
         }
     }
 
@@ -2725,9 +2736,9 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     }
     NSUInteger zeroTotal = 0;
     for (NSNumber *n in zeroTally.allValues) zeroTotal += n.unsignedIntegerValue;
-    ZLog(@"[LowRes] %lu bundle(s) skipped by ledger, %lu bundle(s) have no candidate textures", (unsigned long)ledgerSkipped, (unsigned long)zeroTotal);
+    ZLog(@"[TexComp] %lu bundle(s) skipped by ledger, %lu bundle(s) have no candidate textures", (unsigned long)ledgerSkipped, (unsigned long)zeroTotal);
     for (NSString *why in zeroTally) {
-        ZLog(@"[LowRes] no candidates because %@: %lu bundle(s)", why, (unsigned long)[zeroTally[why] unsignedIntegerValue]);
+        ZLog(@"[TexComp] no candidates because %@: %lu bundle(s)", why, (unsigned long)[zeroTally[why] unsignedIntegerValue]);
     }
 
     NSMutableArray<NSDictionary *> *result = [NSMutableArray arrayWithCapacity:total];
@@ -2741,7 +2752,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     }
     free(counts);
     free(skipped);
-    ZLog(@"[LowRes] counted %lu candidate texture(s) in %.1fs", (unsigned long)grand, CACurrentMediaTime() - countStart);
+    ZLog(@"[TexComp] counted %lu candidate texture(s) in %.1fs", (unsigned long)grand, CACurrentMediaTime() - countStart);
     if (g_zslrLedgerDirty > 0) [self saveLedger];
 
     if (outTextures) *outTextures = grand;
@@ -2771,10 +2782,10 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     os_unfair_lock_unlock(&g_zslrLock);
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        [ZSLowRes loadLedger];
-        NSArray<NSDictionary *> *items = [ZSLowRes enumerateBundles];
+        [TexComp loadLedger];
+        NSArray<NSDictionary *> *items = [TexComp enumerateBundles];
         NSUInteger textures = 0;
-        NSArray<NSDictionary *> *pending = [ZSLowRes countedItems:items textures:&textures];
+        NSArray<NSDictionary *> *pending = [TexComp countedItems:items textures:&textures];
         os_unfair_lock_lock(&g_zslrLock);
         g_zslrPrepared = pending;
         g_zslrPreparedTextures = textures;
@@ -2794,14 +2805,14 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     return YES;
 }
 
-- (BOOL)startWithMode:(ZSLowResMode)mode blockSize:(NSUInteger)blockSize completion:(void (^)(ZSLowResStatus))completion {
+- (BOOL)startWithMode:(TexCompMode)mode blockSize:(NSUInteger)blockSize completion:(void (^)(TexCompStatus))completion {
     os_unfair_lock_lock(&g_zslrLock);
     if (g_zslrStatus.running || g_zslrPreparing) {
         os_unfair_lock_unlock(&g_zslrLock);
-        ZLog(@"[LowRes] start ignored: a run or preparation is already in progress");
+        ZLog(@"[TexComp] start ignored: a run or preparation is already in progress");
         return NO;
     }
-    __block NSArray<NSDictionary *> *preparedItems = (mode == ZSLowResModeTranscode) ? g_zslrPrepared : nil;
+    __block NSArray<NSDictionary *> *preparedItems = (mode == TexCompModeTranscode) ? g_zslrPrepared : nil;
     __block NSUInteger preparedTextures = g_zslrPreparedTextures;
     g_zslrPrepared = nil;
     memset(&g_zslrStatus, 0, sizeof(g_zslrStatus));
@@ -2827,41 +2838,41 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     memset(g_zslrWorkerSeq, 0, sizeof(g_zslrWorkerSeq));
     memset(g_zslrWorkerTotal, 0, sizeof(g_zslrWorkerTotal));
     memset(g_zslrWorkerDone, 0, sizeof(g_zslrWorkerDone));
-    g_zslrMaxWorkers = kZSLowResMaxWorkers;
+    g_zslrMaxWorkers = kTexCompMaxWorkers;
     os_unfair_lock_unlock(&g_zslrLock);
-    ZLog(@"[LowRes] %@ requested at ASTC %ux%u, available memory %lld MB", mode == ZSLowResModeScan ? @"scan" : @"transcode", zslr_block(), zslr_block(), (long long)(zslr_available_memory() / (1024 * 1024)));
+    ZLog(@"[TexComp] %@ requested at ASTC %ux%u, available memory %lld MB", mode == TexCompModeScan ? @"scan" : @"transcode", zslr_block(), zslr_block(), (long long)(zslr_available_memory() / (1024 * 1024)));
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         double runStart = CACurrentMediaTime();
         NSFileManager *fm = NSFileManager.defaultManager;
-        if (mode == ZSLowResModeTranscode) ZSAstcResetTelemetry();
-        if (mode == ZSLowResModeTranscode) {
+        if (mode == TexCompModeTranscode) ZSAstcResetTelemetry();
+        if (mode == TexCompModeTranscode) {
             NSError *dirError = nil;
-            if (![fm createDirectoryAtPath:[ZSLowRes stagingDirectory] withIntermediateDirectories:YES attributes:nil error:&dirError]) {
-                ZLog(@"[LowRes] cannot create staging directory %@: %@", [ZSLowRes stagingDirectory], dirError.localizedDescription ?: @"unknown error");
+            if (![fm createDirectoryAtPath:[TexComp stagingDirectory] withIntermediateDirectories:YES attributes:nil error:&dirError]) {
+                ZLog(@"[TexComp] cannot create staging directory %@: %@", [TexComp stagingDirectory], dirError.localizedDescription ?: @"unknown error");
             } else {
-                ZLog(@"[LowRes] staging directory: %@", [ZSLowRes stagingDirectory]);
+                ZLog(@"[TexComp] staging directory: %@", [TexComp stagingDirectory]);
             }
             if (preparedItems && zslr_ledger_has_other_block()) {
-                ZLog(@"[LowRes] ledger holds bundles written at a different block size, recounting for ASTC %ux%u", zslr_block(), zslr_block());
+                ZLog(@"[TexComp] ledger holds bundles written at a different block size, recounting for ASTC %ux%u", zslr_block(), zslr_block());
                 preparedItems = nil;
             } else if (!preparedItems) {
-                [ZSLowRes loadLedger];
+                [TexComp loadLedger];
             }
         }
         NSArray<NSDictionary *> *items = preparedItems;
         if (!items) {
-            items = [ZSLowRes enumerateBundles];
-            if (mode == ZSLowResModeTranscode) {
+            items = [TexComp enumerateBundles];
+            if (mode == TexCompModeTranscode) {
                 os_unfair_lock_lock(&g_zslrLock);
                 g_zslrStatus.bundlesTotal = items.count;
                 os_unfair_lock_unlock(&g_zslrLock);
                 NSUInteger counted = 0;
-                items = [ZSLowRes countedItems:items textures:&counted] ?: @[];
+                items = [TexComp countedItems:items textures:&counted] ?: @[];
                 preparedTextures = counted;
             }
         }
-        if (mode == ZSLowResModeTranscode) {
+        if (mode == TexCompModeTranscode) {
             os_unfair_lock_lock(&g_zslrLock);
             g_zslrStatus.texturesTotal = preparedTextures;
             g_zslrTranscodeStart = CACurrentMediaTime();
@@ -2874,12 +2885,12 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
         g_zslrStatus.bundlesTotal = items.count;
         NSUInteger workerCount = g_zslrMaxWorkers;
         os_unfair_lock_unlock(&g_zslrLock);
-        ZLog(@"[LowRes] %@ started: %lu bundle(s), %llu MB total, up to %lu worker(s)", mode == ZSLowResModeScan ? @"scan" : @"transcode",
+        ZLog(@"[TexComp] %@ started: %lu bundle(s), %llu MB total, up to %lu worker(s)", mode == TexCompModeScan ? @"scan" : @"transcode",
              (unsigned long)items.count, totalBytes / (1024ull * 1024ull), (unsigned long)workerCount);
-        if (items.count == 0) ZLog(@"[LowRes] no bundles found, nothing to do");
+        if (items.count == 0) ZLog(@"[TexComp] no bundles found, nothing to do");
 
         dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT, QOS_CLASS_USER_INITIATED, 0);
-        dispatch_queue_t queue = dispatch_queue_create("zs.lowres.workers", attr);
+        dispatch_queue_t queue = dispatch_queue_create("zs.texcomp.workers", attr);
         dispatch_group_t group = dispatch_group_create();
         for (NSUInteger wi = 0; wi < workerCount; wi++) {
             dispatch_group_async(group, queue, ^{
@@ -2888,7 +2899,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
                 worker.index = wi;
                 NSUInteger handled = 0;
                 const char *exitReason = "queue drained";
-                ZLog(@"[LowRes] worker %lu started", (unsigned long)wi);
+                ZLog(@"[TexComp] worker %lu started", (unsigned long)wi);
                 while (!g_zslrCancel) {
                     NSUInteger allowed = 0;
                     while (!g_zslrCancel) {
@@ -2924,7 +2935,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
                         break;
                     }
                     @autoreleasepool {
-                        [ZSLowRes processItem:item mode:mode worker:&worker index:itemIndex total:itemTotal];
+                        [TexComp processItem:item mode:mode worker:&worker index:itemIndex total:itemTotal];
                     }
                     handled++;
                     os_unfair_lock_lock(&g_zslrLock);
@@ -2932,16 +2943,16 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
                     os_unfair_lock_unlock(&g_zslrLock);
                 }
                 if (g_zslrCancel) exitReason = "cancelled";
-                ZLog(@"[LowRes] worker %lu exiting: %s, %lu bundle(s) handled", (unsigned long)wi, exitReason, (unsigned long)handled);
+                ZLog(@"[TexComp] worker %lu exiting: %s, %lu bundle(s) handled", (unsigned long)wi, exitReason, (unsigned long)handled);
             });
         }
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
         ZSAstcDrainCaches();
-        ZLog(@"[LowRes] all workers finished");
-        if (mode == ZSLowResModeTranscode) [ZSLowRes saveLedger];
-        if (mode == ZSLowResModeTranscode && !g_zslrCancel) {
-            NSString *mergeError = [ZSLowRes mergeOriginalsIntoDirectory:[ZSLowRes stagingDirectory] copied:NULL];
-            if (mergeError) ZLog(@"[LowRes] %@", mergeError);
+        ZLog(@"[TexComp] all workers finished");
+        if (mode == TexCompModeTranscode) [TexComp saveLedger];
+        if (mode == TexCompModeTranscode && !g_zslrCancel) {
+            NSString *mergeError = [TexComp mergeOriginalsIntoDirectory:[TexComp stagingDirectory] copied:NULL];
+            if (mergeError) ZLog(@"[TexComp] %@", mergeError);
         }
 
         os_unfair_lock_lock(&g_zslrLock);
@@ -2949,22 +2960,22 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
         g_zslrStatus.paused = NO;
         g_zslrStatus.cancelled = g_zslrCancel;
         g_zslrItems = nil;
-        ZSLowResStatus finalStatus = g_zslrStatus;
+        TexCompStatus finalStatus = g_zslrStatus;
         NSUInteger noStream = g_zslrNoStream;
         os_unfair_lock_unlock(&g_zslrLock);
-        ZLog(@"[LowRes] finished in %.1fs, %lu bundle(s) had no .resS node: %@", CACurrentMediaTime() - runStart, (unsigned long)noStream, [[ZSLowRes shared] summary]);
+        ZLog(@"[TexComp] finished in %.1fs, %lu bundle(s) had no .resS node: %@", CACurrentMediaTime() - runStart, (unsigned long)noStream, [[TexComp shared] summary]);
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(finalStatus); });
     });
     return YES;
 }
 
-+ (void)processItem:(NSDictionary *)item mode:(ZSLowResMode)mode worker:(ZSLRWorker *)worker index:(NSUInteger)index total:(NSUInteger)total {
++ (void)processItem:(NSDictionary *)item mode:(TexCompMode)mode worker:(ZSLRWorker *)worker index:(NSUInteger)index total:(NSUInteger)total {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *path = item[@"path"];
     NSString *key = item[@"key"];
     uint64_t size = [item[@"size"] unsignedLongLongValue];
     double mtime = [item[@"mtime"] doubleValue];
-    BOOL scanOnly = (mode == ZSLowResModeScan);
+    BOOL scanOnly = (mode == TexCompModeScan);
     char label[192];
     snprintf(label, sizeof(label), "w%lu %s", (unsigned long)worker->index, key.UTF8String ?: "?");
     double started = CACurrentMediaTime();
@@ -3011,7 +3022,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
 
     ZSLRCodec codec = { worker, zslr_codec_reserve, zslr_codec_tick, zslr_codec_transcode, zslr_codec_progress, zslr_codec_parallel,
                         zslr_codec_acquire, zslr_codec_release, zslr_codec_unreserve };
-    ZSLRPolicy policy = { kZSLowResMinPixels, kZSLowResMaxPixels, kZSLowResMaxResultBytes };
+    ZSLRPolicy policy = { kTexCompMinPixels, kTexCompMaxPixels, kTexCompMaxResultBytes };
     ZSLRResult result;
     char err[256] = {0};
     int rc = zslr_process_bundle(label, path.fileSystemRepresentation, partPath.fileSystemRepresentation, scanOnly ? 1 : 0, &codec, &policy, &result, err, sizeof(err));
@@ -3052,7 +3063,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     os_unfair_lock_lock(&g_zslrLock);
     if (rc == ZSLR_DEFERRED && !scanOnly && !g_zslrCancel) {
         NSUInteger tries = [g_zslrRetries[key] unsignedIntegerValue];
-        if (tries < kZSLowResMaxRetries) {
+        if (tries < kTexCompMaxRetries) {
             g_zslrRetries[key] = @(tries + 1);
             requeue = YES;
         }
@@ -3077,7 +3088,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
         if (result.noStream) g_zslrNoStream++;
         if (ledgerState) {
             g_zslrLedger[key] = @{ @"size": @(size), @"mtime": @(mtime), @"state": ledgerState,
-                                   @"before": @(result.originalBytes), @"after": @(result.newBytes), @"textures": @(result.converted), @"block": @(zslr_block()), @"iv": @1 };
+                                   @"before": @(result.originalBytes), @"after": @(result.newBytes), @"textures": @(result.converted), @"block": @(zslr_block()), @"iv": @2 };
             g_zslrLedgerDirty++;
         }
         g_zslrStatus.bundlesDone++;
@@ -3121,9 +3132,9 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     g_zslrCancel = YES;
 }
 
-- (ZSLowResStatus)status {
+- (TexCompStatus)status {
     os_unfair_lock_lock(&g_zslrLock);
-    ZSLowResStatus copy = g_zslrStatus;
+    TexCompStatus copy = g_zslrStatus;
     NSUInteger best = NSNotFound;
     NSUInteger bestSeq = NSUIntegerMax;
     for (NSUInteger i = 0; i < ZSLR_MAX_WORKERS; i++) {
@@ -3140,7 +3151,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     os_unfair_lock_unlock(&g_zslrLock);
     if (copy.texturesProcessed > copy.texturesTotal) copy.texturesProcessed = copy.texturesTotal;
     copy.etaSeconds = -1;
-    if (copy.running && !copy.preparing && copy.mode == ZSLowResModeTranscode && copy.texturesProcessed > 0 && start > 0) {
+    if (copy.running && !copy.preparing && copy.mode == TexCompModeTranscode && copy.texturesProcessed > 0 && start > 0) {
         double elapsed = CACurrentMediaTime() - start;
         copy.etaSeconds = elapsed / (double)copy.texturesProcessed * (double)(copy.texturesTotal - copy.texturesProcessed);
     }
@@ -3152,17 +3163,17 @@ static NSString *zslr_bytes(uint64_t bytes) {
 }
 
 - (NSString *)statusLine {
-    ZSLowResStatus s = [self status];
-    NSString *verb = s.mode == ZSLowResModeScan ? @"Scanning" : @"Transcoding";
+    TexCompStatus s = [self status];
+    NSString *verb = s.mode == TexCompModeScan ? @"Scanning" : @"Transcoding";
     NSString *state = s.paused ? @" (paused: low memory)" : (s.allowedWorkers == 1 && g_zslrMaxWorkers > 1 ? @" (throttled)" : @"");
     return [NSString stringWithFormat:@"%@ %lu/%lu%@", verb, (unsigned long)s.bundlesDone, (unsigned long)s.bundlesTotal, state];
 }
 
 - (NSString *)summary {
-    ZSLowResStatus s = [self status];
+    TexCompStatus s = [self status];
     NSMutableString *text = [NSMutableString string];
-    if (s.mode == ZSLowResModeScan) {
-        [text appendFormat:@"Bundles scanned: %lu\nCandidate textures: %lu\nASTC 6x6 data: %@\nProjected at %ux%u: %@\nProjected saving: %@",
+    if (s.mode == TexCompModeScan) {
+        [text appendFormat:@"Bundles scanned: %lu\nCandidate textures: %lu\nSource texture data: %@\nProjected at %ux%u: %@\nProjected saving: %@",
             (unsigned long)s.bundlesDone, (unsigned long)s.texturesCandidate, zslr_bytes(s.candidateBytes), zslr_block(), zslr_block(), zslr_bytes(s.newBytes),
             zslr_bytes(s.candidateBytes > s.newBytes ? s.candidateBytes - s.newBytes : 0)];
     } else {

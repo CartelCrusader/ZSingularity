@@ -2,16 +2,16 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef NS_ENUM(NSInteger, ZSLowResMode) {
-    ZSLowResModeScan = 0,
-    ZSLowResModeTranscode = 1,
+typedef NS_ENUM(NSInteger, TexCompMode) {
+    TexCompModeScan = 0,
+    TexCompModeTranscode = 1,
 };
 
 typedef struct {
     BOOL running;
     BOOL paused;
     BOOL cancelled;
-    ZSLowResMode mode;
+    TexCompMode mode;
     NSUInteger bundlesTotal;
     NSUInteger bundlesDone;
     NSUInteger bundlesChanged;
@@ -32,9 +32,9 @@ typedef struct {
     NSUInteger currentBundleTotal;
     NSUInteger currentBundleProcessed;
     double etaSeconds;
-} ZSLowResStatus;
+} TexCompStatus;
 
-@interface ZSLowRes : NSObject
+@interface TexComp : NSObject
 
 + (instancetype)shared;
 + (NSString *)stagingDirectory;
@@ -42,9 +42,9 @@ typedef struct {
 + (nullable NSString *)restoreMissingFilesIntoDirectory:(NSString *)directory fromBackup:(NSString *)backup restored:(nullable NSUInteger *)restoredOut;
 
 - (BOOL)prepareWithCompletion:(void (^)(NSUInteger textures, NSUInteger bundles, BOOL ok))completion;
-- (BOOL)startWithMode:(ZSLowResMode)mode blockSize:(NSUInteger)blockSize completion:(nullable void (^)(ZSLowResStatus status))completion;
+- (BOOL)startWithMode:(TexCompMode)mode blockSize:(NSUInteger)blockSize completion:(nullable void (^)(TexCompStatus status))completion;
 - (void)cancel;
-- (ZSLowResStatus)status;
+- (TexCompStatus)status;
 - (NSString *)statusLine;
 - (NSString *)summary;
 

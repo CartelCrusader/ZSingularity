@@ -1,4 +1,4 @@
-#import "ZSDiagnostics.h"
+#import "Diagnostics.h"
 #import "ZTweakLog.h"
 #import <execinfo.h>
 #import <signal.h>

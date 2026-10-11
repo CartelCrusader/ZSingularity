@@ -1,5 +1,5 @@
 
-#import "ZSGifTint.h"
+#import "GifTint.h"
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreText/CoreText.h>

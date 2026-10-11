@@ -106,10 +106,10 @@ jobs:
             REF="$(gh release view nightly --repo "$REPO" --json targetCommitish -q .targetCommitish || true)"
             HEADER=""
             if [[ -n "$REF" ]]; then
-              HEADER="$(gh api "repos/$REPO/contents/Core/ZSVersion.h?ref=$REF" -H 'Accept: application/vnd.github.raw' || true)"
+              HEADER="$(gh api "repos/$REPO/contents/Core/Version.h?ref=$REF" -H 'Accept: application/vnd.github.raw' || true)"
             fi
             if [[ -z "$HEADER" ]]; then
-              HEADER="$(cat Core/ZSVersion.h)"
+              HEADER="$(cat Core/Version.h)"
             fi
             part() { printf '%s' "$HEADER" | grep -oE "#define ZS_VERSION_$1 [0-9]+" | grep -oE '[0-9]+$'; }
             TWEAK_VERSION="$(part MAJOR).$(part MINOR).$(part PATCH)"

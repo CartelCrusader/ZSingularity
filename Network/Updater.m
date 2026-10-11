@@ -1,8 +1,8 @@
-#import "ZSUpdater.h"
+#import "Updater.h"
 #import "ZTweakLog.h"
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
-#import "ZSVersion.h"
+#import "Version.h"
 
 #pragma mark - ZSDylibUpdater
 
