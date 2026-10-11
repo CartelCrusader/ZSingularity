@@ -17116,14 +17116,12 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         BOOL descending = self.assetExplorerBundleSortDescending;
         BOOL bySize = self.assetExplorerBundleSortBySize;
         BOOL sizeAscending = self.assetExplorerBundleSizeAscending;
-        NSMutableDictionary<NSString *, NSNumber *> *sizes = nil;
-        if (bySize) {
-            sizes = [NSMutableDictionary dictionary];
-            for (ZSAssetExplorerBundle *bundle in self.assetExplorerBundles) {
-                struct stat fileStat;
-                unsigned long long fileSize = (bundle.filePath.length > 0 && stat(bundle.filePath.fileSystemRepresentation, &fileStat) == 0) ? (unsigned long long)fileStat.st_size : 0;
-                sizes[bundle.filePath] = @(fileSize);
-            }
+        NSMutableDictionary<NSString *, NSNumber *> *sizes = [NSMutableDictionary dictionaryWithCapacity:self.assetExplorerBundles.count];
+        for (ZSAssetExplorerBundle *bundle in self.assetExplorerBundles) {
+            if (bundle.filePath.length == 0) continue;
+            struct stat fileStat;
+            unsigned long long fileSize = stat(bundle.filePath.fileSystemRepresentation, &fileStat) == 0 ? (unsigned long long)fileStat.st_size : 0;
+            sizes[bundle.filePath] = @(fileSize);
         }
         self.assetExplorerBundleSizes = sizes;
         NSArray<ZSAssetExplorerBundle *> *sortedBundles = [matches sortedArrayUsingComparator:^NSComparisonResult(ZSAssetExplorerBundle *a, ZSAssetExplorerBundle *b) {
@@ -18015,8 +18013,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         for (NSUInteger i = 0; i < statRows; i++) {
             UILabel *statLabel = [[UILabel alloc] init];
             statLabel.numberOfLines = 1;
-            statLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-            statLabel.frame = CGRectMake(statX, statY + statLineHeight * (CGFloat)i, statWidth, statLineHeight);
+            statLabel.lineBreakMode = NSLineBreakByClipping;
+            statLabel.adjustsFontSizeToFitWidth = YES;
+            statLabel.minimumScaleFactor = 0.6;
+            statLabel.frame = CGRectMake(statX, statY + statLineHeight * (CGFloat)i, MAX(statWidth, width - 6 - statX), statLineHeight);
             [panel addSubview:statLabel];
             [statLabels addObject:statLabel];
         }
@@ -18426,9 +18426,23 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     [self zs_runMemoryUsageScan];
 }
 
+- (void)zs_alignMemoryCycleToPieGrid {
+    CFTimeInterval now = CACurrentMediaTime();
+    CFTimeInterval begin = self.memoryPieBegin;
+    BOOL animating = self.memoryRefreshPieLayer && [self.memoryRefreshPieLayer animationForKey:@"zsPieFill"] != nil;
+    if (begin <= 0 || begin > now || !animating) {
+        self.memoryCycleStart = now;
+        [self zs_startMemoryRefreshPie];
+        return;
+    }
+    double cycle = ZS_MEMORY_SCAN_CYCLE_SECONDS;
+    self.memoryCycleStart = begin + floor((now - begin) / cycle) * cycle;
+}
+
 - (void)zs_memoryAppDidBecomeActive {
     if (!self.memoryFullScreenOpen) return;
-    [self zs_restartMemoryCycle];
+    [self zs_alignMemoryCycleToPieGrid];
+    [self zs_restartMemoryCycleKeepingPie:YES];
 }
 
 - (void)zs_storeMemorySnapshotWithStats:(ZSMemorySystemStats)stats
@@ -18519,7 +18533,8 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     NSTimeInterval now = CACurrentMediaTime();
     NSTimeInterval cycleEnd = self.memoryCycleStart + ZS_MEMORY_SCAN_CYCLE_SECONDS;
     BOOL overran = now - cycleEnd > 1.0;
-    self.memoryCycleStart = overran ? now : cycleEnd;
+    self.memoryCycleStart = cycleEnd;
+    if (overran) [self zs_alignMemoryCycleToPieGrid];
     self.memoryCycleCount++;
     if (overran) self.memoryCycleOverruns++;
     self.memoryLastWork = self.memoryCycleWorkAccum;
@@ -18531,7 +18546,6 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     self.memoryCyclePhase = 0;
     self.memoryPendingGroups = nil;
     self.memoryPendingColumns = nil;
-    if (overran) [self zs_startMemoryRefreshPie];
 }
 
 - (void)zs_buildNextPendingMemoryColumn {
