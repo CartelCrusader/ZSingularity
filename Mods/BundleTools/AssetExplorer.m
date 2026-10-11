@@ -915,6 +915,9 @@ static id ZSAEReadValue(const ZSAETypeTree *tree, ZSAEReader *reader, uint32_t i
     return reader->pos <= reader->limit ? result : nil;
 }
 
+static __thread uint64_t gZSAELastObjectStart;
+static __thread uint64_t gZSAELastObjectSize;
+
 static BOOL ZSAEParseSerializedFile(NSData *data, NSArray<ZSAssetExplorerAsset *> **outAssets, int64_t wantedPathID, ZSAETextureRecord **outRecord, NSDictionary **outObject, int32_t *outObjectClassID, NSArray<NSString *> **outExternals, NSError **error) {
     const uint8_t *bytes = data.bytes;
     size_t length = data.length;
@@ -1069,6 +1072,8 @@ static BOOL ZSAEParseSerializedFile(NSData *data, NSArray<ZSAssetExplorerAsset *
                 objectProblem = YES;
                 continue;
             }
+            gZSAELastObjectStart = objectStart;
+            gZSAELastObjectSize = byteSize;
             ZSAEReader objectReader = { bytes, objectStart, objectStart + byteSize, objectStart };
             NSUInteger objectBudget = 4000000;
             id value = ZSAEReadValue(tree, &objectReader, 0, &objectBudget, 0);
@@ -1590,6 +1595,8 @@ static UIImage *ZSAEImageFromRGBA(NSData *rgba, int32_t width, int32_t height) {
 @property (nonatomic, copy) NSArray<NSString *> *externals;
 @property (nonatomic, strong) ZSAESession *session;
 @property (nonatomic, assign) int64_t pathID;
+@property (nonatomic, assign) uint64_t rawStart;
+@property (nonatomic, assign) uint64_t rawSize;
 @end
 
 @implementation ZSAEObject
@@ -1660,8 +1667,12 @@ static ZSAEObject *ZSAEReadObject(ZSAESession *session, int64_t pathID, NSError 
     NSDictionary *fields = nil;
     int32_t classID = 0;
     NSArray<NSString *> *externals = nil;
+    gZSAELastObjectStart = 0;
+    gZSAELastObjectSize = 0;
     if (!ZSAEParseSerializedFile(session.serializedData, nil, pathID, NULL, &fields, &classID, &externals, error)) return nil;
     ZSAEObject *object = [ZSAEObject new];
+    object.rawStart = gZSAELastObjectStart;
+    object.rawSize = gZSAELastObjectSize;
     object.fields = fields;
     object.classID = classID;
     object.externals = externals ?: @[];
@@ -6270,6 +6281,12 @@ static NSString *ZSAEClassFolderName(int32_t classID) {
     return names[@(classID)] ?: [NSString stringWithFormat:@"Class_%d", classID];
 }
 
+static NSData *ZSAERawDataForObject(ZSAEObject *object) {
+    NSData *serialized = object.session.serializedData;
+    if (object.rawSize == 0 || object.rawStart > serialized.length || object.rawSize > serialized.length - object.rawStart) return nil;
+    return [serialized subdataWithRange:NSMakeRange((NSUInteger)object.rawStart, (NSUInteger)object.rawSize)];
+}
+
 static NSData *ZSAEFontFileData(ZSAEObject *object, NSString **outExtension) {
     NSData *fontData = [object.fields[@"m_FontData"] isKindOfClass:[NSData class]] ? object.fields[@"m_FontData"] : nil;
     if (fontData.length < 4) return nil;
@@ -6640,10 +6657,13 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
     NSString *extension = nil;
     NSData *data = ZSAEMediaDataForObject(context, object, &extension);
     if (data.length == 0) {
-        data = ZSAEJSONDataForObject(object, error);
-        extension = @"json";
+        data = ZSAERawDataForObject(object);
+        extension = @"asset";
     }
-    if (data.length == 0) return nil;
+    if (data.length == 0) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"The asset's data couldn't be read.");
+        return nil;
+    }
 
     NSString *fileName = [ZSAEObjectBaseName(object) stringByAppendingPathExtension:extension];
     NSString *outputPath = [directory stringByAppendingPathComponent:fileName];
@@ -6688,10 +6708,10 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
                 NSString *entry = [NSString stringWithFormat:@"%@/%@.%@", folder, base, mediaExtension];
                 if ([zip addEntryNamed:entry data:media]) [files addObject:entry];
             }
-            NSData *json = ZSAEJSONDataForObject(object, NULL);
-            if (json.length > 0) {
-                NSString *entry = [NSString stringWithFormat:@"%@/%@.json", folder, base];
-                if ([zip addEntryNamed:entry data:json]) [files addObject:entry];
+            NSData *raw = ZSAERawDataForObject(object);
+            if (raw.length > 0) {
+                NSString *entry = [NSString stringWithFormat:@"%@/%@.asset", folder, base];
+                if ([zip addEntryNamed:entry data:raw]) [files addObject:entry];
             }
 
             NSMutableArray<NSDictionary *> *pointers = [NSMutableArray array];
