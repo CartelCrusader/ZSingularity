@@ -36,7 +36,7 @@ constant ZSLRTuning kZSLRTunings[11] = {
 {10,0,0,1,3,4,5,2,1.10f,2.5f},
 {10,0,0,1,3,4,6,2,1.15f,2.0f},
 {10,0,0,1,3,4,6,2,1.20f,1.5f},
-{10,0,0,1,3,4,6,2,1.25f,1.0f}
+{14,0,0,1,3,4,6,3,1.25f,0.8f}
 };
 
 struct ZSLRConfig {
@@ -955,7 +955,7 @@ constant float kZSLRDen12[640] = {
 0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f
 };
 
-constant ZSLRConfig kZSLRConfigs8[10] = {
+constant ZSLRConfig kZSLRConfigs8[14] = {
 {8,8,1,0,1348,192,48},
 {7,5,2,0,482,96,32},
 {5,7,2,0,238,96,32},
@@ -965,9 +965,13 @@ constant ZSLRConfig kZSLRConfigs8[10] = {
 {8,5,2,0,102,32,0},
 {2,8,4,0,522,192,48},
 {8,6,1,0,324,256,192},
-{4,8,2,0,74,192,48}
+{4,8,2,0,74,192,48},
+{3,3,2,1,1454,256,192},
+{4,3,2,1,1058,256,192},
+{3,4,2,1,1486,256,192},
+{4,4,2,1,1090,64,48}
 };
-constant ZSLRConfig kZSLRConfigs10[10] = {
+constant ZSLRConfig kZSLRConfigs10[14] = {
 {8,8,1,0,1348,192,48},
 {5,8,2,0,106,32,0},
 {7,5,2,0,482,96,32},
@@ -977,9 +981,13 @@ constant ZSLRConfig kZSLRConfigs10[10] = {
 {8,2,4,0,518,192,48},
 {7,8,1,0,1316,256,96},
 {8,2,3,0,23,256,192},
-{4,8,2,0,74,192,48}
+{4,8,2,0,74,192,48},
+{3,3,2,1,1454,256,192},
+{4,3,2,1,1058,256,192},
+{3,4,2,1,1486,256,192},
+{4,4,2,1,1090,64,48}
 };
-constant ZSLRConfig kZSLRConfigs12[10] = {
+constant ZSLRConfig kZSLRConfigs12[14] = {
 {8,8,1,0,1348,192,48},
 {5,8,2,0,106,32,0},
 {7,5,2,0,482,96,32},
@@ -989,7 +997,11 @@ constant ZSLRConfig kZSLRConfigs12[10] = {
 {8,5,2,0,102,32,0},
 {5,5,3,0,243,64,0},
 {4,8,2,0,74,192,48},
-{6,2,4,0,770,256,192}
+{6,2,4,0,770,256,192},
+{3,3,2,1,1454,256,192},
+{4,3,2,1,1058,256,192},
+{3,4,2,1,1486,256,192},
+{4,4,2,1,1090,64,48}
 };
 
 
@@ -1107,7 +1119,7 @@ constant float kZSLRDen6[640] = {
 0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,
 0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f
 };
-constant ZSLRConfig kZSLRConfigs6[10] = {
+constant ZSLRConfig kZSLRConfigs6[14] = {
 {5,5,2,0,226,256,192},
 {6,6,1,0,260,256,256},
 {6,5,2,0,354,256,0},
@@ -1117,7 +1129,11 @@ constant ZSLRConfig kZSLRConfigs6[10] = {
 {6,3,3,0,307,256,0},
 {5,3,3,0,179,256,256},
 {4,4,4,0,578,192,48},
-{6,2,4,0,770,256,192}
+{6,2,4,0,770,256,192},
+{3,3,2,1,1454,256,192},
+{4,3,2,1,1058,256,192},
+{3,4,2,1,1486,256,192},
+{4,4,2,1,1090,64,48}
 };
 
 static float zslr_linear_to_srgb(float value) {
@@ -1203,13 +1219,16 @@ static float zslr_vw(thread const uint *vm, uint i) {
 
 template <uint BW>
 static void zslr_solve_grid(thread const uint *pk, thread const uint *vm,
-                            constant uchar *iv, constant uint *ipw, uint wx, uint ng, uint dims,
+                            thread const uchar *iv, thread const uint *ipw, uint wx, uint ng, uint dims,
                             thread const float *e0, thread const float *e1,
-                            thread const float *den, uint bits, thread uchar *gi, thread float *wd, uint iterations) {
+                            thread const float *den, uint bits, thread uchar *gi, thread float *wd, uint iterations,
+                            int selector, bool selectedOnly) {
     const uint N = BW * BW;
     float dir[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     float len2 = 0.0f;
     for (uint c = 0; c < dims; c++) {
+        bool useChannel = selector < 0 || (((int)c == selector) == selectedOnly);
+        if (!useChannel) continue;
         dir[c] = e1[c] - e0[c];
         len2 += dir[c] * dir[c];
     }
@@ -1225,7 +1244,10 @@ static void zslr_solve_grid(thread const uint *pk, thread const uint *vm,
         float4 p = zslr_unpack(pk[i]);
         float m = zslr_vw(vm, i);
         float d = 0.0f;
-        for (uint c = 0; c < dims; c++) d += (p[c] - e0[c]) * dir[c];
+        for (uint c = 0; c < dims; c++) {
+            bool useChannel = selector < 0 || (((int)c == selector) == selectedOnly);
+            if (useChannel) d += (p[c] - e0[c]) * dir[c];
+        }
         u[i] = len2 > 1e-10f ? clamp(d * inv, 0.0f, 1.0f) : 0.5f;
         uint base = iv[i];
         uint pw = ipw[i];
@@ -1326,7 +1348,7 @@ static void zslr_solve_endpoints(thread const uint *pk, thread const uint *vm, u
 
 template <uint BW>
 static float zslr_block_error(thread const uint *pk, thread const uint *vm, uint dims,
-                              constant uchar *iv, constant uint *ipw, uint wx, uint bits,
+                              thread const uchar *iv, thread const uint *ipw, uint wx, uint bits,
                               thread const uchar *gi, thread const float *d0, thread const float *d1) {
     const uint N = BW * BW;
     constant uchar *wu = kZSLRWUnq[bits - 1u];
@@ -1354,7 +1376,7 @@ static float zslr_block_error(thread const uint *pk, thread const uint *vm, uint
 
 template <uint BW>
 static float zslr_eval_config(thread const uint *pk, thread const uint *vm,
-                              constant uchar *iv, constant uint *ipw, constant float *denFull, bool full,
+                              thread const uchar *iv, thread const uint *ipw, thread const float *denFull, bool full,
                               uint wx, uint wy, uint bits, uint levels, uint dims,
                               thread const float *init0, thread const float *init1,
                               uint passes, uint iterA, uint iterB, thread uint *ep, thread uchar *gi) {
@@ -1385,7 +1407,7 @@ static float zslr_eval_config(thread const uint *pk, thread const uint *vm,
         e1[c] = init1[c];
     }
     for (uint pass = 0; pass < passes; pass++) {
-        zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, e0, e1, den, bits, gi, wd, iterA);
+        zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, e0, e1, den, bits, gi, wd, iterA, -1, false);
         zslr_solve_endpoints<BW>(pk, vm, dims, wd, e0, e1);
     }
     constant uchar *enc = zslr_enc_table(levels);
@@ -1416,8 +1438,166 @@ static float zslr_eval_config(thread const uint *pk, thread const uint *vm,
         f0[c] = d0[c] * (1.0f / 255.0f);
         f1[c] = d1[c] * (1.0f / 255.0f);
     }
-    zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, f0, f1, den, bits, gi, wd, iterB);
+    zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, f0, f1, den, bits, gi, wd, iterB, -1, false);
     return zslr_block_error<BW>(pk, vm, dims, iv, ipw, wx, bits, gi, d0, d1);
+}
+
+template <uint BW>
+static void zslr_build_weight_map(uint wx, uint wy, thread uchar *iv, thread uint *ipw, thread float *den) {
+    const uint N = BW * BW;
+    for (uint j = 0; j < 64; j++) den[j] = 0.0f;
+    for (uint y = 0; y < BW; y++) {
+        uint yn = y * (wy - 1u);
+        uint by = yn / (BW - 1u);
+        uint yr = yn % (BW - 1u);
+        uint fy = (yr * 16u + (BW - 1u) / 2u) / (BW - 1u);
+        if (fy >= 16u) { by++; fy = 0u; }
+        by = min(by, wy - 1u);
+        for (uint x = 0; x < BW; x++) {
+            uint xn = x * (wx - 1u);
+            uint bx = xn / (BW - 1u);
+            uint xr = xn % (BW - 1u);
+            uint fx = (xr * 16u + (BW - 1u) / 2u) / (BW - 1u);
+            if (fx >= 16u) { bx++; fx = 0u; }
+            bx = min(bx, wx - 1u);
+            uint i = y * BW + x;
+            iv[i] = uchar(by * wx + bx);
+            uint w00 = ((16u - fx) * (16u - fy) + 8u) >> 4;
+            uint w10 = (fx * (16u - fy) + 8u) >> 4;
+            uint w01 = ((16u - fx) * fy + 8u) >> 4;
+            uint top = min(16u, w00 + w10 + w01);
+            uint w11 = 16u - top;
+            ipw[i] = w00 | (w10 << 8) | (w01 << 16) | (w11 << 24);
+            for (uint k = 0; k < 4; k++) {
+                uint w = (ipw[i] >> (8u * k)) & 255u;
+                if (w == 0u) continue;
+                uint node = uint(iv[i]) + (k & 1u) + (k >> 1u) * wx;
+                den[node] += float(w) * float(w) * (1.0f / 256.0f);
+            }
+        }
+    }
+}
+
+template <uint BW>
+static void zslr_solve_endpoints_dual(thread const uint *pk, thread const uint *vm, uint dims, uint selector,
+                                      thread const float *wd0, thread const float *wd1,
+                                      thread float *e0, thread float *e1) {
+    const uint N = BW * BW;
+    float a00[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float a01[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float a11[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float b0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float b1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint i = 0; i < N; i++) {
+        float m = zslr_vw(vm, i);
+        float4 p = zslr_unpack(pk[i]);
+        for (uint c = 0; c < dims; c++) {
+            float w = c == selector ? wd1[i] : wd0[i];
+            float iw = 1.0f - w;
+            a00[c] += m * iw * iw;
+            a01[c] += m * iw * w;
+            a11[c] += m * w * w;
+            b0[c] += m * iw * p[c];
+            b1[c] += m * w * p[c];
+        }
+    }
+    for (uint c = 0; c < dims; c++) {
+        float det = a00[c] * a11[c] - a01[c] * a01[c];
+        if (det > 1e-5f) {
+            e0[c] = clamp((a11[c] * b0[c] - a01[c] * b1[c]) / det, 0.0f, 1.0f);
+            e1[c] = clamp((a00[c] * b1[c] - a01[c] * b0[c]) / det, 0.0f, 1.0f);
+        }
+    }
+}
+
+template <uint BW>
+static float zslr_block_error_dual(thread const uint *pk, thread const uint *vm, uint dims, uint selector,
+                                   thread const uchar *iv, thread const uint *ipw, uint wx, uint bits,
+                                   thread const uchar *gi0, thread const uchar *gi1,
+                                   thread const float *d0, thread const float *d1) {
+    const uint N = BW * BW;
+    constant uchar *wu = kZSLRWUnq[bits - 1u];
+    float err = 0.0f;
+    for (uint i = 0; i < N; i++) {
+        uint base = iv[i];
+        uint pw = ipw[i];
+        uint sum0 = 8u;
+        uint sum1 = 8u;
+        for (uint k = 0; k < 4; k++) {
+            uint w = (pw >> (8u * k)) & 255u;
+            if (w == 0u) continue;
+            uint node = base + (k & 1u) + (k >> 1u) * wx;
+            sum0 += w * uint(wu[gi0[node]]);
+            sum1 += w * uint(wu[gi1[node]]);
+        }
+        float w0 = float(sum0 >> 4) * (1.0f / 64.0f);
+        float w1 = float(sum1 >> 4) * (1.0f / 64.0f);
+        float m = zslr_vw(vm, i);
+        float4 p = zslr_unpack(pk[i]);
+        for (uint c = 0; c < dims; c++) {
+            float w = c == selector ? w1 : w0;
+            float v = d0[c] + (d1[c] - d0[c]) * w;
+            float diff = p[c] * 255.0f - v;
+            err += m * diff * diff;
+        }
+    }
+    return err;
+}
+
+template <uint BW>
+static float zslr_eval_config_dual(thread const uint *pk, thread const uint *vm,
+                                   thread const uchar *iv, thread const uint *ipw, thread const float *denFull, bool full,
+                                   uint wx, uint wy, uint bits, uint levels, uint dims, uint selector,
+                                   thread const float *init0, thread const float *init1,
+                                   uint passes, uint iterA, uint iterB,
+                                   thread uint *ep, thread uchar *gi0, thread uchar *gi1) {
+    const uint N = BW * BW;
+    uint ng = wx * wy;
+    float den[64];
+    if (full) {
+        for (uint j = 0; j < ng; j++) den[j] = denFull[j];
+    } else {
+        for (uint j = 0; j < ng; j++) den[j] = 0.0f;
+        for (uint i = 0; i < N; i++) {
+            float m = zslr_vw(vm, i);
+            uint base = iv[i];
+            uint pw = ipw[i];
+            for (uint k = 0; k < 4; k++) {
+                uint w = (pw >> (8u * k)) & 255u;
+                if (w == 0u) continue;
+                float a = float(w) * (1.0f / 16.0f);
+                den[base + (k & 1u) + (k >> 1u) * wx] += m * a * a;
+            }
+        }
+    }
+    float e0[4];
+    float e1[4];
+    for (uint c = 0; c < 4; c++) { e0[c] = init0[c]; e1[c] = init1[c]; }
+    float wd0[BW * BW];
+    float wd1[BW * BW];
+    for (uint pass = 0; pass < passes; pass++) {
+        zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, e0, e1, den, bits, gi0, wd0, iterA, int(selector), false);
+        zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, e0, e1, den, bits, gi1, wd1, iterA, int(selector), true);
+        zslr_solve_endpoints_dual<BW>(pk, vm, dims, selector, wd0, wd1, e0, e1);
+    }
+    constant uchar *enc = zslr_enc_table(levels);
+    constant uchar *dec = zslr_dec_table(levels);
+    float d0[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float d1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint c = 0; c < dims; c++) {
+        uint a = enc[uint(round(clamp(e0[c], 0.0f, 1.0f) * 255.0f))];
+        uint b = enc[uint(round(clamp(e1[c], 0.0f, 1.0f) * 255.0f))];
+        ep[c * 2] = a;
+        ep[c * 2 + 1] = b;
+        d0[c] = float(dec[a]);
+        d1[c] = float(dec[b]);
+    }
+    float f0[4];
+    float f1[4];
+    for (uint c = 0; c < 4; c++) { f0[c] = d0[c] * (1.0f / 255.0f); f1[c] = d1[c] * (1.0f / 255.0f); }
+    zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, f0, f1, den, bits, gi0, wd0, iterB, int(selector), false);
+    zslr_solve_grid<BW>(pk, vm, iv, ipw, wx, ng, dims, f0, f1, den, bits, gi1, wd1, iterB, int(selector), true);
+    return zslr_block_error_dual<BW>(pk, vm, dims, selector, iv, ipw, wx, bits, gi0, gi1, d0, d1);
 }
 
 template <uint BW>
@@ -1561,10 +1741,13 @@ static float zslr_encode_block(thread const uint *pk, thread const uint *vm, boo
     uint bestCfg = 0;
     uint bestEp[8];
     uchar bestGridBytes[64];
+    uchar bestGridPlane2[64];
+    uint bestSelector = 0u;
+    bool bestDualPlane = false;
     uint bestLevels = 256u;
     for (uint i = 0; i < 16u; i++) configUsesExtremaSeed[i] = false;
     for (uint i = 0; i < 8; i++) bestEp[i] = 0u;
-    for (uint i = 0; i < 64; i++) bestGridBytes[i] = 0;
+    for (uint i = 0; i < 64; i++) { bestGridBytes[i] = 0; bestGridPlane2[i] = 0; }
     bool done = false;
     for (uint ci = 0; ci < cfgCount; ci++) {
         scores[ci] = 1e30f;
@@ -1572,21 +1755,74 @@ static float zslr_encode_block(thread const uint *pk, thread const uint *vm, boo
         if (levels == 0u) continue;
         uint tmpEp[8];
         uchar tmpGrid[64];
-        float err = zslr_eval_config<BW>(pk, vm, ivT + ci * N, ipwT + ci * N, denT + ci * 64u, full,
-                                         cfgs[ci].wx, cfgs[ci].wy, cfgs[ci].bits, levels, dims,
-                                         init0, init1, sPasses, sIterA, sIterB, tmpEp, tmpGrid);
+        uchar tmpGrid2[64];
+        uint tmpSelector = 0u;
         bool useExtremaSeed = false;
-        if (BW == 6u) {
-            uint altEp[8];
-            uchar altGrid[64];
-            float altErr = zslr_eval_config<BW>(pk, vm, ivT + ci * N, ipwT + ci * N, denT + ci * 64u, full,
-                                                cfgs[ci].wx, cfgs[ci].wy, cfgs[ci].bits, levels, dims,
-                                                seed0, seed1, sPasses, sIterA, sIterB, altEp, altGrid);
-            if (altErr < err) {
-                err = altErr;
-                useExtremaSeed = true;
-                for (uint j = 0; j < dims * 2u; j++) tmpEp[j] = altEp[j];
-                for (uint j = 0; j < cfgs[ci].wx * cfgs[ci].wy; j++) tmpGrid[j] = altGrid[j];
+        float err = 1e30f;
+        uchar mapIv[N];
+        uint mapIpw[N];
+        float mapDen[64];
+        thread const uchar *iv = mapIv;
+        thread const uint *ipw = mapIpw;
+        thread const float *den = mapDen;
+        if (cfgs[ci].pad != 0u) {
+            zslr_build_weight_map<BW>(cfgs[ci].wx, cfgs[ci].wy, mapIv, mapIpw, mapDen);
+            for (uint selector = 0; selector < dims; selector++) {
+                uint candidateEp[8];
+                uchar candidateGrid[64];
+                uchar candidateGrid2[64];
+                float candidateErr = zslr_eval_config_dual<BW>(pk, vm, iv, ipw, den, full,
+                                                                cfgs[ci].wx, cfgs[ci].wy, cfgs[ci].bits, levels, dims, selector,
+                                                                init0, init1, sPasses, sIterA, sIterB,
+                                                                candidateEp, candidateGrid, candidateGrid2);
+                if (candidateErr < err) {
+                    err = candidateErr;
+                    useExtremaSeed = false;
+                    tmpSelector = selector;
+                    for (uint j = 0; j < dims * 2u; j++) tmpEp[j] = candidateEp[j];
+                    for (uint j = 0; j < cfgs[ci].wx * cfgs[ci].wy; j++) {
+                        tmpGrid[j] = candidateGrid[j];
+                        tmpGrid2[j] = candidateGrid2[j];
+                    }
+                }
+                if (BW == 6u) {
+                    uint altEp[8];
+                    uchar altGrid[64];
+                    uchar altGrid2[64];
+                    float altErr = zslr_eval_config_dual<BW>(pk, vm, iv, ipw, den, full,
+                                                             cfgs[ci].wx, cfgs[ci].wy, cfgs[ci].bits, levels, dims, selector,
+                                                             seed0, seed1, sPasses, sIterA, sIterB,
+                                                             altEp, altGrid, altGrid2);
+                    if (altErr < err) {
+                        err = altErr;
+                        useExtremaSeed = true;
+                        tmpSelector = selector;
+                        for (uint j = 0; j < dims * 2u; j++) tmpEp[j] = altEp[j];
+                        for (uint j = 0; j < cfgs[ci].wx * cfgs[ci].wy; j++) {
+                            tmpGrid[j] = altGrid[j];
+                            tmpGrid2[j] = altGrid2[j];
+                        }
+                    }
+                }
+            }
+        } else {
+            for (uint j = 0; j < N; j++) { mapIv[j] = ivT[ci * N + j]; mapIpw[j] = ipwT[ci * N + j]; }
+            for (uint j = 0; j < 64u; j++) mapDen[j] = denT[ci * 64u + j];
+            err = zslr_eval_config<BW>(pk, vm, iv, ipw, den, full,
+                                       cfgs[ci].wx, cfgs[ci].wy, cfgs[ci].bits, levels, dims,
+                                       init0, init1, sPasses, sIterA, sIterB, tmpEp, tmpGrid);
+            if (BW == 6u) {
+                uint altEp[8];
+                uchar altGrid[64];
+                float altErr = zslr_eval_config<BW>(pk, vm, iv, ipw, den, full,
+                                                    cfgs[ci].wx, cfgs[ci].wy, cfgs[ci].bits, levels, dims,
+                                                    seed0, seed1, sPasses, sIterA, sIterB, altEp, altGrid);
+                if (altErr < err) {
+                    err = altErr;
+                    useExtremaSeed = true;
+                    for (uint j = 0; j < dims * 2u; j++) tmpEp[j] = altEp[j];
+                    for (uint j = 0; j < cfgs[ci].wx * cfgs[ci].wy; j++) tmpGrid[j] = altGrid[j];
+                }
             }
         }
         configUsesExtremaSeed[ci] = useExtremaSeed;
@@ -1595,8 +1831,13 @@ static float zslr_encode_block(thread const uint *pk, thread const uint *vm, boo
             bestErr = err;
             bestCfg = ci;
             bestLevels = levels;
+            bestDualPlane = cfgs[ci].pad != 0u;
+            bestSelector = tmpSelector;
             for (uint i = 0; i < dims * 2u; i++) bestEp[i] = tmpEp[i];
-            for (uint j = 0; j < cfgs[ci].wx * cfgs[ci].wy; j++) bestGridBytes[j] = tmpGrid[j];
+            for (uint j = 0; j < cfgs[ci].wx * cfgs[ci].wy; j++) {
+                bestGridBytes[j] = tmpGrid[j];
+                bestGridPlane2[j] = cfgs[ci].pad != 0u ? tmpGrid2[j] : 0u;
+            }
         }
         if (err <= exitTotal) {
             done = true;
@@ -1621,22 +1862,52 @@ static float zslr_encode_block(thread const uint *pk, thread const uint *vm, boo
         uint levels = rgba ? cfgs[pick].levelsRGBA : cfgs[pick].levelsRGB;
         uint tmpEp[8];
         uchar tmpGrid[64];
-        float err;
-        if (configUsesExtremaSeed[pick]) {
-            err = zslr_eval_config<BW>(pk, vm, ivT + pick * N, ipwT + pick * N, denT + pick * 64u, full,
-                                       cfgs[pick].wx, cfgs[pick].wy, cfgs[pick].bits, levels, dims,
-                                       seed0, seed1, rPasses, rIterA, rIterB, tmpEp, tmpGrid);
+        uchar tmpGrid2[64];
+        uint tmpSelector = 0u;
+        float err = 1e30f;
+        thread const float *seedA = configUsesExtremaSeed[pick] ? seed0 : init0;
+        thread const float *seedB = configUsesExtremaSeed[pick] ? seed1 : init1;
+        uchar mapIv[N];
+        uint mapIpw[N];
+        float mapDen[64];
+        if (cfgs[pick].pad != 0u) {
+            zslr_build_weight_map<BW>(cfgs[pick].wx, cfgs[pick].wy, mapIv, mapIpw, mapDen);
+            for (uint selector = 0; selector < dims; selector++) {
+                uint candidateEp[8];
+                uchar candidateGrid[64];
+                uchar candidateGrid2[64];
+                float candidateErr = zslr_eval_config_dual<BW>(pk, vm, mapIv, mapIpw, mapDen, full,
+                                                                cfgs[pick].wx, cfgs[pick].wy, cfgs[pick].bits, levels, dims, selector,
+                                                                seedA, seedB, rPasses, rIterA, rIterB,
+                                                                candidateEp, candidateGrid, candidateGrid2);
+                if (candidateErr < err) {
+                    err = candidateErr;
+                    tmpSelector = selector;
+                    for (uint j = 0; j < dims * 2u; j++) tmpEp[j] = candidateEp[j];
+                    for (uint j = 0; j < cfgs[pick].wx * cfgs[pick].wy; j++) {
+                        tmpGrid[j] = candidateGrid[j];
+                        tmpGrid2[j] = candidateGrid2[j];
+                    }
+                }
+            }
         } else {
-            err = zslr_eval_config<BW>(pk, vm, ivT + pick * N, ipwT + pick * N, denT + pick * 64u, full,
+            for (uint j = 0; j < N; j++) { mapIv[j] = ivT[pick * N + j]; mapIpw[j] = ipwT[pick * N + j]; }
+            for (uint j = 0; j < 64u; j++) mapDen[j] = denT[pick * 64u + j];
+            err = zslr_eval_config<BW>(pk, vm, mapIv, mapIpw, mapDen, full,
                                        cfgs[pick].wx, cfgs[pick].wy, cfgs[pick].bits, levels, dims,
-                                       init0, init1, rPasses, rIterA, rIterB, tmpEp, tmpGrid);
+                                       seedA, seedB, rPasses, rIterA, rIterB, tmpEp, tmpGrid);
         }
         if (err < bestErr) {
             bestErr = err;
             bestCfg = pick;
             bestLevels = levels;
+            bestDualPlane = cfgs[pick].pad != 0u;
+            bestSelector = tmpSelector;
             for (uint i = 0; i < dims * 2u; i++) bestEp[i] = tmpEp[i];
-            for (uint j = 0; j < cfgs[pick].wx * cfgs[pick].wy; j++) bestGridBytes[j] = tmpGrid[j];
+            for (uint j = 0; j < cfgs[pick].wx * cfgs[pick].wy; j++) {
+                bestGridBytes[j] = tmpGrid[j];
+                bestGridPlane2[j] = cfgs[pick].pad != 0u ? tmpGrid2[j] : 0u;
+            }
         }
     }
 
@@ -1654,12 +1925,28 @@ static float zslr_encode_block(thread const uint *pk, thread const uint *vm, boo
         for (uint i = 0; i < nv; i++) zslr_put(out, 17u + i * k, k, bestEp[i]);
     }
     uint ng = wx * wy;
-    for (uint j = 0; j < ng; j++) {
-        uint gv = uint(bestGridBytes[j]);
-        for (uint b = 0; b < bits; b++) {
-            if ((gv >> b) & 1u) {
-                uint pos = 127u - (j * bits + b);
-                out[pos >> 5] |= 1u << (pos & 31u);
+    if (bestDualPlane) {
+        uint weightBits = ng * bits * 2u;
+        zslr_put(out, 128u - weightBits - 2u, 2u, bestSelector);
+        for (uint j = 0; j < ng; j++) {
+            for (uint plane = 0; plane < 2u; plane++) {
+                uint gv = uint(plane == 0u ? bestGridBytes[j] : bestGridPlane2[j]);
+                for (uint b = 0; b < bits; b++) {
+                    if ((gv >> b) & 1u) {
+                        uint pos = 127u - ((j * 2u + plane) * bits + b);
+                        out[pos >> 5] |= 1u << (pos & 31u);
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint j = 0; j < ng; j++) {
+            uint gv = uint(bestGridBytes[j]);
+            for (uint b = 0; b < bits; b++) {
+                if ((gv >> b) & 1u) {
+                    uint pos = 127u - (j * bits + b);
+                    out[pos >> 5] |= 1u << (pos & 31u);
+                }
             }
         }
     }
@@ -2211,7 +2498,7 @@ static void zslr_encode_kernel(texture2d<float, access::sample> source, device u
     }
     bool full = x0 + BW <= params.width && y0 + BW <= params.height;
 
-    float blockErr = zslr_encode_block<BW>(pk, vm, full, cfgs, ivT, ipwT, denT, 10u, params.quality, blk);
+    float blockErr = zslr_encode_block<BW>(pk, vm, full, cfgs, ivT, ipwT, denT, 14u, params.quality, blk);
     metrics[blockY * params.blocksX + gid.x] = blockErr;
 
     uint outputIndex = (blockY * params.blocksX + gid.x) * 4;
