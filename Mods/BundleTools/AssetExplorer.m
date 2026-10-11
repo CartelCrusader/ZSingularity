@@ -7161,3 +7161,500 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
 }
 
 @end
+
+
+#pragma mark FMOD bank core
+
+typedef struct {
+    uint64_t base;
+    uint32_t version;
+    uint32_t numSamples;
+    uint32_t sampleHeaderSize;
+    uint32_t nameTableSize;
+    uint32_t dataSize;
+    uint32_t mode;
+    uint32_t headerSize;
+} ZSFMODFSB;
+
+typedef struct {
+    uint64_t headerOffset;
+    uint32_t headerLength;
+    uint32_t frequency;
+    uint32_t channels;
+    uint64_t sampleCount;
+    uint64_t dataOffset;
+    uint32_t loopStart;
+    uint32_t loopEnd;
+    int hasLoop;
+    uint32_t vorbisCRC;
+    int hasVorbisCRC;
+    uint32_t chunkCount;
+    uint32_t chunkTypes[8];
+    uint32_t chunkSizes[8];
+} ZSFMODSampleHeader;
+
+static const uint32_t kZSFMODFrequencies[10] = {4000, 8000, 11000, 11025, 16000, 22050, 24000, 32000, 44100, 48000};
+
+static inline uint32_t zsfmod_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline uint64_t zsfmod_u64(const uint8_t *p) {
+    return (uint64_t)zsfmod_u32(p) | ((uint64_t)zsfmod_u32(p + 4) << 32);
+}
+
+static int zsfmod_read_fsb(const uint8_t *p, uint64_t size, uint64_t at, ZSFMODFSB *out) {
+    if (at + 60 > size || memcmp(p + at, "FSB5", 4) != 0) return 0;
+    out->base = at;
+    out->version = zsfmod_u32(p + at + 4);
+    out->numSamples = zsfmod_u32(p + at + 8);
+    out->sampleHeaderSize = zsfmod_u32(p + at + 12);
+    out->nameTableSize = zsfmod_u32(p + at + 16);
+    out->dataSize = zsfmod_u32(p + at + 20);
+    out->mode = zsfmod_u32(p + at + 24);
+    out->headerSize = out->version == 0 ? 64 : 60;
+    uint64_t total = (uint64_t)out->headerSize + out->sampleHeaderSize + out->nameTableSize + out->dataSize;
+    if (at + total > size) return 0;
+    if ((uint64_t)out->numSamples * 8 > out->sampleHeaderSize) return 0;
+    return 1;
+}
+
+static uint64_t zsfmod_fsb_total(const ZSFMODFSB *fsb) {
+    return (uint64_t)fsb->headerSize + fsb->sampleHeaderSize + fsb->nameTableSize + fsb->dataSize;
+}
+
+static int zsfmod_collect_fsbs(const uint8_t *p, uint64_t size, ZSFMODFSB *out, int cap, uint32_t *bankVersion) {
+    if (bankVersion) *bankVersion = 0;
+    if (size < 12 || memcmp(p, "RIFF", 4) != 0) return -1;
+    int count = 0;
+    uint64_t pos = 12;
+    while (pos + 8 <= size) {
+        uint64_t chunkSize = zsfmod_u32(p + pos + 4);
+        uint64_t body = pos + 8;
+        uint64_t end = body + chunkSize;
+        if (end > size) end = size;
+        if (memcmp(p + pos, "FMT ", 4) == 0 && chunkSize >= 4 && body + 4 <= size) {
+            if (bankVersion) *bankVersion = zsfmod_u32(p + body);
+        } else if (memcmp(p + pos, "SND ", 4) == 0) {
+            uint64_t cursor = body;
+            while (cursor + 60 <= end && count < cap) {
+                uint64_t found = UINT64_MAX;
+                for (uint64_t q = cursor; q + 4 <= end && q < cursor + 64; q++) {
+                    if (memcmp(p + q, "FSB5", 4) == 0) { found = q; break; }
+                }
+                if (found == UINT64_MAX) break;
+                ZSFMODFSB fsb;
+                if (!zsfmod_read_fsb(p, end, found, &fsb)) break;
+                out[count++] = fsb;
+                cursor = found + zsfmod_fsb_total(&fsb);
+            }
+        }
+        pos = end;
+    }
+    return count;
+}
+
+static int zsfmod_read_sample_header(const uint8_t *p, uint64_t size, const ZSFMODFSB *fsb, uint64_t at, ZSFMODSampleHeader *out) {
+    uint64_t limit = fsb->base + fsb->headerSize + fsb->sampleHeaderSize;
+    if (limit > size) limit = size;
+    if (at + 8 > limit) return 0;
+    memset(out, 0, sizeof(*out));
+    uint64_t raw = zsfmod_u64(p + at);
+    out->headerOffset = at;
+    uint32_t frequencyIndex = (uint32_t)((raw >> 1) & 0xF);
+    out->frequency = frequencyIndex > 9 ? 0 : kZSFMODFrequencies[frequencyIndex];
+    out->channels = (uint32_t)((raw >> 5) & 1) + 1;
+    out->dataOffset = ((raw >> 6) & 0x0FFFFFFFULL) * 16;
+    out->sampleCount = (raw >> 34) & 0x3FFFFFFFULL;
+    int more = (int)(raw & 1);
+    uint64_t cursor = at + 8;
+    while (more) {
+        if (cursor + 4 > limit) return 0;
+        uint32_t header = zsfmod_u32(p + cursor);
+        more = (int)(header & 1);
+        uint32_t chunkSize = (header >> 1) & 0xFFFFFF;
+        uint32_t chunkType = header >> 25;
+        if (cursor + 4 + chunkSize > limit) return 0;
+        const uint8_t *data = p + cursor + 4;
+        if (out->chunkCount < 8) {
+            out->chunkTypes[out->chunkCount] = chunkType;
+            out->chunkSizes[out->chunkCount] = chunkSize;
+            out->chunkCount++;
+        }
+        if (chunkType == 1 && chunkSize >= 1) {
+            out->channels = data[0];
+        } else if (chunkType == 2 && chunkSize >= 4) {
+            out->frequency = zsfmod_u32(data);
+        } else if (chunkType == 3 && chunkSize >= 8) {
+            out->loopStart = zsfmod_u32(data);
+            out->loopEnd = zsfmod_u32(data + 4);
+            out->hasLoop = 1;
+        } else if (chunkType == 11 && chunkSize >= 4) {
+            out->vorbisCRC = zsfmod_u32(data);
+            out->hasVorbisCRC = 1;
+        }
+        cursor += 4 + chunkSize;
+    }
+    out->headerLength = (uint32_t)(cursor - at);
+    return 1;
+}
+
+#pragma mark FMOD bank explorer
+
+NSString * const ZSFMODErrorDomain = @"ZSFMODErrorDomain";
+
+static NSError *ZSFMODMakeError(NSString *message) {
+    return [NSError errorWithDomain:ZSFMODErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+static NSString *ZSFMODCodecName(uint32_t mode) {
+    switch (mode) {
+        case 0:  return @"None";
+        case 1:  return @"PCM8";
+        case 2:  return @"PCM16";
+        case 3:  return @"PCM24";
+        case 4:  return @"PCM32";
+        case 5:  return @"PCM Float";
+        case 6:  return @"GameCube ADPCM";
+        case 7:  return @"IMA ADPCM";
+        case 8:  return @"PS2/PSP VAG";
+        case 9:  return @"PS Vita HEVAG";
+        case 10: return @"Xbox 360 XMA";
+        case 11: return @"MPEG (MP3)";
+        case 12: return @"CELT";
+        case 13: return @"PS4/Vita AT9";
+        case 14: return @"Xbox XWMA";
+        case 15: return @"Vorbis";
+        default: return [NSString stringWithFormat:@"Unknown (%u)", mode];
+    }
+}
+
+static NSString *ZSFMODChunkName(uint32_t type) {
+    switch (type) {
+        case 1:  return @"Channels";
+        case 2:  return @"Frequency";
+        case 3:  return @"Loop";
+        case 4:  return @"XMA seek";
+        case 6:  return @"DSP coefficients";
+        case 7:  return @"XWMA data";
+        case 11: return @"Vorbis data";
+        default: return [NSString stringWithFormat:@"Chunk %u", type];
+    }
+}
+
+static void ZSFMODPutU16(NSMutableData *data, uint16_t value) {
+    uint8_t bytes[2] = {(uint8_t)(value & 0xFF), (uint8_t)(value >> 8)};
+    [data appendBytes:bytes length:2];
+}
+
+static void ZSFMODPutU32(NSMutableData *data, uint32_t value) {
+    uint8_t bytes[4] = {(uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF), (uint8_t)((value >> 16) & 0xFF), (uint8_t)(value >> 24)};
+    [data appendBytes:bytes length:4];
+}
+
+static void ZSFMODWriteU32(uint8_t *target, uint32_t value) {
+    target[0] = (uint8_t)(value & 0xFF);
+    target[1] = (uint8_t)((value >> 8) & 0xFF);
+    target[2] = (uint8_t)((value >> 16) & 0xFF);
+    target[3] = (uint8_t)(value >> 24);
+}
+
+static NSString *ZSFMODChannelText(NSInteger channels) {
+    if (channels == 1) return @"1 (mono)";
+    if (channels == 2) return @"2 (stereo)";
+    return [NSString stringWithFormat:@"%ld", (long)channels];
+}
+
+@implementation ZSFMODBankFile
+@end
+
+@implementation ZSFMODStream
+- (NSTimeInterval)duration {
+    return self.frequency > 0 ? (NSTimeInterval)self.sampleCount / (NSTimeInterval)self.frequency : 0;
+}
+@end
+
+@implementation ZSFMODBank
+@end
+
+@implementation ZSFMODExplorer
+
++ (NSString *)banksDirectory {
+    NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [documents stringByAppendingPathComponent:@"Assets/Sound/FMODBuilds/Mobile"];
+}
+
++ (NSArray<ZSFMODBankFile *> *)availableBanks:(NSError **)error {
+    NSString *directory = [self banksDirectory];
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    BOOL isDirectory = NO;
+    if (![fileManager fileExistsAtPath:directory isDirectory:&isDirectory] || !isDirectory) {
+        if (error) *error = ZSFMODMakeError(@"FMOD bank folder not found.");
+        return @[];
+    }
+    NSArray<NSString *> *names = [fileManager contentsOfDirectoryAtPath:directory error:nil] ?: @[];
+    NSMutableArray<ZSFMODBankFile *> *banks = [NSMutableArray array];
+    for (NSString *name in names) {
+        if (![name.pathExtension.lowercaseString isEqualToString:@"bank"]) continue;
+        NSString *path = [directory stringByAppendingPathComponent:name];
+        struct stat fileStat;
+        if (stat(path.fileSystemRepresentation, &fileStat) != 0 || !S_ISREG(fileStat.st_mode)) continue;
+
+        ZSFMODBankFile *bank = [[ZSFMODBankFile alloc] init];
+        bank.fileName = name;
+        bank.filePath = path;
+        bank.fileSize = (unsigned long long)fileStat.st_size;
+        bank.streamCount = 0;
+
+        @autoreleasepool {
+            NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+            if (data.length > 0) {
+                ZSFMODFSB fsbs[64];
+                uint32_t version = 0;
+                int count = zsfmod_collect_fsbs(data.bytes, data.length, fsbs, 64, &version);
+                NSInteger total = 0;
+                for (int i = 0; i < count; i++) total += fsbs[i].numSamples;
+                bank.streamCount = total;
+                if (count > 0) bank.codecName = ZSFMODCodecName(fsbs[0].mode);
+            }
+        }
+        [banks addObject:bank];
+    }
+    if (banks.count == 0 && error) *error = ZSFMODMakeError(@"No .bank files found.");
+    return banks;
+}
+
++ (ZSFMODBank *)openBankAtPath:(NSString *)path error:(NSError **)error {
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:&readError];
+    if (!data) {
+        if (error) *error = readError ?: ZSFMODMakeError(@"Couldn't read the bank file.");
+        return nil;
+    }
+    const uint8_t *bytes = data.bytes;
+    uint64_t size = data.length;
+
+    ZSFMODFSB fsbs[64];
+    uint32_t version = 0;
+    int count = zsfmod_collect_fsbs(bytes, size, fsbs, 64, &version);
+    if (count < 0) {
+        if (error) *error = ZSFMODMakeError(@"Not an FMOD bank (RIFF header missing).");
+        return nil;
+    }
+
+    NSMutableArray<ZSFMODStream *> *streams = [NSMutableArray array];
+    NSInteger globalIndex = 0;
+    for (int fsbIndex = 0; fsbIndex < count; fsbIndex++) {
+        const ZSFMODFSB *fsb = &fsbs[fsbIndex];
+        uint64_t cursor = fsb->base + fsb->headerSize;
+        uint64_t nameTable = cursor + fsb->sampleHeaderSize;
+        uint64_t dataStart = nameTable + fsb->nameTableSize;
+
+        NSMutableArray<ZSFMODStream *> *fsbStreams = [NSMutableArray arrayWithCapacity:fsb->numSamples];
+        NSMutableArray<NSNumber *> *relativeOffsets = [NSMutableArray arrayWithCapacity:fsb->numSamples];
+        for (uint32_t k = 0; k < fsb->numSamples; k++) {
+            ZSFMODSampleHeader header;
+            if (!zsfmod_read_sample_header(bytes, size, fsb, cursor, &header)) break;
+            cursor += header.headerLength;
+
+            ZSFMODStream *stream = [[ZSFMODStream alloc] init];
+            stream.index = globalIndex++;
+            stream.fsbIndex = fsbIndex;
+            stream.mode = fsb->mode;
+            stream.codecName = ZSFMODCodecName(fsb->mode);
+            stream.channels = header.channels;
+            stream.frequency = header.frequency;
+            stream.sampleCount = header.sampleCount;
+            stream.dataOffset = dataStart + header.dataOffset;
+            stream.sampleHeaderOffset = header.headerOffset;
+            stream.sampleHeaderLength = header.headerLength;
+            stream.fsbBase = fsb->base;
+            stream.fsbHeaderSize = fsb->headerSize;
+            stream.hasLoop = header.hasLoop;
+            stream.loopStart = header.loopStart;
+            stream.loopEnd = header.loopEnd;
+            stream.hasVorbisCRC = header.hasVorbisCRC;
+            stream.vorbisCRC = header.vorbisCRC;
+
+            NSMutableArray<NSString *> *chunks = [NSMutableArray array];
+            for (uint32_t c = 0; c < header.chunkCount; c++) {
+                [chunks addObject:[NSString stringWithFormat:@"%@ (%u bytes)", ZSFMODChunkName(header.chunkTypes[c]), header.chunkSizes[c]]];
+            }
+            stream.chunkSummaries = chunks;
+
+            NSString *name = nil;
+            if ((uint64_t)(k + 1) * 4 <= fsb->nameTableSize) {
+                uint64_t entry = zsfmod_u32(bytes + nameTable + (uint64_t)k * 4);
+                uint64_t nameStart = nameTable + entry;
+                if (nameStart < dataStart) {
+                    const uint8_t *start = bytes + nameStart;
+                    const uint8_t *terminator = memchr(start, 0, (size_t)(dataStart - nameStart));
+                    size_t length = terminator ? (size_t)(terminator - start) : (size_t)(dataStart - nameStart);
+                    if (length > 0) name = [[NSString alloc] initWithBytes:start length:length encoding:NSUTF8StringEncoding];
+                }
+            }
+            stream.name = name.length > 0 ? name : [NSString stringWithFormat:@"stream_%ld", (long)stream.index];
+
+            [fsbStreams addObject:stream];
+            [relativeOffsets addObject:@(header.dataOffset)];
+        }
+
+        for (NSUInteger k = 0; k < fsbStreams.count; k++) {
+            uint64_t start = relativeOffsets[k].unsignedLongLongValue;
+            uint64_t end = fsb->dataSize;
+            if (k + 1 < fsbStreams.count) {
+                uint64_t next = relativeOffsets[k + 1].unsignedLongLongValue;
+                if (next > start && next <= fsb->dataSize) end = next;
+            }
+            fsbStreams[k].dataSize = end > start ? end - start : 0;
+        }
+        [streams addObjectsFromArray:fsbStreams];
+    }
+
+    ZSFMODBank *bank = [[ZSFMODBank alloc] init];
+    bank.filePath = path;
+    bank.fileName = path.lastPathComponent;
+    bank.fileSize = size;
+    bank.formatVersion = version;
+    bank.fsbCount = count;
+    bank.streams = streams;
+    bank.data = data;
+    return bank;
+}
+
++ (NSString *)detailTextForStream:(ZSFMODStream *)stream inBank:(ZSFMODBank *)bank {
+    NSMutableString *text = [NSMutableString string];
+    void (^line)(NSString *, NSString *) = ^(NSString *label, NSString *value) {
+        [text appendFormat:@"%-14s %@\n", label.UTF8String, value];
+    };
+    NSTimeInterval duration = stream.duration;
+    NSInteger minutes = (NSInteger)(duration / 60);
+    double seconds = duration - minutes * 60;
+
+    line(@"Name", stream.name);
+    line(@"Bank", bank.fileName);
+    line(@"Bank version", [NSString stringWithFormat:@"%u", bank.formatVersion]);
+    line(@"Stream", [NSString stringWithFormat:@"%ld of %lu", (long)stream.index + 1, (unsigned long)bank.streams.count]);
+    line(@"FSB", [NSString stringWithFormat:@"%ld of %ld", (long)stream.fsbIndex + 1, (long)bank.fsbCount]);
+    line(@"Codec", stream.codecName);
+    line(@"Channels", ZSFMODChannelText(stream.channels));
+    line(@"Sample rate", [NSString stringWithFormat:@"%ld Hz", (long)stream.frequency]);
+    line(@"Samples", [NSString stringWithFormat:@"%llu", (unsigned long long)stream.sampleCount]);
+    line(@"Duration", [NSString stringWithFormat:@"%02ld:%06.3f", (long)minutes, seconds]);
+    line(@"Data size", [NSString stringWithFormat:@"%llu bytes (%@)", (unsigned long long)stream.dataSize, [NSByteCountFormatter stringFromByteCount:(long long)stream.dataSize countStyle:NSByteCountFormatterCountStyleFile]]);
+    if (duration > 0) {
+        line(@"Bitrate", [NSString stringWithFormat:@"%.1f kbps", (double)stream.dataSize * 8.0 / duration / 1000.0]);
+    }
+    line(@"Data offset", [NSString stringWithFormat:@"0x%llX", (unsigned long long)stream.dataOffset]);
+    line(@"Header offset", [NSString stringWithFormat:@"0x%llX", (unsigned long long)stream.sampleHeaderOffset]);
+    line(@"Loop", stream.hasLoop ? [NSString stringWithFormat:@"%u - %u", stream.loopStart, stream.loopEnd] : @"none");
+    if (stream.hasVorbisCRC) line(@"Vorbis CRC32", [NSString stringWithFormat:@"%08X", stream.vorbisCRC]);
+    if (stream.chunkSummaries.count > 0) line(@"Extra chunks", [stream.chunkSummaries componentsJoinedByString:@", "]);
+    if (stream.mode == 15) {
+        [text appendString:@"\nVorbis streams in FMOD banks carry no codebook, so they can't be decoded here. Export the .fsb to open it in FMOD tools or vgmstream.\n"];
+    }
+    return text;
+}
+
++ (BOOL)canExportWAVForStream:(ZSFMODStream *)stream {
+    return stream.mode >= 1 && stream.mode <= 5 && stream.channels > 0 && stream.frequency > 0;
+}
+
++ (NSString *)safeFileNameForStream:(ZSFMODStream *)stream {
+    NSMutableString *name = [stream.name mutableCopy];
+    for (NSString *bad in @[@"/", @"\\", @":", @"*", @"?", @"\"", @"<", @">", @"|"]) {
+        [name replaceOccurrencesOfString:bad withString:@"_" options:0 range:NSMakeRange(0, name.length)];
+    }
+    NSString *trimmed = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    return trimmed.length > 0 ? trimmed : [NSString stringWithFormat:@"stream_%ld", (long)stream.index];
+}
+
++ (NSString *)exportStream:(ZSFMODStream *)stream inBank:(ZSFMODBank *)bank format:(ZSFMODExportFormat)format toDirectory:(NSString *)directory error:(NSError **)error {
+    uint64_t size = bank.data.length;
+    if (stream.dataOffset + stream.dataSize > size || stream.sampleHeaderOffset + stream.sampleHeaderLength > size) {
+        if (error) *error = ZSFMODMakeError(@"Stream data lies outside the bank file.");
+        return nil;
+    }
+    const uint8_t *bytes = bank.data.bytes;
+    NSData *payload = [NSData dataWithBytes:bytes + stream.dataOffset length:(NSUInteger)stream.dataSize];
+    NSMutableData *output = nil;
+    NSString *extension = nil;
+
+    if (format == ZSFMODExportFormatRaw) {
+        output = [payload mutableCopy];
+        extension = @"raw";
+    } else if (format == ZSFMODExportFormatWAV) {
+        if (![self canExportWAVForStream:stream]) {
+            if (error) *error = ZSFMODMakeError([NSString stringWithFormat:@"%@ streams can't be written as WAV. Export the .fsb instead.", stream.codecName]);
+            return nil;
+        }
+        uint16_t bits = stream.mode == 1 ? 8 : (stream.mode == 2 ? 16 : (stream.mode == 3 ? 24 : 32));
+        uint16_t tag = stream.mode == 5 ? 3 : 1;
+        uint32_t channels = (uint32_t)stream.channels;
+        uint32_t rate = (uint32_t)stream.frequency;
+        uint16_t blockAlign = (uint16_t)(channels * bits / 8);
+        output = [NSMutableData dataWithCapacity:44 + payload.length];
+        [output appendBytes:"RIFF" length:4];
+        ZSFMODPutU32(output, (uint32_t)(36 + payload.length));
+        [output appendBytes:"WAVEfmt " length:8];
+        ZSFMODPutU32(output, 16);
+        ZSFMODPutU16(output, tag);
+        ZSFMODPutU16(output, (uint16_t)channels);
+        ZSFMODPutU32(output, rate);
+        ZSFMODPutU32(output, rate * blockAlign);
+        ZSFMODPutU16(output, blockAlign);
+        ZSFMODPutU16(output, bits);
+        [output appendBytes:"data" length:4];
+        ZSFMODPutU32(output, (uint32_t)payload.length);
+        [output appendData:payload];
+        extension = @"wav";
+    } else {
+        NSMutableData *header = [NSMutableData dataWithBytes:bytes + stream.fsbBase length:stream.fsbHeaderSize];
+        NSMutableData *sampleHeader = [NSMutableData dataWithBytes:bytes + stream.sampleHeaderOffset length:stream.sampleHeaderLength];
+        if (sampleHeader.length < 8) {
+            if (error) *error = ZSFMODMakeError(@"Sample header is truncated.");
+            return nil;
+        }
+        uint8_t *sh = sampleHeader.mutableBytes;
+        uint64_t raw = zsfmod_u64(sh);
+        raw &= ~(0x0FFFFFFFULL << 6);
+        for (int i = 0; i < 8; i++) sh[i] = (uint8_t)((raw >> (8 * i)) & 0xFF);
+
+        NSData *nameData = [stream.name dataUsingEncoding:NSUTF8StringEncoding] ?: [NSData data];
+        NSMutableData *nameTable = [NSMutableData data];
+        ZSFMODPutU32(nameTable, 4);
+        [nameTable appendData:nameData];
+        uint8_t zero = 0;
+        [nameTable appendBytes:&zero length:1];
+        NSUInteger prefix = header.length + sampleHeader.length + nameTable.length;
+        NSUInteger namePad = (32 - (prefix % 32)) % 32;
+        if (namePad > 0) [nameTable increaseLengthBy:namePad];
+
+        NSMutableData *paddedPayload = [payload mutableCopy];
+        NSUInteger dataPad = (32 - (paddedPayload.length % 32)) % 32;
+        if (dataPad > 0) [paddedPayload increaseLengthBy:dataPad];
+
+        uint8_t *h = header.mutableBytes;
+        ZSFMODWriteU32(h + 8, 1);
+        ZSFMODWriteU32(h + 12, (uint32_t)sampleHeader.length);
+        ZSFMODWriteU32(h + 16, (uint32_t)nameTable.length);
+        ZSFMODWriteU32(h + 20, (uint32_t)paddedPayload.length);
+
+        output = [NSMutableData dataWithCapacity:header.length + sampleHeader.length + nameTable.length + paddedPayload.length];
+        [output appendData:header];
+        [output appendData:sampleHeader];
+        [output appendData:nameTable];
+        [output appendData:paddedPayload];
+        extension = @"fsb";
+    }
+
+    NSString *path = [directory stringByAppendingPathComponent:[[self safeFileNameForStream:stream] stringByAppendingPathExtension:extension]];
+    NSError *writeError = nil;
+    if (![output writeToFile:path options:NSDataWritingAtomic error:&writeError]) {
+        if (error) *error = writeError ?: ZSFMODMakeError(@"Couldn't write the export.");
+        return nil;
+    }
+    return path;
+}
+
+@end

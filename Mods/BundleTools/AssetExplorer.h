@@ -81,4 +81,63 @@ typedef NSString * _Nullable (^ZSAssetExplorerLiveDebugProvider)(NSTimeInterval 
 + (nullable NSString *)fullExportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory jsonOnly:(BOOL)jsonOnly error:(NSError **)error;
 @end
 
+extern NSString * const ZSFMODErrorDomain;
+
+typedef NS_ENUM(NSInteger, ZSFMODExportFormat) {
+    ZSFMODExportFormatFSB = 0,
+    ZSFMODExportFormatRaw,
+    ZSFMODExportFormatWAV,
+};
+
+@interface ZSFMODBankFile : NSObject
+@property (nonatomic, copy) NSString *fileName;
+@property (nonatomic, copy) NSString *filePath;
+@property (nonatomic, assign) unsigned long long fileSize;
+@property (nonatomic, assign) NSInteger streamCount;
+@property (nonatomic, copy, nullable) NSString *codecName;
+@end
+
+@interface ZSFMODStream : NSObject
+@property (nonatomic, assign) NSInteger index;
+@property (nonatomic, assign) NSInteger fsbIndex;
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, assign) uint32_t mode;
+@property (nonatomic, copy) NSString *codecName;
+@property (nonatomic, assign) NSInteger channels;
+@property (nonatomic, assign) NSInteger frequency;
+@property (nonatomic, assign) uint64_t sampleCount;
+@property (nonatomic, assign) uint64_t dataOffset;
+@property (nonatomic, assign) uint64_t dataSize;
+@property (nonatomic, assign) uint64_t sampleHeaderOffset;
+@property (nonatomic, assign) uint32_t sampleHeaderLength;
+@property (nonatomic, assign) uint64_t fsbBase;
+@property (nonatomic, assign) uint32_t fsbHeaderSize;
+@property (nonatomic, assign) BOOL hasLoop;
+@property (nonatomic, assign) uint32_t loopStart;
+@property (nonatomic, assign) uint32_t loopEnd;
+@property (nonatomic, assign) BOOL hasVorbisCRC;
+@property (nonatomic, assign) uint32_t vorbisCRC;
+@property (nonatomic, copy) NSArray<NSString *> *chunkSummaries;
+@property (nonatomic, readonly) NSTimeInterval duration;
+@end
+
+@interface ZSFMODBank : NSObject
+@property (nonatomic, copy) NSString *filePath;
+@property (nonatomic, copy) NSString *fileName;
+@property (nonatomic, assign) unsigned long long fileSize;
+@property (nonatomic, assign) uint32_t formatVersion;
+@property (nonatomic, assign) NSInteger fsbCount;
+@property (nonatomic, copy) NSArray<ZSFMODStream *> *streams;
+@property (nonatomic, strong) NSData *data;
+@end
+
+@interface ZSFMODExplorer : NSObject
++ (NSString *)banksDirectory;
++ (NSArray<ZSFMODBankFile *> *)availableBanks:(NSError **)error;
++ (nullable ZSFMODBank *)openBankAtPath:(NSString *)path error:(NSError **)error;
++ (NSString *)detailTextForStream:(ZSFMODStream *)stream inBank:(ZSFMODBank *)bank;
++ (BOOL)canExportWAVForStream:(ZSFMODStream *)stream;
++ (nullable NSString *)exportStream:(ZSFMODStream *)stream inBank:(ZSFMODBank *)bank format:(ZSFMODExportFormat)format toDirectory:(NSString *)directory error:(NSError **)error;
+@end
+
 NS_ASSUME_NONNULL_END

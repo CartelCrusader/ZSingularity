@@ -6111,6 +6111,19 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, strong) UIButton *assetExplorerPageNextButton;
 @property (nonatomic, strong) UILabel *assetExplorerPageLabel;
 @property (nonatomic, copy) NSString *assetExplorerStatusMessage;
+@property (nonatomic, strong) UIView *assetExplorerHubView;
+@property (nonatomic, strong) UITableView *assetExplorerFMODTableView;
+@property (nonatomic, assign) BOOL assetExplorerHubVisible;
+@property (nonatomic, assign) BOOL assetExplorerFMODMode;
+@property (nonatomic, assign) NSUInteger assetExplorerFMODGeneration;
+@property (nonatomic, assign) NSInteger assetExplorerFMODSortMode;
+@property (nonatomic, strong) NSArray<ZSFMODBankFile *> *assetExplorerFMODBankFiles;
+@property (nonatomic, strong) NSArray<ZSFMODBankFile *> *assetExplorerFMODDisplayedBanks;
+@property (nonatomic, strong) ZSFMODBankFile *assetExplorerFMODBankFile;
+@property (nonatomic, strong) ZSFMODBank *assetExplorerFMODBank;
+@property (nonatomic, strong) NSArray<ZSFMODStream *> *assetExplorerFMODDisplayedStreams;
+@property (nonatomic, strong) ZSFMODStream *assetExplorerFMODStream;
+@property (nonatomic, strong) NSSet<NSString *> *assetExplorerFMODModdedNames;
 @property (nonatomic, strong) UIView *memoryFullScreenOverlay;
 @property (nonatomic, strong) UIScrollView *memoryFullScreenScrollView;
 @property (nonatomic, strong) UIView *memoryFullScreenContentView;
@@ -8435,6 +8448,17 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     [self.assetExplorerFullScreenOverlay removeFromSuperview];
     self.assetExplorerFullScreenOverlay = nil;
     self.assetExplorerTableView = nil;
+    self.assetExplorerFMODTableView = nil;
+    self.assetExplorerHubView = nil;
+    self.assetExplorerHubVisible = NO;
+    self.assetExplorerFMODMode = NO;
+    self.assetExplorerFMODGeneration += 1;
+    self.assetExplorerFMODBankFile = nil;
+    self.assetExplorerFMODBank = nil;
+    self.assetExplorerFMODStream = nil;
+    self.assetExplorerFMODBankFiles = nil;
+    self.assetExplorerFMODDisplayedBanks = nil;
+    self.assetExplorerFMODDisplayedStreams = nil;
     self.assetExplorerTitleLabel = nil;
     self.assetExplorerStatusLabel = nil;
     self.assetExplorerBackButton = nil;
@@ -16501,6 +16525,8 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
         [tableView.trailingAnchor constraintEqualToAnchor:overlay.trailingAnchor],
         [tableView.bottomAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.bottomAnchor],
     ]];
+
+    [self zs_assetExplorerBuildHubAndFMODViews];
 }
 
 - (void)zs_assetExplorerLoadBundles {
@@ -16511,10 +16537,10 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerSelectedBundle = nil;
     [self zs_assetExplorerSetTextureModeVisible:NO];
     self.assetExplorerAssets = @[];
-    self.assetExplorerCloseButton.hidden = NO;
+    self.assetExplorerCloseButton.hidden = YES;
     self.assetExplorerTitleLabel.text = @"Asset Explorer";
     self.assetExplorerStatusMessage = @"Loading…";
-    self.assetExplorerBackButton.hidden = YES;
+    self.assetExplorerBackButton.hidden = NO;
     self.assetExplorerTableView.hidden = NO;
     [self zs_assetExplorerResetViewState];
     [self zs_assetExplorerRefreshListResettingScroll:YES];
@@ -16593,7 +16619,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerFullScreenOpen = YES;
     self.docsPanelOpen = YES;
     [self positionPanelAnimated:!self.extendedCoverEntering];
-    [self zs_assetExplorerLoadBundles];
+    [self zs_assetExplorerShowHub];
 }
 
 - (void)zs_endAssetExplorerSession {
@@ -16607,6 +16633,15 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     self.assetExplorerCloseButton.hidden = NO;
     self.assetExplorerBackButton.hidden = YES;
     self.assetExplorerFullScreenOverlay.hidden = YES;
+    self.assetExplorerFMODGeneration += 1;
+    self.assetExplorerHubVisible = NO;
+    self.assetExplorerFMODMode = NO;
+    self.assetExplorerFMODBankFile = nil;
+    self.assetExplorerFMODBank = nil;
+    self.assetExplorerFMODStream = nil;
+    self.assetExplorerFMODBankFiles = nil;
+    self.assetExplorerFMODDisplayedBanks = nil;
+    self.assetExplorerFMODDisplayedStreams = nil;
 }
 
 - (void)zs_assetExplorerApplyPreviewTransform {
@@ -17182,6 +17217,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerTextureExportTapped {
+    if (self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODExportStreamTapped];
+        return;
+    }
     UIImage *image = self.assetExplorerTextureImageView.image;
     ZSAssetExplorerVisual *textVisual = self.assetExplorerVisual;
     BOOL isDataExport = self.assetExplorerDataMode && self.assetExplorerDataJSON.length > 0 && textVisual != nil && textVisual.text.length == 0;
@@ -17255,6 +17294,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerTextureBackTapped {
+    if (self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODCloseStream];
+        return;
+    }
     if (!self.assetExplorerTextureOpen) return;
     self.assetExplorerGeneration += 1;
     NSInteger currentIndex = self.assetExplorerTextureIndex;
@@ -17278,15 +17321,24 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerBackTapped {
-    if (!self.assetExplorerSelectedBundle) return;
+    if (self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODBackTapped];
+        return;
+    }
+    if (!self.assetExplorerSelectedBundle) {
+        [self zs_assetExplorerShowHub];
+        UIImpactFeedbackGenerator *hubHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [hubHaptic impactOccurred];
+        return;
+    }
     [self.assetExplorerSearchField resignFirstResponder];
     self.assetExplorerGeneration += 1;
     self.assetExplorerSelectedBundle = nil;
     self.assetExplorerAssets = @[];
-    self.assetExplorerCloseButton.hidden = NO;
+    self.assetExplorerCloseButton.hidden = YES;
     self.assetExplorerTitleLabel.text = @"Asset Explorer";
     self.assetExplorerStatusMessage = nil;
-    self.assetExplorerBackButton.hidden = YES;
+    self.assetExplorerBackButton.hidden = NO;
     self.assetExplorerTableView.hidden = NO;
     [self zs_assetExplorerResetViewState];
     [self zs_assetExplorerRefreshListResettingScroll:YES];
@@ -17356,6 +17408,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerShareBundleTapped {
+    if (self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODShareBankTapped];
+        return;
+    }
     ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
     NSArray<ZSAssetExplorerAsset *> *assets = self.assetExplorerAssets;
     if (!bundle || assets.count == 0 || self.assetExplorerTextureOpen) return;
@@ -17583,6 +17639,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerSearchChanged:(UITextField *)field {
+    if (self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODRefreshListResettingScroll:YES];
+        return;
+    }
     [self zs_assetExplorerRefreshListResettingScroll:YES];
 }
 
@@ -17703,6 +17763,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerSyncControls {
+    if (self.assetExplorerHubVisible || self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODSyncControls];
+        return;
+    }
     BOOL textureOpen = self.assetExplorerTextureOpen;
     BOOL inBundle = self.assetExplorerSelectedBundle != nil;
     self.assetExplorerSearchContainer.hidden = textureOpen;
@@ -17722,6 +17786,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 
 - (void)zs_assetExplorerRebuildMenus {
     if (!self.assetExplorerSortButton) return;
+    if (self.assetExplorerFMODMode) {
+        [self zs_assetExplorerFMODRebuildMenus];
+        return;
+    }
     __weak typeof(self) weakSelf = self;
     BOOL inBundle = self.assetExplorerSelectedBundle != nil;
     UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIImageSymbolWeightSemibold];
@@ -17882,6 +17950,9 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (tableView == self.assetExplorerFMODTableView) {
+        return (NSInteger)(self.assetExplorerFMODBankFile ? self.assetExplorerFMODDisplayedStreams.count : self.assetExplorerFMODDisplayedBanks.count);
+    }
     if (tableView != self.assetExplorerTableView) return 0;
     if (self.assetExplorerSelectedBundle) return (NSInteger)self.assetExplorerDisplayedAssets.count;
     NSUInteger moddedCount = [self zs_assetExplorerModdedDisplayCount];
@@ -17915,6 +17986,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (tableView == self.assetExplorerFMODTableView) return [self zs_assetExplorerFMODCellForTableView:tableView indexPath:indexPath];
     static NSString * const identifier = @"zs.asset.explorer.cell";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:identifier];
@@ -17962,6 +18034,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (UIContextMenuConfiguration *)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point API_AVAILABLE(ios(13.0)) {
+    if (tableView == self.assetExplorerFMODTableView) return [self zs_assetExplorerFMODContextMenuForIndexPath:indexPath];
     if (tableView != self.assetExplorerTableView || !self.assetExplorerSelectedBundle || self.assetExplorerTextureOpen) return nil;
     if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.assetExplorerDisplayedAssets.count) return nil;
     ZSAssetExplorerAsset *asset = self.assetExplorerDisplayedAssets[(NSUInteger)indexPath.row];
@@ -17982,6 +18055,17 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (tableView == self.assetExplorerFMODTableView) {
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        if (self.assetExplorerFMODBankFile) {
+            if (indexPath.row >= 0 && indexPath.row < (NSInteger)self.assetExplorerFMODDisplayedStreams.count) {
+                [self zs_assetExplorerFMODOpenStream:self.assetExplorerFMODDisplayedStreams[(NSUInteger)indexPath.row]];
+            }
+        } else if (indexPath.row >= 0 && indexPath.row < (NSInteger)self.assetExplorerFMODDisplayedBanks.count) {
+            [self zs_assetExplorerFMODOpenBankFile:self.assetExplorerFMODDisplayedBanks[(NSUInteger)indexPath.row]];
+        }
+        return;
+    }
     if (tableView != self.assetExplorerTableView) return;
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (self.assetExplorerSelectedBundle) {
@@ -17993,6 +18077,600 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     NSInteger bundleIndex = [self zs_assetExplorerBundleIndexForIndexPath:indexPath];
     if (bundleIndex < 0 || bundleIndex >= (NSInteger)self.assetExplorerDisplayedBundles.count) return;
     [self zs_assetExplorerOpenBundle:self.assetExplorerDisplayedBundles[(NSUInteger)bundleIndex]];
+}
+
+#pragma mark Asset explorer hub and FMOD banks
+
+- (UIButton *)zs_assetExplorerMakeHubTileWithSymbol:(NSString *)symbol title:(NSString *)title action:(SEL)action {
+    UIButton *tile = [UIButton buttonWithType:UIButtonTypeCustom];
+    tile.translatesAutoresizingMaskIntoConstraints = NO;
+    tile.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    tile.layer.cornerRadius = 32;
+    tile.layer.cornerCurve = kCACornerCurveContinuous;
+    tile.layer.borderWidth = 1;
+    tile.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
+    tile.clipsToBounds = YES;
+    [tile addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [tile addTarget:self action:@selector(zs_assetExplorerHubTilePressed:) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
+    [tile addTarget:self action:@selector(zs_assetExplorerHubTileReleased:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
+
+    UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:46 weight:UIImageSymbolWeightRegular];
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:symbol withConfiguration:symbolConfig]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = [UIColor colorWithWhite:1 alpha:0.92];
+    icon.contentMode = UIViewContentModeScaleAspectFit;
+    icon.userInteractionEnabled = NO;
+    [tile addSubview:icon];
+
+    UILabel *label = [[UILabel alloc] init];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.text = title;
+    label.font = zs_mono_font(11, UIFontWeightSemibold);
+    label.textColor = [UIColor colorWithWhite:1 alpha:0.85];
+    label.textAlignment = NSTextAlignmentCenter;
+    label.adjustsFontSizeToFitWidth = YES;
+    label.minimumScaleFactor = 0.6;
+    label.userInteractionEnabled = NO;
+    [tile addSubview:label];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.centerXAnchor constraintEqualToAnchor:tile.centerXAnchor],
+        [icon.centerYAnchor constraintEqualToAnchor:tile.centerYAnchor constant:-12],
+        [label.leadingAnchor constraintEqualToAnchor:tile.leadingAnchor constant:10],
+        [label.trailingAnchor constraintEqualToAnchor:tile.trailingAnchor constant:-10],
+        [label.bottomAnchor constraintEqualToAnchor:tile.bottomAnchor constant:-14],
+    ]];
+    return tile;
+}
+
+- (void)zs_assetExplorerHubTilePressed:(UIButton *)tile {
+    [UIView animateWithDuration:0.12 delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction animations:^{
+        tile.transform = CGAffineTransformMakeScale(0.96, 0.96);
+        tile.backgroundColor = [UIColor colorWithWhite:1 alpha:0.14];
+    } completion:nil];
+}
+
+- (void)zs_assetExplorerHubTileReleased:(UIButton *)tile {
+    [UIView animateWithDuration:0.18 delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction animations:^{
+        tile.transform = CGAffineTransformIdentity;
+        tile.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    } completion:nil];
+}
+
+- (void)zs_assetExplorerBuildHubAndFMODViews {
+    UIView *overlay = self.assetExplorerFullScreenOverlay;
+    UIButton *closeButton = self.assetExplorerCloseButton;
+    if (!overlay || !closeButton || self.assetExplorerHubView) return;
+
+    UITableView *fmodTable = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    fmodTable.translatesAutoresizingMaskIntoConstraints = NO;
+    fmodTable.backgroundColor = UIColor.clearColor;
+    fmodTable.separatorColor = [UIColor colorWithWhite:1 alpha:0.08];
+    fmodTable.separatorInset = UIEdgeInsetsMake(0, kPanelPadding, 0, kPanelPadding);
+    fmodTable.showsVerticalScrollIndicator = NO;
+    fmodTable.showsHorizontalScrollIndicator = NO;
+    fmodTable.rowHeight = 48;
+    fmodTable.estimatedRowHeight = 48;
+    if (@available(iOS 15.0, *)) fmodTable.sectionHeaderTopPadding = 0;
+    fmodTable.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    fmodTable.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    fmodTable.dataSource = self;
+    fmodTable.delegate = self;
+    fmodTable.hidden = YES;
+    [overlay addSubview:fmodTable];
+    self.assetExplorerFMODTableView = fmodTable;
+
+    UIView *hub = [[UIView alloc] init];
+    hub.translatesAutoresizingMaskIntoConstraints = NO;
+    hub.backgroundColor = UIColor.clearColor;
+    hub.hidden = YES;
+    [overlay addSubview:hub];
+    self.assetExplorerHubView = hub;
+
+    UIButton *unityTile = [self zs_assetExplorerMakeHubTileWithSymbol:@"shippingbox.fill" title:@"Unity Asset Bundles" action:@selector(zs_assetExplorerHubUnityTapped)];
+    UIButton *fmodTile = [self zs_assetExplorerMakeHubTileWithSymbol:@"waveform" title:@"FMOD Audio Banks" action:@selector(zs_assetExplorerHubFMODTapped)];
+
+    UIStackView *tiles = [[UIStackView alloc] initWithArrangedSubviews:@[unityTile, fmodTile]];
+    tiles.translatesAutoresizingMaskIntoConstraints = NO;
+    tiles.axis = UILayoutConstraintAxisHorizontal;
+    tiles.alignment = UIStackViewAlignmentCenter;
+    tiles.distribution = UIStackViewDistributionFillEqually;
+    tiles.spacing = 16;
+    [hub addSubview:tiles];
+
+    NSLayoutConstraint *preferredSize = [unityTile.heightAnchor constraintEqualToConstant:200];
+    preferredSize.priority = UILayoutPriorityDefaultHigh;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [fmodTable.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
+        [fmodTable.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor],
+        [fmodTable.trailingAnchor constraintEqualToAnchor:overlay.trailingAnchor],
+        [fmodTable.bottomAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.bottomAnchor],
+
+        [hub.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
+        [hub.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
+        [hub.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
+        [hub.bottomAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.bottomAnchor constant:-8],
+
+        [tiles.centerXAnchor constraintEqualToAnchor:hub.centerXAnchor],
+        [tiles.centerYAnchor constraintEqualToAnchor:hub.centerYAnchor],
+        [unityTile.widthAnchor constraintEqualToAnchor:unityTile.heightAnchor],
+        [fmodTile.widthAnchor constraintEqualToAnchor:fmodTile.heightAnchor],
+        [fmodTile.heightAnchor constraintEqualToAnchor:unityTile.heightAnchor],
+        [unityTile.heightAnchor constraintLessThanOrEqualToAnchor:hub.heightAnchor multiplier:0.92],
+        [unityTile.widthAnchor constraintLessThanOrEqualToAnchor:hub.widthAnchor multiplier:0.5 constant:-14],
+        preferredSize,
+    ]];
+}
+
+- (void)zs_assetExplorerShowHub {
+    [self.assetExplorerSearchField resignFirstResponder];
+    self.assetExplorerGeneration += 1;
+    self.assetExplorerNamesSession += 1;
+    self.assetExplorerFMODGeneration += 1;
+    self.assetExplorerSelectedBundle = nil;
+    self.assetExplorerAssets = @[];
+    self.assetExplorerFMODBankFile = nil;
+    self.assetExplorerFMODBank = nil;
+    self.assetExplorerFMODStream = nil;
+    self.assetExplorerFMODBankFiles = @[];
+    self.assetExplorerFMODDisplayedBanks = @[];
+    self.assetExplorerFMODDisplayedStreams = @[];
+    self.assetExplorerFMODSortMode = 0;
+    self.assetExplorerFMODMode = NO;
+    self.assetExplorerHubVisible = YES;
+    self.assetExplorerStatusMessage = nil;
+    [self zs_assetExplorerResetViewState];
+    [self zs_assetExplorerSetTextureModeVisible:NO];
+    [self.assetExplorerFMODTableView reloadData];
+    [self zs_assetExplorerFMODApplyLevel];
+}
+
+- (void)zs_assetExplorerHubUnityTapped {
+    if (!self.assetExplorerHubVisible) return;
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+    self.assetExplorerHubVisible = NO;
+    self.assetExplorerFMODMode = NO;
+    self.assetExplorerHubView.hidden = YES;
+    self.assetExplorerFMODTableView.hidden = YES;
+    [self zs_assetExplorerLoadBundles];
+}
+
+- (void)zs_assetExplorerHubFMODTapped {
+    if (!self.assetExplorerHubVisible) return;
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+    self.assetExplorerHubVisible = NO;
+    self.assetExplorerFMODMode = YES;
+    [self zs_assetExplorerFMODLoadBanks];
+}
+
+- (void)zs_assetExplorerFMODApplyLevel {
+    BOOL hub = self.assetExplorerHubVisible;
+    BOOL detail = !hub && self.assetExplorerFMODStream != nil;
+    BOOL inBank = self.assetExplorerFMODBankFile != nil;
+
+    self.assetExplorerHubView.hidden = !hub;
+    self.assetExplorerTableView.hidden = YES;
+    self.assetExplorerFMODTableView.hidden = hub || detail;
+    self.assetExplorerTextView.hidden = !detail;
+    self.assetExplorerTitleLabel.hidden = detail;
+    self.assetExplorerStatusLabel.hidden = hub || detail;
+    self.assetExplorerCloseButton.hidden = !(hub || detail);
+    self.assetExplorerBackButton.hidden = hub || detail;
+    self.assetExplorerTextureBackButton.hidden = !detail;
+    self.assetExplorerTextureExportButton.hidden = !detail;
+    self.assetExplorerTextureExportButton.enabled = detail;
+    self.assetExplorerTextureExportButton.alpha = detail ? 1 : 0.35;
+    self.assetExplorerTitleLabel.text = hub ? @"Asset Explorer" : (inBank ? self.assetExplorerFMODBankFile.fileName : @"FMOD Audio Banks");
+    [self zs_assetExplorerSyncControls];
+}
+
+- (void)zs_assetExplorerFMODSyncControls {
+    BOOL hub = self.assetExplorerHubVisible;
+    BOOL inBank = self.assetExplorerFMODBankFile != nil;
+    BOOL detail = self.assetExplorerFMODStream != nil;
+    BOOL hideControls = hub || detail;
+    self.assetExplorerSearchContainer.hidden = hideControls;
+    self.assetExplorerControlsStack.hidden = hideControls;
+    self.assetExplorerFilterButton.hidden = YES;
+    self.assetExplorerSortButton.hidden = NO;
+    self.assetExplorerShareButton.hidden = !inBank;
+    self.assetExplorerShareButton.enabled = YES;
+    self.assetExplorerShareButton.alpha = 1;
+    NSString *placeholder = inBank ? @"Search streams" : @"Search banks";
+    self.assetExplorerSearchField.attributedPlaceholder =
+        [[NSAttributedString alloc] initWithString:placeholder
+                                         attributes:@{NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.35]}];
+    if (!hideControls) [self zs_assetExplorerFMODRebuildMenus];
+}
+
+- (void)zs_assetExplorerFMODRebuildMenus {
+    if (!self.assetExplorerSortButton) return;
+    __weak typeof(self) weakSelf = self;
+    BOOL inBank = self.assetExplorerFMODBankFile != nil;
+    NSArray<NSString *> *titles = inBank
+        ? @[@"Index", @"Name · A–Z", @"Size · Largest first", @"Length · Longest first"]
+        : @[@"Name · A–Z", @"Name · Z–A", @"Size · Largest first", @"Size · Smallest first"];
+    NSMutableArray<UIMenuElement *> *items = [NSMutableArray array];
+    for (NSInteger i = 0; i < (NSInteger)titles.count; i++) {
+        UIAction *action = [UIAction actionWithTitle:titles[(NSUInteger)i] image:nil identifier:nil handler:^(__kindof UIAction *selected) {
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.assetExplorerFMODSortMode = i;
+            [strongSelf zs_assetExplorerFMODRefreshListResettingScroll:YES];
+            [strongSelf zs_assetExplorerFMODRebuildMenus];
+        }];
+        action.state = self.assetExplorerFMODSortMode == i ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [items addObject:action];
+    }
+    NSInteger desiredSortStyle = self.assetExplorerFMODSortMode != 0 ? 1 : 0;
+    if (self.assetExplorerSortButton.tag != desiredSortStyle) {
+        UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIImageSymbolWeightSemibold];
+        UIColor *tint = desiredSortStyle ? zs_accent_green_color() : [UIColor colorWithWhite:1 alpha:0.9];
+        zs_style_pill_icon_button_as_native_glass(self.assetExplorerSortButton, [UIImage systemImageNamed:@"arrow.up.arrow.down" withConfiguration:symbolConfig], tint);
+        self.assetExplorerSortButton.tag = desiredSortStyle;
+    }
+    self.assetExplorerSortButton.menu = [UIMenu menuWithTitle:@"Sort" children:items];
+    self.assetExplorerSortButton.showsMenuAsPrimaryAction = YES;
+}
+
+- (void)zs_assetExplorerFMODLoadBanks {
+    self.assetExplorerFMODGeneration += 1;
+    NSUInteger generation = self.assetExplorerFMODGeneration;
+    self.assetExplorerFMODBankFile = nil;
+    self.assetExplorerFMODBank = nil;
+    self.assetExplorerFMODStream = nil;
+    self.assetExplorerFMODBankFiles = @[];
+    self.assetExplorerFMODDisplayedBanks = @[];
+    self.assetExplorerFMODDisplayedStreams = @[];
+    self.assetExplorerFMODSortMode = 0;
+    self.assetExplorerSearchField.text = @"";
+    self.assetExplorerStatusMessage = @"Loading…";
+    [self zs_assetExplorerFMODApplyLevel];
+    [self zs_assetExplorerFMODRefreshListResettingScroll:YES];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSArray<ZSFMODBankFile *> *banks = [ZSFMODExplorer availableBanks:&error];
+        NSMutableSet<NSString *> *modded = [NSMutableSet set];
+        for (NSString *relative in [BankTransplant documentsRelativePathsOfSwappedBanks] ?: @[]) {
+            [modded addObject:relative.lastPathComponent];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen || !strongSelf.assetExplorerFMODMode || strongSelf.assetExplorerFMODGeneration != generation) return;
+            strongSelf.assetExplorerFMODBankFiles = banks ?: @[];
+            strongSelf.assetExplorerFMODModdedNames = modded;
+            strongSelf.assetExplorerStatusMessage = error.localizedDescription;
+            [strongSelf zs_assetExplorerFMODRefreshListResettingScroll:NO];
+        });
+    });
+}
+
+- (void)zs_assetExplorerFMODOpenBankFile:(ZSFMODBankFile *)file {
+    if (!file || self.assetExplorerFMODBankFile) return;
+    [self.assetExplorerSearchField resignFirstResponder];
+    self.assetExplorerFMODGeneration += 1;
+    NSUInteger generation = self.assetExplorerFMODGeneration;
+    self.assetExplorerFMODBankFile = file;
+    self.assetExplorerFMODBank = nil;
+    self.assetExplorerFMODStream = nil;
+    self.assetExplorerFMODDisplayedStreams = @[];
+    self.assetExplorerFMODSortMode = 0;
+    self.assetExplorerSearchField.text = @"";
+    self.assetExplorerStatusMessage = @"Reading…";
+    [self zs_assetExplorerFMODApplyLevel];
+    [self zs_assetExplorerFMODRefreshListResettingScroll:YES];
+
+    __weak typeof(self) weakSelf = self;
+    NSString *path = [file.filePath copy];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        ZSFMODBank *bank = [ZSFMODExplorer openBankAtPath:path error:&error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen || !strongSelf.assetExplorerFMODMode || strongSelf.assetExplorerFMODGeneration != generation || strongSelf.assetExplorerFMODBankFile != file) return;
+            strongSelf.assetExplorerFMODBank = bank;
+            if (error) {
+                strongSelf.assetExplorerStatusMessage = error.localizedDescription;
+            } else {
+                strongSelf.assetExplorerStatusMessage = bank.streams.count == 0 ? @"No audio streams in this bank" : nil;
+            }
+            [strongSelf zs_assetExplorerFMODRefreshListResettingScroll:NO];
+        });
+    });
+}
+
+- (void)zs_assetExplorerFMODOpenStream:(ZSFMODStream *)stream {
+    ZSFMODBank *bank = self.assetExplorerFMODBank;
+    if (!bank || !stream || self.assetExplorerFMODStream) return;
+    [self.assetExplorerSearchField resignFirstResponder];
+    self.assetExplorerFMODStream = stream;
+    self.assetExplorerTextView.text = [ZSFMODExplorer detailTextForStream:stream inBank:bank];
+    [self.assetExplorerTextView setContentOffset:CGPointZero animated:NO];
+    [self zs_assetExplorerFMODApplyLevel];
+}
+
+- (void)zs_assetExplorerFMODCloseStream {
+    if (!self.assetExplorerFMODStream) return;
+    self.assetExplorerFMODStream = nil;
+    self.assetExplorerTextView.text = @"";
+    [self zs_assetExplorerFMODApplyLevel];
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+}
+
+- (void)zs_assetExplorerFMODBackTapped {
+    [self.assetExplorerSearchField resignFirstResponder];
+    if (self.assetExplorerFMODStream) {
+        [self zs_assetExplorerFMODCloseStream];
+        return;
+    }
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+    if (self.assetExplorerFMODBankFile) {
+        self.assetExplorerFMODGeneration += 1;
+        self.assetExplorerFMODBankFile = nil;
+        self.assetExplorerFMODBank = nil;
+        self.assetExplorerFMODDisplayedStreams = @[];
+        self.assetExplorerFMODSortMode = 0;
+        self.assetExplorerSearchField.text = @"";
+        self.assetExplorerStatusMessage = nil;
+        [self zs_assetExplorerFMODApplyLevel];
+        [self zs_assetExplorerFMODRefreshListResettingScroll:YES];
+        return;
+    }
+    [self zs_assetExplorerShowHub];
+}
+
+- (void)zs_assetExplorerFMODRefreshListResettingScroll:(BOOL)resetScroll {
+    NSString *query = [self.assetExplorerSearchField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    NSInteger mode = self.assetExplorerFMODSortMode;
+    NSUInteger shown = 0;
+    NSUInteger total = 0;
+    NSString *noun = nil;
+
+    if (!self.assetExplorerFMODBankFile) {
+        NSMutableArray<ZSFMODBankFile *> *matches = [NSMutableArray array];
+        for (ZSFMODBankFile *file in self.assetExplorerFMODBankFiles) {
+            if (query.length > 0 && ![file.fileName localizedCaseInsensitiveContainsString:query]) continue;
+            [matches addObject:file];
+        }
+        self.assetExplorerFMODDisplayedBanks = [matches sortedArrayUsingComparator:^NSComparisonResult(ZSFMODBankFile *a, ZSFMODBankFile *b) {
+            if (mode == 2 || mode == 3) {
+                if (a.fileSize != b.fileSize) {
+                    BOOL aLarger = a.fileSize > b.fileSize;
+                    return (aLarger == (mode == 2)) ? NSOrderedAscending : NSOrderedDescending;
+                }
+            }
+            NSComparisonResult result = [a.fileName compare:b.fileName options:NSCaseInsensitiveSearch | NSNumericSearch];
+            if (mode == 1) {
+                if (result == NSOrderedAscending) return NSOrderedDescending;
+                if (result == NSOrderedDescending) return NSOrderedAscending;
+            }
+            return result;
+        }];
+        self.assetExplorerFMODDisplayedStreams = @[];
+        shown = self.assetExplorerFMODDisplayedBanks.count;
+        total = self.assetExplorerFMODBankFiles.count;
+        noun = @"bank";
+    } else {
+        NSArray<ZSFMODStream *> *all = self.assetExplorerFMODBank.streams ?: @[];
+        NSMutableArray<ZSFMODStream *> *matches = [NSMutableArray array];
+        for (ZSFMODStream *stream in all) {
+            if (query.length > 0) {
+                BOOL hit = [stream.name localizedCaseInsensitiveContainsString:query] ||
+                           [stream.codecName localizedCaseInsensitiveContainsString:query] ||
+                           [[NSString stringWithFormat:@"%ld", (long)stream.index] containsString:query];
+                if (!hit) continue;
+            }
+            [matches addObject:stream];
+        }
+        if (mode == 0) {
+            self.assetExplorerFMODDisplayedStreams = matches;
+        } else {
+            self.assetExplorerFMODDisplayedStreams = [matches sortedArrayUsingComparator:^NSComparisonResult(ZSFMODStream *a, ZSFMODStream *b) {
+                if (mode == 2 && a.dataSize != b.dataSize) return a.dataSize > b.dataSize ? NSOrderedAscending : NSOrderedDescending;
+                if (mode == 3 && a.duration != b.duration) return a.duration > b.duration ? NSOrderedAscending : NSOrderedDescending;
+                NSComparisonResult result = [a.name compare:b.name options:NSCaseInsensitiveSearch | NSNumericSearch];
+                if (result != NSOrderedSame) return result;
+                if (a.index < b.index) return NSOrderedAscending;
+                if (a.index > b.index) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+        }
+        self.assetExplorerFMODDisplayedBanks = @[];
+        shown = self.assetExplorerFMODDisplayedStreams.count;
+        total = all.count;
+        noun = @"stream";
+    }
+
+    NSString *message = self.assetExplorerStatusMessage;
+    if (message.length == 0) {
+        NSString *plural = total == 1 ? @"" : @"s";
+        message = shown == total
+            ? [NSString stringWithFormat:@"%lu %@%@", (unsigned long)total, noun, plural]
+            : [NSString stringWithFormat:@"%lu of %lu %@%@", (unsigned long)shown, (unsigned long)total, noun, plural];
+    }
+    self.assetExplorerStatusLabel.text = message;
+    [self.assetExplorerFMODTableView reloadData];
+    if (resetScroll) [self.assetExplorerFMODTableView setContentOffset:CGPointZero animated:NO];
+}
+
+- (UITableViewCell *)zs_assetExplorerFMODCellForTableView:(UITableView *)tableView indexPath:(NSIndexPath *)indexPath {
+    static NSString * const identifier = @"zs.asset.explorer.fmod.cell";
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:identifier];
+
+    cell.backgroundColor = UIColor.clearColor;
+    cell.contentView.backgroundColor = UIColor.clearColor;
+    cell.textLabel.font = zs_mono_font(11, UIFontWeightRegular);
+    cell.textLabel.textColor = [UIColor colorWithWhite:0.94 alpha:1];
+    cell.textLabel.numberOfLines = 1;
+    cell.textLabel.adjustsFontSizeToFitWidth = YES;
+    cell.textLabel.minimumScaleFactor = 0.65;
+    cell.detailTextLabel.font = zs_mono_font(9, UIFontWeightRegular);
+    cell.detailTextLabel.textColor = [UIColor colorWithWhite:1 alpha:0.38];
+    cell.detailTextLabel.numberOfLines = 1;
+    cell.detailTextLabel.adjustsFontSizeToFitWidth = YES;
+    cell.detailTextLabel.minimumScaleFactor = 0.5;
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.tintColor = [UIColor colorWithWhite:1 alpha:0.5];
+    UIView *selected = [[UIView alloc] init];
+    selected.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    cell.selectedBackgroundView = selected;
+
+    if (!self.assetExplorerFMODBankFile) {
+        ZSFMODBankFile *file = indexPath.row < (NSInteger)self.assetExplorerFMODDisplayedBanks.count ? self.assetExplorerFMODDisplayedBanks[(NSUInteger)indexPath.row] : nil;
+        cell.textLabel.text = file.fileName ?: @"";
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        if (file.streamCount > 0) {
+            [parts addObject:[NSString stringWithFormat:@"%ld stream%@", (long)file.streamCount, file.streamCount == 1 ? @"" : @"s"]];
+            if (file.codecName.length > 0) [parts addObject:file.codecName];
+        } else {
+            [parts addObject:@"no audio streams"];
+        }
+        [parts addObject:[NSByteCountFormatter stringFromByteCount:(long long)file.fileSize countStyle:NSByteCountFormatterCountStyleFile]];
+        if (file.fileName && [self.assetExplorerFMODModdedNames containsObject:file.fileName]) [parts addObject:@"modded"];
+        cell.detailTextLabel.text = [parts componentsJoinedByString:@"  •  "];
+    } else {
+        ZSFMODStream *stream = indexPath.row < (NSInteger)self.assetExplorerFMODDisplayedStreams.count ? self.assetExplorerFMODDisplayedStreams[(NSUInteger)indexPath.row] : nil;
+        cell.textLabel.text = stream.name ?: @"";
+        NSTimeInterval duration = stream.duration;
+        NSString *length = duration >= 60 ? [NSString stringWithFormat:@"%d:%04.1f", (int)(duration / 60), duration - 60 * (int)(duration / 60)] : [NSString stringWithFormat:@"%.2f s", duration];
+        NSString *channels = stream.channels == 1 ? @"mono" : (stream.channels == 2 ? @"stereo" : [NSString stringWithFormat:@"%ldch", (long)stream.channels]);
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  •  %@  •  %.1f kHz  •  %@  •  %@", stream.codecName, channels, stream.frequency / 1000.0, length, [NSByteCountFormatter stringFromByteCount:(long long)stream.dataSize countStyle:NSByteCountFormatterCountStyleFile]];
+    }
+    return cell;
+}
+
+- (UIContextMenuConfiguration *)zs_assetExplorerFMODContextMenuForIndexPath:(NSIndexPath *)indexPath API_AVAILABLE(ios(13.0)) {
+    __weak typeof(self) weakSelf = self;
+    if (self.assetExplorerFMODBankFile) {
+        if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.assetExplorerFMODDisplayedStreams.count) return nil;
+        ZSFMODStream *stream = self.assetExplorerFMODDisplayedStreams[(NSUInteger)indexPath.row];
+        return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+            return [weakSelf zs_assetExplorerFMODExportMenuForStream:stream];
+        }];
+    }
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.assetExplorerFMODDisplayedBanks.count) return nil;
+    ZSFMODBankFile *file = self.assetExplorerFMODDisplayedBanks[(NSUInteger)indexPath.row];
+    return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+        UIAction *exportAction = [UIAction actionWithTitle:@"Export" image:[UIImage systemImageNamed:@"square.and.arrow.up"] identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf zs_assetExplorerFMODExportBankFile:file];
+        }];
+        return [UIMenu menuWithTitle:@"" children:@[exportAction]];
+    }];
+}
+
+- (UIMenu *)zs_assetExplorerFMODExportMenuForStream:(ZSFMODStream *)stream {
+    __weak typeof(self) weakSelf = self;
+    NSMutableArray<UIMenuElement *> *items = [NSMutableArray array];
+    [items addObject:[UIAction actionWithTitle:@".fsb" image:[UIImage systemImageNamed:@"waveform"] identifier:nil handler:^(__kindof UIAction *action) {
+        [weakSelf zs_assetExplorerFMODExportStream:stream format:ZSFMODExportFormatFSB sourceView:nil];
+    }]];
+    if ([ZSFMODExplorer canExportWAVForStream:stream]) {
+        [items addObject:[UIAction actionWithTitle:@".wav" image:[UIImage systemImageNamed:@"speaker.wave.2"] identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf zs_assetExplorerFMODExportStream:stream format:ZSFMODExportFormatWAV sourceView:nil];
+        }]];
+    }
+    [items addObject:[UIAction actionWithTitle:@"raw" image:[UIImage systemImageNamed:@"doc.zipper"] identifier:nil handler:^(__kindof UIAction *action) {
+        [weakSelf zs_assetExplorerFMODExportStream:stream format:ZSFMODExportFormatRaw sourceView:nil];
+    }]];
+    return [UIMenu menuWithTitle:@"" children:items];
+}
+
+- (void)zs_assetExplorerFMODExportStreamTapped {
+    ZSFMODStream *stream = self.assetExplorerFMODStream;
+    if (!stream || !self.assetExplorerFMODBank) return;
+    UIViewController *presenter = zs_key_window().rootViewController;
+    if (!presenter) return;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+
+    UIButton *sourceButton = self.assetExplorerTextureExportButton;
+    __weak typeof(self) weakSelf = self;
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Export" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Standalone .fsb" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf zs_assetExplorerFMODExportStream:stream format:ZSFMODExportFormatFSB sourceView:sourceButton];
+    }]];
+    if ([ZSFMODExplorer canExportWAVForStream:stream]) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"WAV" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            [weakSelf zs_assetExplorerFMODExportStream:stream format:ZSFMODExportFormatWAV sourceView:sourceButton];
+        }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:@"Raw stream data" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [weakSelf zs_assetExplorerFMODExportStream:stream format:ZSFMODExportFormatRaw sourceView:sourceButton];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    alert.popoverPresentationController.sourceView = sourceButton;
+    alert.popoverPresentationController.sourceRect = sourceButton.bounds;
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)zs_assetExplorerFMODShareBankTapped {
+    ZSFMODBankFile *file = self.assetExplorerFMODBankFile;
+    if (!file) return;
+    [self zs_assetExplorerFMODExportBankFile:file];
+}
+
+- (void)zs_assetExplorerFMODExportBankFile:(ZSFMODBankFile *)file {
+    NSString *sourcePath = [file.filePath copy];
+    NSString *fileName = [file.fileName copy];
+    if (sourcePath.length == 0 || fileName.length == 0) return;
+    [self zs_assetExplorerFMODPerformExportWithSourceView:self.assetExplorerShareButton writer:^NSString *(NSString *directory, NSError **error) {
+        NSString *destination = [directory stringByAppendingPathComponent:fileName];
+        return [NSFileManager.defaultManager copyItemAtPath:sourcePath toPath:destination error:error] ? destination : nil;
+    }];
+}
+
+- (void)zs_assetExplorerFMODExportStream:(ZSFMODStream *)stream format:(ZSFMODExportFormat)format sourceView:(UIView *)sourceView {
+    ZSFMODBank *bank = self.assetExplorerFMODBank;
+    if (!bank || !stream) return;
+    [self zs_assetExplorerFMODPerformExportWithSourceView:sourceView writer:^NSString *(NSString *directory, NSError **error) {
+        return [ZSFMODExplorer exportStream:stream inBank:bank format:format toDirectory:directory error:error];
+    }];
+}
+
+- (void)zs_assetExplorerFMODPerformExportWithSourceView:(UIView *)sourceView writer:(NSString *(^)(NSString *directory, NSError **error))writer {
+    UIView *anchor = sourceView ?: self.assetExplorerFullScreenOverlay;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"ZSFMODExport-%@", NSUUID.UUID.UUIDString]];
+        NSError *error = nil;
+        NSString *path = nil;
+        if ([NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&error]) {
+            path = writer(directory, &error);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen) {
+                [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
+                return;
+            }
+            UIViewController *presenter = zs_key_window().rootViewController;
+            while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+            if (!path) {
+                [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
+                UIAlertController *failure = [UIAlertController alertControllerWithTitle:@"Export Failed" message:error.localizedDescription ?: @"Couldn't write the file." preferredStyle:UIAlertControllerStyleAlert];
+                [failure addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [presenter presentViewController:failure animated:YES completion:nil];
+                return;
+            }
+            UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+            activityVC.popoverPresentationController.sourceView = anchor;
+            activityVC.popoverPresentationController.sourceRect = anchor.bounds;
+            activityVC.completionWithItemsHandler = ^(UIActivityType activityType, BOOL completed, NSArray *returnedItems, NSError *activityError) {
+                [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
+            };
+            [presenter presentViewController:activityVC animated:YES completion:nil];
+            UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+            [haptic impactOccurred];
+        });
+    });
 }
 
 #pragma mark Memory full-screen viewer
