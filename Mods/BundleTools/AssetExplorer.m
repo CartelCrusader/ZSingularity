@@ -3337,6 +3337,11 @@ static float ZSAEAnimCurveEval(NSData *keyData, double time) {
     return ((key->c[0] * dt + key->c[1]) * dt + key->c[2]) * dt + key->c[3];
 }
 
+static NSUInteger ZSAEAnimStreamCurveTotal(id value) {
+    uint64_t raw = (uint64_t)MAX((int64_t)0, ZSAEInt(value));
+    return (NSUInteger)((raw & 0xFFFFu) + ((raw >> 16) & 0xFFFFu));
+}
+
 static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
     NSDictionary *fields = clipObject.fields;
     NSDictionary *muscle = ZSAEDict(fields[@"m_MuscleClip"]);
@@ -3347,7 +3352,7 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
     NSDictionary *constant = ZSAEDict(clipData[@"m_ConstantClip"]);
     NSDictionary *bindingConstant = ZSAEDict(fields[@"m_ClipBindingConstant"]);
 
-    NSUInteger expectedStream = (NSUInteger)MAX((int64_t)0, ZSAEInt(streamed[@"curveCount"]));
+    NSUInteger expectedStream = ZSAEAnimStreamCurveTotal(streamed[@"curveCount"]);
     NSUInteger expectedDense = (NSUInteger)MAX((int64_t)0, ZSAEInt(dense[@"m_CurveCount"]));
     NSData *expectedConstantData = [constant[@"data"] isKindOfClass:[NSData class]] ? constant[@"data"] : nil;
     NSUInteger expectedTotal = expectedStream + expectedDense + expectedConstantData.length / sizeof(float);
@@ -3392,7 +3397,7 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
     };
 
     double lastTime = 0;
-    NSUInteger streamCount = (NSUInteger)ZSAEInt(streamed[@"curveCount"]);
+    NSUInteger streamCount = expectedStream;
     NSData *streamData = [streamed[@"data"] isKindOfClass:[NSData class]] ? streamed[@"data"] : nil;
     if (streamData.length > 0) {
         NSMutableDictionary<NSNumber *, NSMutableData *> *perCurve = [NSMutableDictionary dictionary];
