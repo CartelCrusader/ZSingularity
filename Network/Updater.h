@@ -57,4 +57,11 @@ typedef NS_ENUM(NSInteger, ZSUpdateCheckMode) {
 
 @end
 
+@interface ZSLiveContainerPatcher : NSObject
+
++ (void)patchIPAAtURL:(NSURL *)ipaURL
+           completion:(void (^)(NSURL * _Nullable patchedURL, NSString * _Nullable hostBundleID, NSError * _Nullable error))completion;
+
+@end
+
 NS_ASSUME_NONNULL_END

@@ -2,6 +2,8 @@
 #import "ZTweakLog.h"
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#import <compression.h>
+#import <sys/stat.h>
 #import "Version.h"
 
 #pragma mark - ZSDylibUpdater
@@ -518,6 +520,527 @@ static void zs_update_fetch_non_nightly_releases(NSUInteger page, NSMutableArray
 
     NSURL *url = [NSURL URLWithString:zs_releases_latest_url_string()];
     zs_update_gh_json_get(url, handleRoot);
+}
+
+@end
+
+#pragma mark - ZSLiveContainerPatcher
+
+static NSString * const kZSPatchErrorDomain = @"ZSLiveContainerPatcher";
+static NSString * const kZSPatchAppexName = @"ZSRamDonor.appex";
+static NSString * const kZSPatchDefaultExecutable = @"ZSRamDonor";
+
+static NSError *zs_patch_error(NSString *message) {
+    return [NSError errorWithDomain:kZSPatchErrorDomain code:1 userInfo:@{NSLocalizedDescriptionKey: message}];
+}
+
+static uint16_t zs_patch_u16(const uint8_t *p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t zs_patch_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint32_t zs_patch_crc32(const uint8_t *bytes, size_t length) {
+    static uint32_t table[256];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+    });
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < length; i++) crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+@interface ZSPatchZipEntry : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy) NSData *nameBytes;
+@property (nonatomic, assign) uint16_t versionMadeBy;
+@property (nonatomic, assign) uint16_t flags;
+@property (nonatomic, assign) uint16_t method;
+@property (nonatomic, assign) uint16_t dosTime;
+@property (nonatomic, assign) uint16_t dosDate;
+@property (nonatomic, assign) uint16_t internalAttributes;
+@property (nonatomic, assign) uint32_t crc;
+@property (nonatomic, assign) uint32_t compressedSize;
+@property (nonatomic, assign) uint32_t size;
+@property (nonatomic, assign) uint32_t externalAttributes;
+@property (nonatomic, assign) uint32_t localOffset;
+@end
+
+@implementation ZSPatchZipEntry
+@end
+
+static NSArray<ZSPatchZipEntry *> *zs_patch_read_entries(NSData *data, NSError **error) {
+    const uint8_t *bytes = data.bytes;
+    NSInteger length = (NSInteger)data.length;
+    if (length < 22) {
+        if (error) *error = zs_patch_error(@"File is too small to be a zip archive.");
+        return nil;
+    }
+
+    NSInteger lowest = MAX((NSInteger)0, length - 22 - 65535);
+    NSInteger eocd = -1;
+    for (NSInteger i = length - 22; i >= lowest; i--) {
+        if (zs_patch_u32(bytes + i) != 0x06054b50) continue;
+        if (i + 22 + zs_patch_u16(bytes + i + 20) != length) continue;
+        eocd = i;
+        break;
+    }
+    if (eocd < 0) {
+        if (error) *error = zs_patch_error(@"No central directory found, this isn't a valid zip archive.");
+        return nil;
+    }
+
+    const uint8_t *tail = bytes + eocd;
+    uint16_t count = zs_patch_u16(tail + 10);
+    uint32_t cdSize = zs_patch_u32(tail + 12);
+    uint32_t cdOffset = zs_patch_u32(tail + 16);
+    if (count == 0xFFFF || cdSize == 0xFFFFFFFFu || cdOffset == 0xFFFFFFFFu) {
+        if (error) *error = zs_patch_error(@"ZIP64 archives aren't supported.");
+        return nil;
+    }
+    if ((uint64_t)cdOffset + cdSize > (uint64_t)length) {
+        if (error) *error = zs_patch_error(@"The zip's central directory runs past the end of the file.");
+        return nil;
+    }
+
+    NSMutableArray<ZSPatchZipEntry *> *entries = [NSMutableArray arrayWithCapacity:count];
+    NSUInteger cursor = cdOffset;
+    NSUInteger cdEnd = (NSUInteger)cdOffset + cdSize;
+    for (uint16_t i = 0; i < count; i++) {
+        if (cursor + 46 > cdEnd) break;
+        const uint8_t *p = bytes + cursor;
+        if (zs_patch_u32(p) != 0x02014b50) break;
+
+        uint16_t nameLength = zs_patch_u16(p + 28);
+        uint16_t extraLength = zs_patch_u16(p + 30);
+        uint16_t commentLength = zs_patch_u16(p + 32);
+        if (cursor + 46 + nameLength > cdEnd) break;
+
+        ZSPatchZipEntry *entry = [ZSPatchZipEntry new];
+        entry.versionMadeBy = zs_patch_u16(p + 4);
+        entry.flags = zs_patch_u16(p + 8);
+        entry.method = zs_patch_u16(p + 10);
+        entry.dosTime = zs_patch_u16(p + 12);
+        entry.dosDate = zs_patch_u16(p + 14);
+        entry.crc = zs_patch_u32(p + 16);
+        entry.compressedSize = zs_patch_u32(p + 20);
+        entry.size = zs_patch_u32(p + 24);
+        entry.internalAttributes = zs_patch_u16(p + 36);
+        entry.externalAttributes = zs_patch_u32(p + 38);
+        entry.localOffset = zs_patch_u32(p + 42);
+        if (entry.compressedSize == 0xFFFFFFFFu || entry.size == 0xFFFFFFFFu || entry.localOffset == 0xFFFFFFFFu) {
+            if (error) *error = zs_patch_error(@"ZIP64 entries aren't supported.");
+            return nil;
+        }
+
+        NSData *nameBytes = [NSData dataWithBytes:(p + 46) length:nameLength];
+        NSString *name = [[NSString alloc] initWithData:nameBytes encoding:NSUTF8StringEncoding]
+            ?: [[NSString alloc] initWithData:nameBytes encoding:NSISOLatin1StringEncoding];
+        entry.nameBytes = nameBytes;
+        entry.name = name ?: @"";
+        [entries addObject:entry];
+
+        cursor += 46 + nameLength + extraLength + commentLength;
+    }
+
+    if (entries.count != count) {
+        if (error) *error = zs_patch_error(@"The zip's central directory is corrupt.");
+        return nil;
+    }
+    return entries;
+}
+
+static BOOL zs_patch_payload_start(NSData *data, ZSPatchZipEntry *entry, NSUInteger *outStart) {
+    uint64_t offset = entry.localOffset;
+    if (offset + 30 > data.length) return NO;
+    const uint8_t *p = (const uint8_t *)data.bytes + offset;
+    if (zs_patch_u32(p) != 0x04034b50) return NO;
+    uint64_t start = offset + 30 + zs_patch_u16(p + 26) + zs_patch_u16(p + 28);
+    if (start + entry.compressedSize > data.length) return NO;
+    *outStart = (NSUInteger)start;
+    return YES;
+}
+
+static NSData *zs_patch_entry_data(NSData *data, ZSPatchZipEntry *entry, NSError **error) {
+    NSUInteger start = 0;
+    if (!zs_patch_payload_start(data, entry, &start)) {
+        if (error) *error = zs_patch_error([NSString stringWithFormat:@"\"%@\" is corrupt, its data lies outside the archive.", entry.name]);
+        return nil;
+    }
+    if (entry.flags & 0x0001) {
+        if (error) *error = zs_patch_error([NSString stringWithFormat:@"\"%@\" is encrypted.", entry.name]);
+        return nil;
+    }
+
+    const uint8_t *payload = (const uint8_t *)data.bytes + start;
+    NSData *result = nil;
+    if (entry.method == 0) {
+        result = [NSData dataWithBytes:payload length:entry.compressedSize];
+    } else if (entry.method == 8) {
+        NSMutableData *out = [NSMutableData dataWithLength:entry.size];
+        if (entry.size > 0) {
+            size_t decoded = compression_decode_buffer(out.mutableBytes, entry.size, payload, entry.compressedSize, NULL, COMPRESSION_ZLIB);
+            if (decoded != entry.size) {
+                if (error) *error = zs_patch_error([NSString stringWithFormat:@"Couldn't decompress \"%@\".", entry.name]);
+                return nil;
+            }
+        }
+        result = out;
+    } else {
+        if (error) *error = zs_patch_error([NSString stringWithFormat:@"\"%@\" uses unsupported zip compression method %u.", entry.name, entry.method]);
+        return nil;
+    }
+
+    if (zs_patch_crc32(result.bytes, result.length) != entry.crc) {
+        if (error) *error = zs_patch_error([NSString stringWithFormat:@"\"%@\" failed its checksum.", entry.name]);
+        return nil;
+    }
+    return result;
+}
+
+@interface ZSPatchZipWriter : NSObject
+- (instancetype)initWithPath:(NSString *)path;
+- (BOOL)copyEntry:(ZSPatchZipEntry *)entry fromData:(NSData *)source;
+- (BOOL)addEntryNamed:(NSString *)name data:(NSData *)data mode:(uint16_t)mode;
+- (BOOL)finish;
+@end
+
+@implementation ZSPatchZipWriter {
+    FILE *_file;
+    BOOL _failed;
+    NSMutableArray<ZSPatchZipEntry *> *_records;
+    uint16_t _dosTime;
+    uint16_t _dosDate;
+}
+
+- (instancetype)initWithPath:(NSString *)path {
+    if ((self = [super init])) {
+        _file = fopen(path.fileSystemRepresentation, "wb");
+        _failed = (_file == NULL);
+        _records = [NSMutableArray array];
+        time_t now = time(NULL);
+        struct tm local;
+        localtime_r(&now, &local);
+        _dosTime = (uint16_t)((local.tm_hour << 11) | (local.tm_min << 5) | (local.tm_sec / 2));
+        _dosDate = (uint16_t)(((MAX(local.tm_year - 80, 0)) << 9) | ((local.tm_mon + 1) << 5) | local.tm_mday);
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_file) fclose(_file);
+}
+
+- (void)writeU16:(uint16_t)value {
+    uint8_t b[2] = { (uint8_t)(value & 0xFF), (uint8_t)(value >> 8) };
+    if (fwrite(b, 1, 2, _file) != 2) _failed = YES;
+}
+
+- (void)writeU32:(uint32_t)value {
+    uint8_t b[4] = { (uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF), (uint8_t)((value >> 16) & 0xFF), (uint8_t)(value >> 24) };
+    if (fwrite(b, 1, 4, _file) != 4) _failed = YES;
+}
+
+- (void)writeBytes:(const void *)bytes length:(size_t)length {
+    if (length > 0 && fwrite(bytes, 1, length, _file) != length) _failed = YES;
+}
+
+- (BOOL)writeEntry:(ZSPatchZipEntry *)entry payload:(const void *)payload {
+    if (_failed || !_file || _records.count >= 0xFFFE || entry.nameBytes.length > 0xFFFF) return NO;
+    long position = ftell(_file);
+    if (position < 0 || (uint64_t)position >= 0xFFFFFFFFu) return NO;
+
+    ZSPatchZipEntry *record = [ZSPatchZipEntry new];
+    record.name = entry.name;
+    record.nameBytes = entry.nameBytes;
+    record.versionMadeBy = entry.versionMadeBy;
+    record.flags = entry.flags & (uint16_t)~0x0008;
+    record.method = entry.method;
+    record.dosTime = entry.dosTime;
+    record.dosDate = entry.dosDate;
+    record.internalAttributes = entry.internalAttributes;
+    record.crc = entry.crc;
+    record.compressedSize = entry.compressedSize;
+    record.size = entry.size;
+    record.externalAttributes = entry.externalAttributes;
+    record.localOffset = (uint32_t)position;
+
+    [self writeU32:0x04034B50];
+    [self writeU16:20];
+    [self writeU16:record.flags];
+    [self writeU16:record.method];
+    [self writeU16:record.dosTime];
+    [self writeU16:record.dosDate];
+    [self writeU32:record.crc];
+    [self writeU32:record.compressedSize];
+    [self writeU32:record.size];
+    [self writeU16:(uint16_t)record.nameBytes.length];
+    [self writeU16:0];
+    [self writeBytes:record.nameBytes.bytes length:record.nameBytes.length];
+    [self writeBytes:payload length:record.compressedSize];
+    if (_failed) return NO;
+    [_records addObject:record];
+    return YES;
+}
+
+- (BOOL)copyEntry:(ZSPatchZipEntry *)entry fromData:(NSData *)source {
+    NSUInteger start = 0;
+    if (!zs_patch_payload_start(source, entry, &start)) return NO;
+    return [self writeEntry:entry payload:(const uint8_t *)source.bytes + start];
+}
+
+- (BOOL)addEntryNamed:(NSString *)name data:(NSData *)data mode:(uint16_t)mode {
+    if (data.length >= 0xFFFFFFFFu) return NO;
+
+    uint16_t method = 0;
+    NSData *payload = data;
+    if (data.length > 64) {
+        NSMutableData *packed = [NSMutableData dataWithLength:data.length];
+        size_t written = compression_encode_buffer(packed.mutableBytes, packed.length, data.bytes, data.length, NULL, COMPRESSION_ZLIB);
+        if (written > 0 && written < data.length) {
+            packed.length = written;
+            payload = packed;
+            method = 8;
+        }
+    }
+
+    ZSPatchZipEntry *entry = [ZSPatchZipEntry new];
+    entry.name = name;
+    entry.nameBytes = [name dataUsingEncoding:NSUTF8StringEncoding];
+    entry.versionMadeBy = 0x031E;
+    entry.flags = 0x0800;
+    entry.method = method;
+    entry.dosTime = _dosTime;
+    entry.dosDate = _dosDate;
+    entry.internalAttributes = 0;
+    entry.crc = zs_patch_crc32(data.bytes, data.length);
+    entry.compressedSize = (uint32_t)payload.length;
+    entry.size = (uint32_t)data.length;
+    entry.externalAttributes = ((uint32_t)(S_IFREG | mode)) << 16;
+    return [self writeEntry:entry payload:payload.bytes];
+}
+
+- (BOOL)finish {
+    if (_failed || !_file) return NO;
+    long centralStart = ftell(_file);
+    if (centralStart < 0) return NO;
+    for (ZSPatchZipEntry *record in _records) {
+        [self writeU32:0x02014B50];
+        [self writeU16:record.versionMadeBy];
+        [self writeU16:20];
+        [self writeU16:record.flags];
+        [self writeU16:record.method];
+        [self writeU16:record.dosTime];
+        [self writeU16:record.dosDate];
+        [self writeU32:record.crc];
+        [self writeU32:record.compressedSize];
+        [self writeU32:record.size];
+        [self writeU16:(uint16_t)record.nameBytes.length];
+        [self writeU16:0];
+        [self writeU16:0];
+        [self writeU16:0];
+        [self writeU16:record.internalAttributes];
+        [self writeU32:record.externalAttributes];
+        [self writeU32:record.localOffset];
+        [self writeBytes:record.nameBytes.bytes length:record.nameBytes.length];
+    }
+    long centralEnd = ftell(_file);
+    if (centralEnd < 0 || _failed) return NO;
+    [self writeU32:0x06054B50];
+    [self writeU16:0];
+    [self writeU16:0];
+    [self writeU16:(uint16_t)_records.count];
+    [self writeU16:(uint16_t)_records.count];
+    [self writeU32:(uint32_t)(centralEnd - centralStart)];
+    [self writeU32:(uint32_t)centralStart];
+    [self writeU16:0];
+    BOOL ok = !_failed && fflush(_file) == 0;
+    fclose(_file);
+    _file = NULL;
+    return ok;
+}
+
+@end
+
+@implementation ZSLiveContainerPatcher
+
++ (nullable NSDictionary<NSString *, NSArray *> *)zs_appexFilesFromZipData:(NSData *)zipData error:(NSError **)error {
+    NSArray<ZSPatchZipEntry *> *entries = zs_patch_read_entries(zipData, error);
+    if (!entries) return nil;
+
+    NSString *marker = [kZSPatchAppexName stringByAppendingString:@"/"];
+    NSMutableDictionary<NSString *, NSArray *> *files = [NSMutableDictionary dictionary];
+    for (ZSPatchZipEntry *entry in entries) {
+        NSString *name = entry.name;
+        if ([name hasSuffix:@"/"] || [name hasPrefix:@"__MACOSX/"]) continue;
+        NSRange range = [name rangeOfString:marker];
+        if (range.location == NSNotFound) continue;
+        NSString *relative = [name substringFromIndex:NSMaxRange(range)];
+        if (relative.length == 0 || [relative hasPrefix:@"_CodeSignature/"]) continue;
+
+        NSData *payload = zs_patch_entry_data(zipData, entry, error);
+        if (!payload) return nil;
+        uint16_t mode = (uint16_t)((entry.externalAttributes >> 16) & 0777);
+        files[relative] = @[payload, @(mode)];
+    }
+    return files;
+}
+
++ (BOOL)zs_patchIPAAtURL:(NSURL *)ipaURL
+            appexZipData:(NSData *)appexZipData
+               outputURL:(NSURL *)outputURL
+            hostBundleID:(NSString * _Nullable * _Nonnull)outHostID
+                   error:(NSError **)error {
+    NSDictionary<NSString *, NSArray *> *appexFiles = [self zs_appexFilesFromZipData:appexZipData error:error];
+    if (!appexFiles) return NO;
+    if (!appexFiles[@"Info.plist"]) {
+        if (error) *error = zs_patch_error(@"The downloaded ZSRamDonor.appex doesn't contain an Info.plist.");
+        return NO;
+    }
+
+    NSData *ipaData = [NSData dataWithContentsOfURL:ipaURL options:NSDataReadingMappedIfSafe error:error];
+    if (!ipaData) return NO;
+    NSArray<ZSPatchZipEntry *> *ipaEntries = zs_patch_read_entries(ipaData, error);
+    if (!ipaEntries) return NO;
+
+    NSString *appPrefix = nil;
+    ZSPatchZipEntry *hostPlistEntry = nil;
+    for (ZSPatchZipEntry *entry in ipaEntries) {
+        NSArray<NSString *> *parts = [entry.name componentsSeparatedByString:@"/"];
+        if (parts.count >= 3 && [parts[0] isEqualToString:@"Payload"] && [parts[1] hasSuffix:@".app"] && [parts[2] isEqualToString:@"Info.plist"]) {
+            appPrefix = [@"Payload/" stringByAppendingString:parts[1]];
+            hostPlistEntry = entry;
+            break;
+        }
+    }
+    if (!appPrefix || !hostPlistEntry) {
+        if (error) *error = zs_patch_error(@"Couldn't find the .app bundle inside the IPA.");
+        return NO;
+    }
+
+    NSData *hostPlistData = zs_patch_entry_data(ipaData, hostPlistEntry, error);
+    if (!hostPlistData) return NO;
+    NSDictionary *hostPlist = [NSPropertyListSerialization propertyListWithData:hostPlistData options:NSPropertyListImmutable format:NULL error:nil];
+    NSString *hostID = [hostPlist isKindOfClass:[NSDictionary class]] ? hostPlist[@"CFBundleIdentifier"] : nil;
+    if (![hostID isKindOfClass:[NSString class]] || hostID.length == 0) {
+        if (error) *error = zs_patch_error(@"The IPA's Info.plist has no CFBundleIdentifier.");
+        return NO;
+    }
+    NSString *donorID = [hostID stringByAppendingString:@".ZSRamDonor"];
+
+    NSMutableDictionary *appexPlist = [NSPropertyListSerialization propertyListWithData:appexFiles[@"Info.plist"][0]
+                                                                                 options:NSPropertyListMutableContainersAndLeaves
+                                                                                  format:NULL
+                                                                                   error:nil];
+    if (![appexPlist isKindOfClass:[NSMutableDictionary class]]) {
+        if (error) *error = zs_patch_error(@"The downloaded ZSRamDonor.appex has an unreadable Info.plist.");
+        return NO;
+    }
+    appexPlist[@"CFBundleIdentifier"] = donorID;
+    NSString *executable = [appexPlist[@"CFBundleExecutable"] isKindOfClass:[NSString class]] ? appexPlist[@"CFBundleExecutable"] : kZSPatchDefaultExecutable;
+    NSData *patchedPlist = [NSPropertyListSerialization dataWithPropertyList:appexPlist format:NSPropertyListXMLFormat_v1_0 options:0 error:error];
+    if (!patchedPlist) return NO;
+
+    NSMutableDictionary<NSString *, NSArray *> *finalFiles = [appexFiles mutableCopy];
+    finalFiles[@"Info.plist"] = @[patchedPlist, @(0644)];
+    if (!finalFiles[executable]) {
+        if (error) *error = zs_patch_error([NSString stringWithFormat:@"The downloaded ZSRamDonor.appex has no executable named %@.", executable]);
+        return NO;
+    }
+
+    NSString *targetPrefix = [NSString stringWithFormat:@"%@/PlugIns/%@/", appPrefix, kZSPatchAppexName];
+    ZSPatchZipWriter *writer = [[ZSPatchZipWriter alloc] initWithPath:outputURL.path];
+    for (ZSPatchZipEntry *entry in ipaEntries) {
+        if ([entry.name hasPrefix:targetPrefix]) continue;
+        if (![writer copyEntry:entry fromData:ipaData]) {
+            if (error) *error = zs_patch_error([NSString stringWithFormat:@"Couldn't copy \"%@\" into the patched IPA.", entry.name]);
+            return NO;
+        }
+    }
+
+    for (NSString *relative in [finalFiles.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        NSData *payload = finalFiles[relative][0];
+        uint16_t mode = (uint16_t)[finalFiles[relative][1] unsignedShortValue];
+        if ([relative isEqualToString:executable]) mode = 0755;
+        else if (mode == 0) mode = 0644;
+        if (![writer addEntryNamed:[targetPrefix stringByAppendingString:relative] data:payload mode:mode]) {
+            if (error) *error = zs_patch_error([NSString stringWithFormat:@"Couldn't add \"%@\" to the patched IPA.", relative]);
+            return NO;
+        }
+    }
+
+    if (![writer finish]) {
+        if (error) *error = zs_patch_error(@"Couldn't finish writing the patched IPA, the device may be out of space.");
+        return NO;
+    }
+
+    *outHostID = hostID;
+    return YES;
+}
+
++ (void)patchIPAAtURL:(NSURL *)ipaURL
+           completion:(void (^)(NSURL * _Nullable, NSString * _Nullable, NSError * _Nullable))completion {
+    void (^finish)(NSURL *, NSString *, NSError *) = ^(NSURL *patchedURL, NSString *hostID, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ if (completion) completion(patchedURL, hostID, error); });
+    };
+
+    zs_update_find_release_by_tag(kZSNightlyReleaseTag, 1, ^(id release, NSError *releaseError) {
+        NSArray *assets = [release isKindOfClass:[NSDictionary class]] && [release[@"assets"] isKindOfClass:[NSArray class]] ? release[@"assets"] : nil;
+
+        NSDictionary *appexAsset = nil;
+        for (NSDictionary *asset in assets) {
+            NSString *name = [asset isKindOfClass:[NSDictionary class]] ? asset[@"name"] : nil;
+            if ([name isKindOfClass:[NSString class]] && [name.lowercaseString hasSuffix:@".appex.zip"]) { appexAsset = asset; break; }
+        }
+
+        NSString *assetURLString = [appexAsset[@"url"] isKindOfClass:[NSString class]] ? appexAsset[@"url"] : nil;
+        NSURL *assetURL = assetURLString ? [NSURL URLWithString:assetURLString] : nil;
+        if (!assetURL) {
+            finish(nil, nil, releaseError ?: zs_patch_error(@"The nightly release doesn't have a ZSRamDonor.appex.zip asset attached."));
+            return;
+        }
+
+        zs_update_gh_data_get(assetURL, @"application/octet-stream", ^(NSData *appexZipData, NSError *downloadError) {
+            if (!appexZipData) {
+                finish(nil, nil, downloadError ?: zs_patch_error(@"Couldn't download ZSRamDonor.appex from the nightly release."));
+                return;
+            }
+
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                NSFileManager *fm = [NSFileManager defaultManager];
+                NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:[@"ZSPatchLC-" stringByAppendingString:[NSUUID UUID].UUIDString]];
+                NSError *directoryError = nil;
+                if (![fm createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:&directoryError]) {
+                    finish(nil, nil, directoryError);
+                    return;
+                }
+
+                NSString *stem = ipaURL.lastPathComponent.stringByDeletingPathExtension;
+                if (stem.length == 0) stem = @"Patched";
+                NSURL *outputURL = [NSURL fileURLWithPath:[directory stringByAppendingPathComponent:[stem stringByAppendingString:@"-Patched.ipa"]]];
+
+                NSString *hostID = nil;
+                NSError *patchError = nil;
+                BOOL ok = [self zs_patchIPAAtURL:ipaURL appexZipData:appexZipData outputURL:outputURL hostBundleID:&hostID error:&patchError];
+                if (!ok) {
+                    [fm removeItemAtPath:directory error:nil];
+                    ZLog(@"[LiveContainerPatcher] patch failed: %@", patchError.localizedDescription);
+                    finish(nil, nil, patchError ?: zs_patch_error(@"Unknown error."));
+                    return;
+                }
+
+                ZLog(@"[LiveContainerPatcher] patched %@ (host bundle id %@, donor bundle id %@.ZSRamDonor)", ipaURL.lastPathComponent, hostID, hostID);
+                finish(outputURL, hostID, nil);
+            });
+        });
+    });
 }
 
 @end

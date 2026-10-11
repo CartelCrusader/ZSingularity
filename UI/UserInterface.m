@@ -5963,6 +5963,8 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, weak) UIDocumentPickerViewController *libraryImportPicker;
 @property (nonatomic, copy) NSString *libraryImportTargetFolder;
 
+@property (nonatomic, weak) UIDocumentPickerViewController *patchLCPicker;
+
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSTimer *> *doctorPollTimers;
 
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorUploadProgressLastUpdate;
@@ -9384,6 +9386,9 @@ static const CGFloat kContentFadeHeight = 22;
     UIButton *librarySymlinkButton = zs_make_grouped_action_button(@"Library Symlink", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [librarySymlinkButton addTarget:self action:@selector(librarySymlinkTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    UIButton *patchLCButton = zs_make_grouped_action_button(@"Patch LC", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
+    [patchLCButton addTarget:self action:@selector(patchLCTapped) forControlEvents:UIControlEventTouchUpInside];
+
     UIButton *syslogButton = zs_make_grouped_action_button(@"Show system logs", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     self.syslogButton = syslogButton;
 
@@ -9399,6 +9404,7 @@ static const CGFloat kContentFadeHeight = 22;
         experimentalEnabledRow,
         dumpIL2CPPMethodsButton,
         librarySymlinkButton,
+        patchLCButton,
         syslogButton,
         keepAliveButton,
     ]);
@@ -11985,6 +11991,110 @@ static BOOL zs_keep_alive_background_mode_declared(void) {
     ZLog(@"[UserInterface] Keep Alive location error: %@", error.localizedDescription);
 }
 
+#pragma mark Developer (Patch LC)
+
+- (void)patchLCTapped {
+    UIDocumentPickerViewController *picker;
+    if (@available(iOS 14.0, *)) {
+        UTType *ipaType = [UTType typeWithFilenameExtension:@"ipa" conformingToType:UTTypeData] ?: UTTypeData;
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[ipaType] asCopy:YES];
+    } else {
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"com.apple.itunes.ipa"] inMode:UIDocumentPickerModeImport];
+    }
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+
+    UIViewController *presenter = zs_key_window().rootViewController;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+    if (!presenter) {
+        ZLog(@"[PatchLC] no root view controller to present the file picker from");
+        return;
+    }
+    self.patchLCPicker = picker;
+    [presenter presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)zs_handlePatchLCPickedURL:(NSURL *)url {
+    if ([url.pathExtension caseInsensitiveCompare:@"ipa"] != NSOrderedSame) {
+        [self zs_presentModsAlertWithTitle:@"Patch LC Failed" message:@"Pick an .ipa file."];
+        return;
+    }
+
+    UIViewController *presenter = zs_key_window().rootViewController;
+    UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Patching\u2026"
+                                                                      message:@"Embedding the memory extension into the IPA."
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [working.view addSubview:spinner];
+    [spinner startAnimating];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:working.view.centerXAnchor],
+        [spinner.bottomAnchor constraintEqualToAnchor:working.view.bottomAnchor constant:-16],
+    ]];
+
+    __block BOOL workingShown = (presenter == nil);
+    __block dispatch_block_t pendingResult = nil;
+    if (presenter) {
+        [presenter presentViewController:working animated:YES completion:^{
+            workingShown = YES;
+            if (pendingResult) {
+                dispatch_block_t result = pendingResult;
+                pendingResult = nil;
+                result();
+            }
+        }];
+    }
+
+    BOOL accessing = [url startAccessingSecurityScopedResource];
+    __weak typeof(self) weakSelf = self;
+    [ZSLiveContainerPatcher patchIPAAtURL:url completion:^(NSURL *patchedURL, NSString *hostBundleID, NSError *error) {
+        if (accessing) [url stopAccessingSecurityScopedResource];
+
+        dispatch_block_t present = ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+            if (!patchedURL) {
+                [haptic notificationOccurred:UINotificationFeedbackTypeError];
+                [strongSelf zs_presentModsAlertWithTitle:@"Patch LC Failed" message:error.localizedDescription ?: @"Unknown error."];
+                return;
+            }
+
+            UIViewController *sharePresenter = zs_key_window().rootViewController;
+            while (sharePresenter.presentedViewController) sharePresenter = sharePresenter.presentedViewController;
+            if (!sharePresenter) {
+                [NSFileManager.defaultManager removeItemAtURL:patchedURL.URLByDeletingLastPathComponent error:nil];
+                return;
+            }
+
+            UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[patchedURL] applicationActivities:nil];
+            activityVC.popoverPresentationController.sourceView = sharePresenter.view;
+            activityVC.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(sharePresenter.view.bounds), CGRectGetMidY(sharePresenter.view.bounds), 0, 0);
+            activityVC.popoverPresentationController.permittedArrowDirections = 0;
+            activityVC.completionWithItemsHandler = ^(UIActivityType activityType, BOOL completed, NSArray *returnedItems, NSError *activityError) {
+                [NSFileManager.defaultManager removeItemAtURL:patchedURL.URLByDeletingLastPathComponent error:nil];
+            };
+            [sharePresenter presentViewController:activityVC animated:YES completion:nil];
+            [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+        };
+
+        dispatch_block_t finish = ^{
+            if (working.presentingViewController) {
+                [working dismissViewControllerAnimated:YES completion:present];
+            } else {
+                present();
+            }
+        };
+
+        if (workingShown) {
+            finish();
+        } else {
+            pendingResult = finish;
+        }
+    }];
+}
+
 #pragma mark Developer (Library Symlink)
 
 - (void)librarySymlinkTapped {
@@ -12294,6 +12404,11 @@ static BOOL zs_keep_alive_background_mode_declared(void) {
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
+    if (controller == self.patchLCPicker) {
+        self.patchLCPicker = nil;
+        [self zs_handlePatchLCPickedURL:urls.firstObject];
+        return;
+    }
     if (controller == self.loadModsPicker) {
         NSString *folderName = self.loadModsTargetFolder;
         self.loadModsTargetFolder = nil;
