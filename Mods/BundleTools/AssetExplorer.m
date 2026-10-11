@@ -3329,10 +3329,20 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
     NSDictionary *constant = ZSAEDict(clipData[@"m_ConstantClip"]);
     NSDictionary *bindingConstant = ZSAEDict(fields[@"m_ClipBindingConstant"]);
 
-    NSMutableArray<NSDictionary *> *slots = [NSMutableArray array];
+    NSUInteger expectedStream = (NSUInteger)MAX((int64_t)0, ZSAEInt(streamed[@"curveCount"]));
+    NSUInteger expectedDense = (NSUInteger)MAX((int64_t)0, ZSAEInt(dense[@"m_CurveCount"]));
+    NSData *expectedConstantData = [constant[@"data"] isKindOfClass:[NSData class]] ? constant[@"data"] : nil;
+    NSUInteger expectedTotal = expectedStream + expectedDense + expectedConstantData.length / sizeof(float);
+
+    NSMutableArray<NSDictionary *> *skipSlots = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *countSlots = [NSMutableArray array];
     for (id entry in ZSAEArray(bindingConstant[@"genericBindings"])) {
         NSDictionary *binding = ZSAEDict(entry);
-        if (!binding || ZSAEInt(binding[@"isPPtrCurve"]) != 0) continue;
+        if (!binding) continue;
+        if (ZSAEInt(binding[@"isPPtrCurve"]) != 0) {
+            [countSlots addObject:@{@"p": @0, @"a": @0, @"t": @(-1), @"c": @0}];
+            continue;
+        }
         int32_t typeID = (int32_t)ZSAEInt(binding[@"typeID"]);
         uint32_t attribute = (uint32_t)ZSAEInt(binding[@"attribute"]);
         uint32_t pathHash = (uint32_t)ZSAEInt(binding[@"path"]);
@@ -3342,9 +3352,12 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
             else if (attribute == 1 || attribute == 3 || attribute == 4) components = 3;
         }
         for (int c = 0; c < components; c++) {
-            [slots addObject:@{@"p": @(pathHash), @"a": @(attribute), @"t": @(typeID), @"c": @(c)}];
+            NSDictionary *slot = @{@"p": @(pathHash), @"a": @(attribute), @"t": @(typeID), @"c": @(c)};
+            [skipSlots addObject:slot];
+            [countSlots addObject:slot];
         }
     }
+    NSArray<NSDictionary *> *slots = (skipSlots.count != expectedTotal && countSlots.count == expectedTotal) ? countSlots : skipSlots;
 
     NSMutableArray<ZSAEAnimCurve *> *curves = [NSMutableArray array];
     void (^addCurve)(NSUInteger, NSData *) = ^(NSUInteger slotIndex, NSData *keys) {
@@ -3486,7 +3499,7 @@ static int32_t ZSAEAnimRegisterSprite(ZSAEAnimScene *scene, ZSAEObject *owner, i
     NSString *key = [NSString stringWithFormat:@"%p:%lld:%lld", owner.session, (long long)ZSAEInt(reference[@"m_FileID"]), (long long)ZSAEInt(reference[@"m_PathID"])];
     NSNumber *existing = scene.spriteIndexByKey[key];
     if (existing) return (int32_t)existing.integerValue;
-    if (scene.spriteRefs.count >= 240) return -1;
+    if (scene.spriteRefs.count >= 480) return -1;
     int32_t index = (int32_t)scene.spriteRefs.count;
     scene.spriteIndexByKey[key] = @(index);
     [scene.spriteRefs addObject:@{@"owner": owner, @"pptr": reference}];
@@ -3656,6 +3669,20 @@ static void ZSAEAnimBindClip(ZSAEAnimScene *scene, ZSAEAnimRoot *root, ZSAEAnimT
     for (NSDictionary *spriteCurve in clip.spriteCurves) {
         NSString *path = spriteCurve[@"path"];
         NSNumber *node = root.pathToNode[path] ?: root.hashToNode[@(ZSAECRC32(path.UTF8String ?: ""))];
+        if (!node && path.length > 0) {
+            NSString *leaf = path.lastPathComponent;
+            NSNumber *best = nil;
+            NSUInteger bestIndex = NSUIntegerMax;
+            for (NSString *candidatePath in root.pathToNode) {
+                if (![candidatePath.lastPathComponent isEqualToString:leaf]) continue;
+                NSNumber *candidate = root.pathToNode[candidatePath];
+                if (candidate.unsignedIntegerValue < bestIndex) {
+                    bestIndex = candidate.unsignedIntegerValue;
+                    best = candidate;
+                }
+            }
+            node = best;
+        }
         if (!node) continue;
         NSArray<NSNumber *> *times = spriteCurve[@"times"];
         NSArray<NSDictionary *> *values = spriteCurve[@"values"];
@@ -4076,6 +4103,19 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
         return nil;
     }
 
+    NSUInteger animatedCurves = 0;
+    NSUInteger spriteSwaps = 0;
+    for (ZSAEAnimTrackPlay *play in scene.tracks) {
+        NSMutableArray<ZSAEAnimTrackClip *> *allClips = [NSMutableArray arrayWithArray:play.clips];
+        if (play.base) [allClips addObject:play.base];
+        for (ZSAEAnimTrackClip *candidate in allClips) {
+            for (ZSAEAnimBound *bound in candidate.bounds) if (bound.keys.length > sizeof(ZSAEAnimKey)) animatedCurves++;
+            for (ZSAEAnimSpriteBound *spriteBound in candidate.spriteBounds) if (spriteBound.sprites.length > sizeof(int32_t)) spriteSwaps++;
+        }
+    }
+    NSString *motionSummary = (animatedCurves + spriteSwaps == 0) ? @"  •  no motion data" :
+        [NSString stringWithFormat:@"  •  %lu animated  •  %lu sprite swaps", (unsigned long)animatedCurves, (unsigned long)spriteSwaps];
+
     for (NSUInteger r = 0; r < scene.roots.count; r++) {
         if ([usedRoots containsObject:@(r)]) continue;
         for (ZSAEAnimNode *node in scene.nodes) if (node.root == (NSInteger)r) node.excluded = YES;
@@ -4144,11 +4184,12 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
     double loopLength = total + 0.5;
     ZSAssetExplorerVisual *visual = [ZSAssetExplorerVisual new];
     visual.name = title;
-    visual.summary = [NSString stringWithFormat:@"%@  •  Animation  •  %lu %@  •  %lu %@  •  %@  •  %lu/%lu curves bound%@", title.length > 0 ? title : @"Track",
+    visual.summary = [NSString stringWithFormat:@"%@  •  Animation  •  %lu %@  •  %lu %@  •  %@  •  %lu/%lu curves bound%@%@", title.length > 0 ? title : @"Track",
                       (unsigned long)scene.tracks.count, scene.tracks.count == 1 ? @"track" : @"tracks",
                       (unsigned long)decodedSprites, decodedSprites == 1 ? @"sprite" : @"sprites",
                       ZSAETimelineSeconds(total), (unsigned long)boundCount, (unsigned long)mappableCount,
-                      unboundTracks > 0 ? [NSString stringWithFormat:@"  •  %lu unbound", (unsigned long)unboundTracks] : @""];
+                      unboundTracks > 0 ? [NSString stringWithFormat:@"  •  %lu unbound", (unsigned long)unboundTracks] : @"",
+                      motionSummary];
     visual.pageLabels = @[@"Animation", @"Timeline"];
     visual.livePageIndex = 0;
     NSArray<NSDictionary *> *capturedRows = [rows copy];
@@ -5853,6 +5894,50 @@ static ZSAssetExplorerVisual *ZSAEBuildParticleVisual(ZSAEContext *context, ZSAE
 @implementation ZSAssetExplorerTexture
 @end
 
+static id ZSAEJSONSafeValue(id value, NSUInteger depth, NSUInteger *budget) {
+    if (!value || *budget == 0) return [NSNull null];
+    (*budget)--;
+    if (depth > 64) return @"…";
+    if ([value isKindOfClass:[NSString class]]) return value;
+    if ([value isKindOfClass:[NSNumber class]]) {
+        NSNumber *number = value;
+        const char *type = number.objCType;
+        if (type && (type[0] == 'f' || type[0] == 'd')) {
+            double d = number.doubleValue;
+            if (isnan(d)) return @"NaN";
+            if (isinf(d)) return d > 0 ? @"Infinity" : @"-Infinity";
+        }
+        return number;
+    }
+    if ([value isKindOfClass:[NSData class]]) {
+        NSData *data = value;
+        if (data.length == 0) return @"";
+        if (data.length > 64) return [NSString stringWithFormat:@"<%lu bytes>", (unsigned long)data.length];
+        const uint8_t *bytes = data.bytes;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:data.length * 2];
+        for (NSUInteger i = 0; i < data.length; i++) [hex appendFormat:@"%02x", bytes[i]];
+        return hex;
+    }
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dictionary = value;
+        NSMutableDictionary *result = [NSMutableDictionary dictionaryWithCapacity:dictionary.count];
+        for (id key in dictionary) {
+            NSString *name = [key isKindOfClass:[NSString class]] ? key : [key description];
+            result[name] = ZSAEJSONSafeValue(dictionary[key], depth + 1, budget);
+        }
+        return result;
+    }
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSArray *array = value;
+        NSUInteger limit = MIN(array.count, (NSUInteger)20000);
+        NSMutableArray *result = [NSMutableArray arrayWithCapacity:limit + 1];
+        for (NSUInteger i = 0; i < limit; i++) [result addObject:ZSAEJSONSafeValue(array[i], depth + 1, budget)];
+        if (array.count > limit) [result addObject:[NSString stringWithFormat:@"… %lu more items", (unsigned long)(array.count - limit)]];
+        return result;
+    }
+    return [value description] ?: @"";
+}
+
 @implementation ZSAssetExplorerVisual
 
 - (BOOL)isLivePage:(NSInteger)page {
@@ -6234,6 +6319,29 @@ static BOOL ZSAEApplyCachedName(ZSAssetExplorerBundle *bundle) {
         default:
             return ZSAEBuildInspectorVisual(object, error);
     }
+}
+
++ (NSData *)jsonDataForPathID:(int64_t)pathID inBundleAtPath:(NSString *)path error:(NSError **)error {
+    ZSAESession *session = ZSAEOpenSession(path, error);
+    if (!session) return nil;
+    ZSAEObject *object = ZSAEReadObject(session, pathID, error);
+    if (!object) return nil;
+    NSDictionary *fields = object.fields;
+    if (fields.count == 0) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"This object has no readable fields.");
+        return nil;
+    }
+    NSUInteger budget = 600000;
+    id safe = ZSAEJSONSafeValue(fields, 0, &budget);
+    NSJSONWritingOptions options = NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys;
+    if (@available(iOS 13.0, *)) options |= NSJSONWritingWithoutEscapingSlashes;
+    NSError *jsonError = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:safe options:options error:&jsonError];
+    if (!data) {
+        if (error) *error = jsonError ?: ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"Couldn't serialize this asset to JSON.");
+        return nil;
+    }
+    return data;
 }
 
 + (NSArray<ZSAssetExplorerAsset *> *)assetsForBundleAtPath:(NSString *)path error:(NSError **)error {

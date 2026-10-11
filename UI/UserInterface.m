@@ -6047,6 +6047,10 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, assign) NSUInteger assetExplorerLiveToken;
 @property (nonatomic, assign) BOOL assetExplorerLivePaused;
 @property (nonatomic, assign) NSTimeInterval assetExplorerLiveElapsed;
+@property (nonatomic, strong) UISegmentedControl *assetExplorerModeControl;
+@property (nonatomic, assign) BOOL assetExplorerDataMode;
+@property (nonatomic, strong) NSData *assetExplorerDataJSON;
+@property (nonatomic, assign) NSUInteger assetExplorerDataToken;
 @property (nonatomic, assign) NSInteger assetExplorerPageIndex;
 @property (nonatomic, strong) UIStackView *assetExplorerPageStack;
 @property (nonatomic, strong) UIButton *assetExplorerPagePrevButton;
@@ -8124,6 +8128,9 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     self.assetExplorerTextureOpen = NO;
     self.assetExplorerTextureBackButton = nil;
     self.assetExplorerTextureExportButton = nil;
+    self.assetExplorerModeControl = nil;
+    self.assetExplorerDataJSON = nil;
+    self.assetExplorerDataMode = NO;
     self.assetExplorerTextureImageView = nil;
     self.assetExplorerPreviewClipView = nil;
     self.assetExplorerTextView = nil;
@@ -15610,6 +15617,18 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     [overlay addSubview:textureExportButton];
     self.assetExplorerTextureExportButton = textureExportButton;
 
+    UISegmentedControl *modeControl = [[UISegmentedControl alloc] initWithItems:@[@"Preview", @"Data"]];
+    modeControl.translatesAutoresizingMaskIntoConstraints = NO;
+    modeControl.selectedSegmentIndex = 0;
+    modeControl.hidden = YES;
+    modeControl.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
+    if (@available(iOS 13.0, *)) modeControl.selectedSegmentTintColor = zs_accent_green_color();
+    [modeControl setTitleTextAttributes:@{NSFontAttributeName: zs_mono_font(10, UIFontWeightMedium), NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.75]} forState:UIControlStateNormal];
+    [modeControl setTitleTextAttributes:@{NSFontAttributeName: zs_mono_font(10, UIFontWeightSemibold), NSForegroundColorAttributeName: UIColor.blackColor} forState:UIControlStateSelected];
+    [modeControl addTarget:self action:@selector(zs_assetExplorerModeChanged:) forControlEvents:UIControlEventValueChanged];
+    [overlay addSubview:modeControl];
+    self.assetExplorerModeControl = modeControl;
+
     UIImageView *textureImageView = [[UIImageView alloc] init];
     textureImageView.translatesAutoresizingMaskIntoConstraints = NO;
     textureImageView.contentMode = UIViewContentModeScaleAspectFit;
@@ -15802,6 +15821,10 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     [overlay addSubview:pageStack];
     self.assetExplorerPageStack = pageStack;
 
+    NSLayoutConstraint *modeControlWidth = [modeControl.widthAnchor constraintEqualToConstant:118];
+    modeControlWidth.priority = UILayoutPriorityDefaultHigh;
+    modeControlWidth.active = YES;
+
     [NSLayoutConstraint activateConstraints:@[
         [pagePrevButton.widthAnchor constraintEqualToConstant:30],
         [pagePrevButton.heightAnchor constraintEqualToConstant:30],
@@ -15853,6 +15876,11 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
         [textureExportButton.leadingAnchor constraintEqualToAnchor:textureBackButton.trailingAnchor constant:8],
         [textureExportButton.widthAnchor constraintEqualToConstant:30],
         [textureExportButton.heightAnchor constraintEqualToConstant:30],
+
+        [modeControl.centerYAnchor constraintEqualToAnchor:closeButton.centerYAnchor],
+        [modeControl.leadingAnchor constraintEqualToAnchor:textureExportButton.trailingAnchor constant:8],
+        [modeControl.heightAnchor constraintEqualToConstant:30],
+        [modeControl.trailingAnchor constraintLessThanOrEqualToAnchor:pagerStack.leadingAnchor constant:-6],
 
         [textureCaption.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
         [textureCaption.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
@@ -16186,6 +16214,7 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
     self.assetExplorerTextureCaptionLabel.hidden = !visible;
     self.assetExplorerBackdropView.hidden = !visible;
     self.assetExplorerTexturePagerStack.hidden = !visible;
+    self.assetExplorerModeControl.hidden = YES;
     if (visible) [self.assetExplorerSearchField resignFirstResponder];
     [self zs_assetExplorerSyncControls];
     if (!visible) {
@@ -16195,6 +16224,10 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
         self.assetExplorerTextureImageView.alpha = 1;
         self.assetExplorerVisual = nil;
         self.assetExplorerPageIndex = 0;
+        self.assetExplorerDataMode = NO;
+        self.assetExplorerDataJSON = nil;
+        self.assetExplorerDataToken += 1;
+        self.assetExplorerModeControl.selectedSegmentIndex = 0;
         self.assetExplorerPageStack.hidden = YES;
         self.assetExplorerTextureAssets = nil;
         self.assetExplorerTextureIndex = 0;
@@ -16240,6 +16273,9 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
     self.assetExplorerTextureImageView.alpha = 1;
     self.assetExplorerVisual = nil;
     self.assetExplorerPageIndex = 0;
+    self.assetExplorerDataJSON = nil;
+    self.assetExplorerDataToken += 1;
+    self.assetExplorerModeControl.hidden = YES;
     [self zs_assetExplorerResetPreviewZoomAnimated:NO];
     self.assetExplorerTextureImageView.image = nil;
     self.assetExplorerTextureImageView.hidden = NO;
@@ -16274,6 +16310,7 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
                 if (isText) summary = [NSString stringWithFormat:@"%@  •  %@", asset.typeName ?: @"Asset", summary ?: @""];
                 strongSelf.assetExplorerTextureCaptionLabel.text = summary;
                 [strongSelf zs_assetExplorerSyncPagePager];
+                [strongSelf zs_assetExplorerSyncModeControl];
             }
             if (isText) {
                 strongSelf.assetExplorerTextureImageView.hidden = YES;
@@ -16287,9 +16324,113 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
                 strongSelf.assetExplorerTextureImageView.image = image;
                 strongSelf.assetExplorerTextureExportButton.enabled = YES;
                 strongSelf.assetExplorerTextureExportButton.alpha = 1;
-                [strongSelf zs_assetExplorerStartLiveFromElapsed:0];
+                if (strongSelf.assetExplorerDataMode) [strongSelf zs_assetExplorerApplyDisplayMode];
+                else [strongSelf zs_assetExplorerStartLiveFromElapsed:0];
             } else {
                 strongSelf.assetExplorerTextureMessageLabel.text = error.localizedDescription ?: @"Couldn't decode this asset.";
+                strongSelf.assetExplorerTextureMessageLabel.hidden = NO;
+                if (visual && strongSelf.assetExplorerDataMode) [strongSelf zs_assetExplorerApplyDisplayMode];
+            }
+        });
+    });
+}
+
+- (void)zs_assetExplorerSyncModeControl {
+    ZSAssetExplorerVisual *visual = self.assetExplorerVisual;
+    BOOL available = self.assetExplorerTextureOpen && visual != nil && visual.text.length == 0;
+    self.assetExplorerModeControl.hidden = !available;
+    self.assetExplorerModeControl.selectedSegmentIndex = self.assetExplorerDataMode ? 1 : 0;
+}
+
+- (void)zs_assetExplorerModeChanged:(UISegmentedControl *)control {
+    BOOL dataMode = control.selectedSegmentIndex == 1;
+    if (dataMode == self.assetExplorerDataMode) return;
+    self.assetExplorerDataMode = dataMode;
+    [self zs_assetExplorerApplyDisplayMode];
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+}
+
+- (void)zs_assetExplorerApplyDisplayMode {
+    ZSAssetExplorerVisual *visual = self.assetExplorerVisual;
+    if (!self.assetExplorerTextureOpen || !visual || visual.text.length > 0) return;
+    [self zs_assetExplorerSyncModeControl];
+    if (self.assetExplorerDataMode) {
+        [self zs_assetExplorerStopLive];
+        [self zs_assetExplorerResetPreviewZoomAnimated:NO];
+        self.assetExplorerTextureImageView.hidden = YES;
+        self.assetExplorerBackdropView.hidden = YES;
+        self.assetExplorerTextureMessageLabel.hidden = YES;
+        [self.assetExplorerTextureSpinner stopAnimating];
+        [self zs_assetExplorerSyncPagePager];
+        [self zs_assetExplorerLoadDataForCurrentAsset];
+        return;
+    }
+    self.assetExplorerDataToken += 1;
+    self.assetExplorerTextView.hidden = YES;
+    self.assetExplorerTextView.text = @"";
+    self.assetExplorerTextureMessageLabel.hidden = YES;
+    self.assetExplorerTextureImageView.hidden = NO;
+    self.assetExplorerBackdropView.hidden = NO;
+    [self zs_assetExplorerSyncPagePager];
+    UIImage *image = self.assetExplorerTextureImageView.image;
+    if (image) {
+        self.assetExplorerTextureExportButton.enabled = YES;
+        self.assetExplorerTextureExportButton.alpha = 1;
+        [self zs_assetExplorerStartLiveFromElapsed:self.assetExplorerLiveElapsed];
+    } else {
+        [self zs_assetExplorerLoadPage:self.assetExplorerPageIndex];
+    }
+}
+
+- (void)zs_assetExplorerShowDataJSON {
+    NSData *json = self.assetExplorerDataJSON;
+    if (!json || !self.assetExplorerDataMode) return;
+    NSString *text = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding] ?: @"";
+    self.assetExplorerTextureMessageLabel.hidden = YES;
+    self.assetExplorerTextView.text = text;
+    self.assetExplorerTextView.hidden = NO;
+    [self.assetExplorerTextView setContentOffset:CGPointZero animated:NO];
+    self.assetExplorerTextureExportButton.enabled = YES;
+    self.assetExplorerTextureExportButton.alpha = 1;
+}
+
+- (void)zs_assetExplorerLoadDataForCurrentAsset {
+    ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
+    NSInteger index = self.assetExplorerTextureIndex;
+    if (!bundle || index < 0 || index >= (NSInteger)self.assetExplorerTextureAssets.count) return;
+    ZSAssetExplorerAsset *asset = self.assetExplorerTextureAssets[(NSUInteger)index];
+
+    if (self.assetExplorerDataJSON) {
+        [self zs_assetExplorerShowDataJSON];
+        return;
+    }
+
+    self.assetExplorerDataToken += 1;
+    NSUInteger token = self.assetExplorerDataToken;
+    NSUInteger generation = self.assetExplorerGeneration;
+    self.assetExplorerTextView.hidden = YES;
+    self.assetExplorerTextView.text = @"";
+    [self.assetExplorerTextureSpinner startAnimating];
+    self.assetExplorerTextureExportButton.enabled = NO;
+    self.assetExplorerTextureExportButton.alpha = 0.35;
+
+    __weak typeof(self) weakSelf = self;
+    NSString *bundlePath = [bundle.filePath copy];
+    int64_t pathID = asset.pathID;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSData *json = [ZSAssetExplorer jsonDataForPathID:pathID inBundleAtPath:bundlePath error:&error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen || !strongSelf.assetExplorerTextureOpen) return;
+            if (strongSelf.assetExplorerGeneration != generation || strongSelf.assetExplorerDataToken != token || !strongSelf.assetExplorerDataMode) return;
+            [strongSelf.assetExplorerTextureSpinner stopAnimating];
+            if (json) {
+                strongSelf.assetExplorerDataJSON = json;
+                [strongSelf zs_assetExplorerShowDataJSON];
+            } else {
+                strongSelf.assetExplorerTextureMessageLabel.text = error.localizedDescription ?: @"Couldn't read this asset's data.";
                 strongSelf.assetExplorerTextureMessageLabel.hidden = NO;
             }
         });
@@ -16416,7 +16557,8 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     ZSAssetExplorerVisual *visual = self.assetExplorerVisual;
     NSInteger count = visual ? (NSInteger)visual.pageLabels.count : 0;
     NSInteger index = self.assetExplorerPageIndex;
-    BOOL show = self.assetExplorerTextureOpen && count > 1;
+    BOOL showingData = self.assetExplorerDataMode && visual && visual.text.length == 0;
+    BOOL show = self.assetExplorerTextureOpen && count > 1 && !showingData;
     self.assetExplorerPageStack.hidden = !show;
     if (!show) return;
     NSString *label = index >= 0 && index < count ? visual.pageLabels[(NSUInteger)index] : @"";
@@ -16473,8 +16615,9 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 - (void)zs_assetExplorerTextureExportTapped {
     UIImage *image = self.assetExplorerTextureImageView.image;
     ZSAssetExplorerVisual *textVisual = self.assetExplorerVisual;
-    BOOL isTextExport = textVisual.text.length > 0;
-    NSData *textData = isTextExport ? (textVisual.exportData ?: [textVisual.text dataUsingEncoding:NSUTF8StringEncoding]) : nil;
+    BOOL isDataExport = self.assetExplorerDataMode && self.assetExplorerDataJSON.length > 0 && textVisual != nil && textVisual.text.length == 0;
+    BOOL isTextExport = isDataExport || textVisual.text.length > 0;
+    NSData *textData = isDataExport ? self.assetExplorerDataJSON : (isTextExport ? (textVisual.exportData ?: [textVisual.text dataUsingEncoding:NSUTF8StringEncoding]) : nil);
     NSInteger index = self.assetExplorerTextureIndex;
     if ((!image && !isTextExport) || !self.assetExplorerTextureOpen || index < 0 || index >= (NSInteger)self.assetExplorerTextureAssets.count) return;
 
@@ -16482,7 +16625,9 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     NSString *baseName = asset.assetName.length > 0 ? asset.assetName : [NSString stringWithFormat:@"%@_%lld", asset.typeName.length > 0 ? asset.typeName : @"Asset", (long long)asset.pathID];
     ZSAssetExplorerVisual *exportVisual = self.assetExplorerVisual;
     NSInteger exportPage = self.assetExplorerPageIndex;
-    if (exportVisual.pageLabels.count > 1 && exportPage >= 0 && exportPage < (NSInteger)exportVisual.pageLabels.count) {
+    if (isDataExport) {
+        baseName = [baseName stringByAppendingString:@"_data"];
+    } else if (exportVisual.pageLabels.count > 1 && exportPage >= 0 && exportPage < (NSInteger)exportVisual.pageLabels.count) {
         baseName = [baseName stringByAppendingFormat:@"_%@", exportVisual.pageLabels[(NSUInteger)exportPage]];
     }
     NSMutableCharacterSet *allowed = [NSMutableCharacterSet alphanumericCharacterSet];
@@ -16496,7 +16641,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     UIButton *sourceButton = self.assetExplorerTextureExportButton;
     sourceButton.enabled = NO;
     __weak typeof(self) weakSelf = self;
-    NSString *fileExtension = isTextExport ? (textVisual.fileExtension.length > 0 ? textVisual.fileExtension : @"txt") : @"png";
+    NSString *fileExtension = isDataExport ? @"json" : (isTextExport ? (textVisual.fileExtension.length > 0 ? textVisual.fileExtension : @"txt") : @"png");
     NSString *fileName = [safeName stringByAppendingPathExtension:fileExtension];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSData *png = isTextExport ? textData : UIImagePNGRepresentation(image);

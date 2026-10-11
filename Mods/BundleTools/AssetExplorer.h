@@ -72,6 +72,7 @@ typedef UIImage * _Nullable (^ZSAssetExplorerLiveFrameProvider)(NSTimeInterval e
 + (BOOL)hasVisualPreviewForClassID:(int32_t)classID;
 + (BOOL)classID:(int32_t)a sharesPreviewGroupWithClassID:(int32_t)b;
 + (nullable ZSAssetExplorerVisual *)visualForPathID:(int64_t)pathID classID:(int32_t)classID inBundleAtPath:(NSString *)path error:(NSError **)error;
++ (nullable NSData *)jsonDataForPathID:(int64_t)pathID inBundleAtPath:(NSString *)path error:(NSError **)error;
 @end
 
 NS_ASSUME_NONNULL_END
