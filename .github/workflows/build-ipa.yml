@@ -53,7 +53,7 @@ jobs:
             echo "downloaded=true" >> "$GITHUB_OUTPUT"
           else
             echo "No URL provided — falling back to cached .ipa"
-            if [[ "${{ steps.ipa-restore.outputs.cache-hit }}" != "true" || ! -s ipa/app.ipa ]]; then
+            if [[ ! -s ipa/app.ipa ]]; then
               echo "::error::No ipa_url was given and no cached .ipa exists yet. Run the workflow once with ipa_url set." >&2
               exit 1
             fi
