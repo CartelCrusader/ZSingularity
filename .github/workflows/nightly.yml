@@ -175,13 +175,15 @@ jobs:
             -Wl,-sectcreate,__DATA,__enkephalin,Resources/Enkephalin.gif \
             -Wl,-sectcreate,__DATA,__zsastcmetal,Astc.metallib \
             -I. \
-            -ICore -IUI -IMods -IMods/BundleTools -IMods/Transcoder -INetwork -IDiagnostics -IResources -INotifications \
+            -ICore -ICore/RamBypass -IUI -IMods -IMods/BundleTools -IMods/Transcoder -INetwork -IDiagnostics -IResources -INotifications \
             Mods/BundleTools/UnityBundleTools.m \
             Mods/BundleTools/AssetExplorer.m \
             Core/IL2CppIntrospection.m \
             Mods/Dumper/Dumper.m \
             Core/DumpTypeRegistry.m \
             Core/Engine.m \
+            Core/RamBypass/RamDonor.m \
+            Core/RamBypass/DonatedHeap.m \
             Diagnostics/Diagnostics.m \
             Mods/Mods.m \
             Mods/Transcoder/Transcoder.m \
@@ -203,6 +205,28 @@ jobs:
       - name: Verify architecture
         run: lipo -info ZSingularity.dylib
 
+      - name: Compile memory donor extension
+        run: |
+          set -euo pipefail
+          rm -rf ZSRamDonor.appex ZSRamDonor.appex.zip
+          mkdir -p ZSRamDonor.appex
+          clang \
+            -O2 \
+            -fobjc-arc \
+            -fmodules \
+            -fapplication-extension \
+            -isysroot "${{ steps.sdk.outputs.path }}" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -Wl,-e,_NSExtensionMain \
+            -ICore/RamBypass \
+            Extension/ZSRamDonor/main.m \
+            -o ZSRamDonor.appex/ZSRamDonor
+          cp Extension/ZSRamDonor/Info.plist ZSRamDonor.appex/Info.plist
+          codesign -f -s - ZSRamDonor.appex
+          ditto -c -k --keepParent ZSRamDonor.appex ZSRamDonor.appex.zip
+
       - name: Publish nightly release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -217,7 +241,7 @@ jobs:
           fi
           
           # Create new nightly release
-          gh release create nightly ZSingularity.dylib \
+          gh release create nightly ZSingularity.dylib ZSRamDonor.appex.zip \
             --repo "$REPO" \
             --title "Nightly build ${{ github.run_number }}" \
             --notes "Automated nightly build ${{ github.run_number }} (commit ${{ github.sha }})." \

@@ -85,6 +85,7 @@ jobs:
           gh release download ${{ steps.dylib-tag.outputs.tag }} \
             --repo "${{ github.repository }}" \
             --pattern 'ZSingularity.dylib' \
+            --pattern 'ZSRamDonor.appex.zip' \
             --dir . \
             --clobber
 
@@ -162,6 +163,24 @@ jobs:
 
           EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")"
           echo "MAIN_BINARY=$APP_DIR/$EXECUTABLE_NAME" >> "$GITHUB_ENV"
+
+      - name: Embed memory donor extension
+        run: |
+          set -euo pipefail
+          if [[ ! -s ZSRamDonor.appex.zip ]]; then
+            echo "::warning::No ZSRamDonor.appex.zip on this release, RamBypass will be unavailable."
+            exit 0
+          fi
+
+          APP_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_DIR/Info.plist")"
+          APPEX="$APP_DIR/PlugIns/ZSRamDonor.appex"
+
+          rm -rf "$APPEX"
+          mkdir -p "$APP_DIR/PlugIns"
+          ditto -x -k ZSRamDonor.appex.zip "$APP_DIR/PlugIns"
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${APP_ID}.ZSRamDonor" "$APPEX/Info.plist"
+          codesign -f -s - "$APPEX"
 
       - name: Patch Info.plist keys
         run: |

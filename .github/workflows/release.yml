@@ -222,13 +222,15 @@ jobs:
             -Wl,-sectcreate,__DATA,__enkephalin,Resources/Enkephalin.gif \
             -Wl,-sectcreate,__DATA,__zsastcmetal,Astc.metallib \
             -I. \
-            -ICore -IUI -IMods -IMods/BundleTools -IMods/Transcoder -INetwork -IDiagnostics -IResources -INotifications \
+            -ICore -ICore/RamBypass -IUI -IMods -IMods/BundleTools -IMods/Transcoder -INetwork -IDiagnostics -IResources -INotifications \
             Mods/BundleTools/UnityBundleTools.m \
             Mods/BundleTools/AssetExplorer.m \
             Core/IL2CppIntrospection.m \
             Mods/Dumper/Dumper.m \
             Core/DumpTypeRegistry.m \
             Core/Engine.m \
+            Core/RamBypass/RamDonor.m \
+            Core/RamBypass/DonatedHeap.m \
             Diagnostics/Diagnostics.m \
             Mods/Mods.m \
             Mods/Transcoder/Transcoder.m \
@@ -250,12 +252,34 @@ jobs:
       - name: Verify architecture
         run: lipo -info ZSingularity.dylib
 
+      - name: Compile memory donor extension
+        run: |
+          set -euo pipefail
+          rm -rf ZSRamDonor.appex ZSRamDonor.appex.zip
+          mkdir -p ZSRamDonor.appex
+          clang \
+            -O2 \
+            -fobjc-arc \
+            -fmodules \
+            -fapplication-extension \
+            -isysroot "${{ steps.sdk.outputs.path }}" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -Wl,-e,_NSExtensionMain \
+            -ICore/RamBypass \
+            Extension/ZSRamDonor/main.m \
+            -o ZSRamDonor.appex/ZSRamDonor
+          cp Extension/ZSRamDonor/Info.plist ZSRamDonor.appex/Info.plist
+          codesign -f -s - ZSRamDonor.appex
+          ditto -c -k --keepParent ZSRamDonor.appex ZSRamDonor.appex.zip
+
       - name: Create Draft GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release create "${{ steps.version.outputs.tag }}" ZSingularity.dylib \
+          gh release create "${{ steps.version.outputs.tag }}" ZSingularity.dylib ZSRamDonor.appex.zip \
             --repo "${{ github.repository }}" \
             --title "${{ steps.version.outputs.tag }}" \
             --notes "Automated release ${{ steps.version.outputs.tag }} (build ${{ github.run_number }})" \

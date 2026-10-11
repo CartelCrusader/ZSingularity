@@ -29,6 +29,7 @@
 #import "EmbeddedSignature.h"
 #import "Docs.h"
 #import "GifTint.h"
+#import "DonatedHeap.h"
 
 @class ZSCapsuleSlider, ZSModeSlider, ZSWheelPicker;
 
@@ -9071,6 +9072,9 @@ static const CGFloat kContentFadeHeight = 22;
     ZSRow *disableEnkephalinRow = zs_make_switch_row(@"Disable Enkephalin", zs_enkephalin_disabled_by_user());
     [disableEnkephalinRow.toggle addTarget:self action:@selector(disableEnkephalinChanged:) forControlEvents:UIControlEventValueChanged];
 
+    ZSRow *ramBypassRow = zs_make_switch_row(@"RamBypass", zs_ram_bypass_enabled());
+    [ramBypassRow.toggle addTarget:self action:@selector(ramBypassChanged:) forControlEvents:UIControlEventValueChanged];
+
     UIButton *assetExplorerButton = zs_make_grouped_action_button(@"Asset Explorer", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [assetExplorerButton addTarget:self action:@selector(assetExplorerTapped) forControlEvents:UIControlEventTouchUpInside];
 
@@ -9079,6 +9083,7 @@ static const CGFloat kContentFadeHeight = 22;
         uidRedactorRow,
         disableLiquidGlassRow,
         disableEnkephalinRow,
+        ramBypassRow,
         assetExplorerButton,
     ]);
     miscCard.layer.borderWidth = 1;
@@ -20252,6 +20257,19 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
 - (void)disableEnkephalinChanged:(UISwitch *)toggle {
     zs_set_enkephalin_disabled_by_user(toggle.on);
     zs_gif_tint_set_disabled(toggle.on);
+}
+
+- (void)ramBypassChanged:(UISwitch *)toggle {
+    zs_set_donated_heap_enabled(toggle.on);
+    UIViewController *presenter = zs_key_window().rootViewController;
+    if (presenter) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Restart Required"
+                                                                         message:@"You must restart the app for RamBypass to take effect."
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        zs_add_restart_action(alert);
+        [presenter presentViewController:alert animated:YES completion:nil];
+    }
 }
 
 - (void)nightlyReleasesEnabledChanged:(UISwitch *)toggle {
