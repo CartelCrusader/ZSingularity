@@ -9302,8 +9302,7 @@ static const CGFloat kContentFadeHeight = 22;
     [self.stack addArrangedSubview:entitlementsCard];
     [self.stack setCustomSpacing:8 afterView:entitlementsCard];
 
-    BOOL ramBypassOnLiveContainer = [ZSDylibUpdater isRunningUnderLiveContainer];
-    BOOL ramBypassAvailable = zs_ram_bypass_available() && !ramBypassOnLiveContainer;
+    BOOL ramBypassAvailable = zs_ram_bypass_available();
     ZSRow *ramBypassRow = zs_make_switch_row(@"Extend Memory Usage", ramBypassAvailable && zs_ram_bypass_enabled());
     [ramBypassRow.toggle addTarget:self action:@selector(ramBypassChanged:) forControlEvents:UIControlEventValueChanged];
     if (!ramBypassAvailable) {
@@ -9311,9 +9310,7 @@ static const CGFloat kContentFadeHeight = 22;
         ramBypassRow.toggle.enabled = NO;
         ramBypassRow.titleLabel.alpha = 0.35;
         ramBypassRow.toggle.alpha = 0.35;
-        zs_add_unavailable_subtext(ramBypassRow, ramBypassOnLiveContainer
-            ? @"Unavailable, Extend Memory Usage is not supported on LiveContainer (yet)"
-            : @"Unavailable, RamDonor extension not registered");
+        zs_add_unavailable_subtext(ramBypassRow, @"Unavailable, RamDonor extension not registered");
     }
 
     ZSRow *ramHudRow = zs_make_switch_row(@"Memory Usage HUD", zs_ram_hud_enabled());

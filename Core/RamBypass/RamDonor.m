@@ -3,6 +3,7 @@
 #import "ZTweakLog.h"
 
 #import <mach/mach.h>
+#import <objc/message.h>
 
 @interface NSExtension : NSObject
 @property (nonatomic, strong, readwrite) NSArray *preferredLanguages;
@@ -119,32 +120,53 @@ static ZSRamDonor *sharedDonor;
     static dispatch_once_t once;
 
     dispatch_once(&once, ^{
-        NSURL *plugIns = NSBundle.mainBundle.builtInPlugInsURL;
+        NSMutableArray<NSBundle *> *hosts = [NSMutableArray arrayWithObject:NSBundle.mainBundle];
+        SEL liveContainerSelector = NSSelectorFromString(@"lcMainBundle");
 
-        if (!plugIns)
+        if ([NSUserDefaults respondsToSelector:liveContainerSelector])
         {
-            return;
+            id liveContainerBundle = ((id (*)(id, SEL))objc_msgSend)(NSUserDefaults.class, liveContainerSelector);
+
+            if ([liveContainerBundle isKindOfClass:NSBundle.class] && liveContainerBundle != NSBundle.mainBundle)
+            {
+                [hosts addObject:liveContainerBundle];
+            }
         }
 
-        NSArray<NSURL *> *contents =
-            [NSFileManager.defaultManager contentsOfDirectoryAtURL:plugIns
-                                        includingPropertiesForKeys:nil
-                                                           options:0
-                                                             error:nil];
-
-        for (NSURL *url in contents)
+        for (NSBundle *host in hosts)
         {
-            if (![url.pathExtension isEqualToString:@"appex"])
+            NSURL *plugIns = host.builtInPlugInsURL;
+
+            if (!plugIns)
             {
                 continue;
             }
 
-            NSBundle *bundle = [NSBundle bundleWithURL:url];
-            NSString *principal = bundle.infoDictionary[@"NSExtension"][@"NSExtensionPrincipalClass"];
+            NSArray<NSURL *> *contents =
+                [NSFileManager.defaultManager contentsOfDirectoryAtURL:plugIns
+                                            includingPropertiesForKeys:nil
+                                                               options:0
+                                                                 error:nil];
 
-            if ([principal isEqualToString:@"ZSRamDonorHandler"])
+            for (NSURL *url in contents)
             {
-                identifier = bundle.bundleIdentifier;
+                if (![url.pathExtension isEqualToString:@"appex"])
+                {
+                    continue;
+                }
+
+                NSBundle *bundle = [NSBundle bundleWithURL:url];
+                NSString *principal = bundle.infoDictionary[@"NSExtension"][@"NSExtensionPrincipalClass"];
+
+                if ([principal isEqualToString:@"ZSRamDonorHandler"])
+                {
+                    identifier = bundle.bundleIdentifier;
+                    break;
+                }
+            }
+
+            if (identifier)
+            {
                 break;
             }
         }
