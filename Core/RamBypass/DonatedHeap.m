@@ -133,7 +133,7 @@ void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
 
     outSnapshot->donatedBytes = stats.active ? stats.poolBytes : 0;
     outSnapshot->donatedUsedBytes = stats.active ? stats.usedBytes : 0;
-    outSnapshot->totalBytes = outSnapshot->appBytes + outSnapshot->donatedBytes;
+    outSnapshot->totalBytes = outSnapshot->appBytes + outSnapshot->donatedUsedBytes;
 }
 
 static inline uint64_t zs_round_page(uint64_t value)

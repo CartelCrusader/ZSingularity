@@ -7138,7 +7138,9 @@ static void zs_mt_hud_build_texture(void) {
     NSArray<NSString *> *values = @[
         zs_mt_hud_format_bytes(snapshot.totalBytes),
         zs_mt_hud_format_bytes(snapshot.appBytes),
-        zs_mt_hud_format_bytes(snapshot.donatedBytes),
+        snapshot.donatedBytes > 0
+            ? [NSString stringWithFormat:@"%@ / %@", zs_mt_hud_format_bytes(snapshot.donatedUsedBytes), zs_mt_hud_format_bytes(snapshot.donatedBytes)]
+            : @"off",
     ];
 
     UIFont *font = zs_mono_font(10, UIFontWeightSemibold);
