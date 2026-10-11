@@ -2807,6 +2807,29 @@ static ZSRow *zs_make_switch_row(NSString *title, BOOL val) {
     return row;
 }
 
+static void zs_add_unavailable_subtext(ZSRow *row, NSString *text) {
+    UILabel *subLabel = [[UILabel alloc] init];
+    subLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    subLabel.font = zs_mono_font(9, UIFontWeightRegular);
+    subLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+    subLabel.text = text;
+    subLabel.numberOfLines = 2;
+    [row addSubview:subLabel];
+
+    for (NSLayoutConstraint *constraint in row.constraints) {
+        if (constraint.firstItem == row.titleLabel && constraint.firstAttribute == NSLayoutAttributeCenterY) {
+            constraint.active = NO;
+        }
+    }
+
+    [NSLayoutConstraint activateConstraints:@[
+        [row.titleLabel.topAnchor constraintEqualToAnchor:row.topAnchor constant:3],
+        [subLabel.topAnchor constraintEqualToAnchor:row.titleLabel.bottomAnchor constant:1],
+        [subLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [subLabel.trailingAnchor constraintLessThanOrEqualToAnchor:row.toggle.leadingAnchor constant:-6],
+    ]];
+}
+
 static ZSRow *zs_make_button_pair_row(NSString *leftTitle, UIColor *leftTint,
                                        NSString *rightTitle, UIColor *rightTint) {
     ZSRow *row = [[ZSRow alloc] initWithFrame:CGRectZero];
@@ -7134,12 +7157,12 @@ static void zs_mt_hud_build_texture(void) {
     RamHudSnapshot snapshot;
     zs_ram_hud_get_snapshot(&snapshot);
 
-    NSArray<NSString *> *labels = @[@"TOTAL", @"APP", @"DONOR"];
+    NSArray<NSString *> *labels = @[@"TOTAL", @"APP", @"EXT."];
     NSArray<NSString *> *values = @[
         zs_mt_hud_format_bytes(snapshot.totalBytes),
         zs_mt_hud_format_bytes(snapshot.appBytes),
         snapshot.donatedBytes > 0
-            ? [NSString stringWithFormat:@"%@ / %@", zs_mt_hud_format_bytes(snapshot.donatedUsedBytes), zs_mt_hud_format_bytes(snapshot.donatedBytes)]
+            ? zs_mt_hud_format_bytes(snapshot.donatedUsedBytes)
             : @"off",
     ];
 
@@ -8565,6 +8588,94 @@ static UIButton *zs_make_section_info_button(NSString *docKey, id target, SEL ac
     return button;
 }
 
+static UIView *zs_make_entitlements_card(BOOL hasIncreasedLimit, BOOL hasExtendedVA) {
+    UIView *card;
+    UIView *host;
+    if (zs_has_liquid_glass()) {
+        UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:zs_make_glass_effect_dark(NO)];
+        glass.translatesAutoresizingMaskIntoConstraints = NO;
+        zs_configure_glass_corners(glass, 14, NO);
+        glass.layer.borderWidth = 1;
+        glass.layer.borderColor = [zs_accent_green_color() colorWithAlphaComponent:0.2].CGColor;
+        zs_register_suspendable_glass(glass);
+        card = glass;
+        host = glass.contentView;
+    } else {
+        UIView *plain = [[UIView alloc] init];
+        plain.translatesAutoresizingMaskIntoConstraints = NO;
+        plain.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.96];
+        plain.layer.cornerRadius = 14;
+        plain.layer.cornerCurve = kCACornerCurveContinuous;
+        plain.layer.borderWidth = 1;
+        plain.layer.borderColor = [zs_accent_green_color() colorWithAlphaComponent:0.2].CGColor;
+        plain.clipsToBounds = YES;
+        card = plain;
+        host = plain;
+    }
+
+    UILabel *header = [[UILabel alloc] init];
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    header.text = @"ENTITLEMENTS";
+    header.font = zs_mono_font(9, UIFontWeightSemibold);
+    header.textColor = [UIColor colorWithWhite:0.9 alpha:1];
+
+    UIColor *yesColor = zs_accent_green_color();
+    UIColor *noColor = [UIColor colorWithRed:1.0 green:0.33 blue:0.33 alpha:1.0];
+    NSArray<NSArray *> *entries = @[
+        @[@"kern.increased-memory-limit", @(hasIncreasedLimit)],
+        @[@"kern.extended-virtual-addressing", @(hasExtendedVA)],
+    ];
+
+    UIStackView *rows = [[UIStackView alloc] init];
+    rows.translatesAutoresizingMaskIntoConstraints = NO;
+    rows.axis = UILayoutConstraintAxisVertical;
+    rows.spacing = 8;
+
+    for (NSArray *entry in entries) {
+        BOOL on = [entry[1] boolValue];
+
+        UILabel *nameLabel = [[UILabel alloc] init];
+        nameLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        nameLabel.font = zs_mono_font(11, UIFontWeightRegular);
+        nameLabel.textColor = [UIColor colorWithWhite:1 alpha:0.85];
+        nameLabel.text = entry[0];
+        nameLabel.adjustsFontSizeToFitWidth = YES;
+        nameLabel.minimumScaleFactor = 0.7;
+        [nameLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+        UILabel *valueLabel = [[UILabel alloc] init];
+        valueLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        valueLabel.font = zs_mono_font(11, UIFontWeightSemibold);
+        valueLabel.textColor = on ? yesColor : noColor;
+        valueLabel.text = on ? @"Yes" : @"No";
+        valueLabel.textAlignment = NSTextAlignmentRight;
+        [valueLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+        [valueLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+        UIStackView *line = [[UIStackView alloc] initWithArrangedSubviews:@[nameLabel, valueLabel]];
+        line.translatesAutoresizingMaskIntoConstraints = NO;
+        line.axis = UILayoutConstraintAxisHorizontal;
+        line.spacing = 8;
+        line.alignment = UIStackViewAlignmentCenter;
+        [rows addArrangedSubview:line];
+    }
+
+    [host addSubview:header];
+    [host addSubview:rows];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [header.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
+        [header.topAnchor constraintEqualToAnchor:host.topAnchor constant:12],
+
+        [rows.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
+        [rows.trailingAnchor constraintEqualToAnchor:host.trailingAnchor constant:-12],
+        [rows.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:8],
+        [rows.bottomAnchor constraintEqualToAnchor:host.bottomAnchor constant:-12],
+    ]];
+
+    return card;
+}
+
 static UIView *zs_make_syslog_blacklist_card(UIView *syslogRow, UILabel *blacklistHeader, UILabel *statusLabel, UIScrollView *entriesScroll) {
     UIView *card;
     UIView *host;
@@ -8594,6 +8705,13 @@ static UIView *zs_make_syslog_blacklist_card(UIView *syslogRow, UILabel *blackli
     separator.translatesAutoresizingMaskIntoConstraints = NO;
     separator.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
 
+    UILabel *cardTitle = [[UILabel alloc] init];
+    cardTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    cardTitle.text = @"NSLog Keyword Blacklist";
+    cardTitle.font = zs_mono_font(9, UIFontWeightSemibold);
+    cardTitle.textColor = [UIColor colorWithWhite:0.9 alpha:1];
+
+    [host addSubview:cardTitle];
     [host addSubview:syslogRow];
     [host addSubview:separator];
     [host addSubview:blacklistHeader];
@@ -8603,7 +8721,10 @@ static UIView *zs_make_syslog_blacklist_card(UIView *syslogRow, UILabel *blackli
     [NSLayoutConstraint activateConstraints:@[
         [syslogRow.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
         [syslogRow.trailingAnchor constraintEqualToAnchor:host.trailingAnchor constant:-12],
-        [syslogRow.topAnchor constraintEqualToAnchor:host.topAnchor constant:12],
+        [cardTitle.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
+        [cardTitle.topAnchor constraintEqualToAnchor:host.topAnchor constant:12],
+
+        [syslogRow.topAnchor constraintEqualToAnchor:cardTitle.bottomAnchor constant:8],
         [syslogRow.heightAnchor constraintEqualToConstant:34],
 
         [separator.leadingAnchor constraintEqualToAnchor:host.leadingAnchor constant:12],
@@ -9163,16 +9284,27 @@ static const CGFloat kContentFadeHeight = 22;
     [self.pendingSectionBuilders addObject:^{
     zs_add_section_header(self.stack, @"Memory management", self);
 
-    BOOL ramBypassAvailable = zs_ram_bypass_available();
-    ZSRow *ramBypassRow = zs_make_switch_row(@"RamBypass", ramBypassAvailable && zs_ram_bypass_enabled());
+    ZSMemorySystemStats entitlementStats = zs_collect_memory_system_stats();
+    UIView *entitlementsCard = zs_make_entitlements_card(entitlementStats.hasIncreasedMemoryLimitEntitlement,
+                                                         entitlementStats.hasExtendedVirtualAddressingEntitlement);
+    [self.stack addArrangedSubview:entitlementsCard];
+    [self.stack setCustomSpacing:8 afterView:entitlementsCard];
+
+    BOOL ramBypassOnLiveContainer = [ZSDylibUpdater isRunningUnderLiveContainer];
+    BOOL ramBypassAvailable = zs_ram_bypass_available() && !ramBypassOnLiveContainer;
+    ZSRow *ramBypassRow = zs_make_switch_row(@"Extend Memory Usage", ramBypassAvailable && zs_ram_bypass_enabled());
     [ramBypassRow.toggle addTarget:self action:@selector(ramBypassChanged:) forControlEvents:UIControlEventValueChanged];
     if (!ramBypassAvailable) {
         ramBypassRow.toggle.on = NO;
         ramBypassRow.toggle.enabled = NO;
-        ramBypassRow.alpha = 0.35;
+        ramBypassRow.titleLabel.alpha = 0.35;
+        ramBypassRow.toggle.alpha = 0.35;
+        zs_add_unavailable_subtext(ramBypassRow, ramBypassOnLiveContainer
+            ? @"Unavailable, Extend Memory Usage is not supported on LiveContainer (yet)"
+            : @"Unavailable, RamDonor extension not registered");
     }
 
-    ZSRow *ramHudRow = zs_make_switch_row(@"RAM HUD", zs_ram_hud_enabled());
+    ZSRow *ramHudRow = zs_make_switch_row(@"Memory Usage HUD", zs_ram_hud_enabled());
     [ramHudRow.toggle addTarget:self action:@selector(ramHudChanged:) forControlEvents:UIControlEventValueChanged];
 
     UIButton *memoryCleanupButton = zs_make_grouped_action_button(@"Memory cleanup", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);

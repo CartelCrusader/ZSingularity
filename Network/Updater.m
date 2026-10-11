@@ -27,6 +27,8 @@ static void zs_self_image_anchor(void) {}
 }
 
 + (BOOL)isRunningUnderLiveContainer {
+    NSString *containerInfoPath = [NSHomeDirectory() stringByAppendingPathComponent:@"LCContainerInfo.plist"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:containerInfoPath]) return YES;
     NSString *path = [self zs_selfImagePath];
     if (!path) return NO;
     return [path rangeOfString:@"/Documents/Tweaks/"].location != NSNotFound;
@@ -62,6 +64,16 @@ static void zs_self_image_anchor(void) {}
 + (nullable NSString *)installedDylibPath {
     if (![self isRunningUnderLiveContainer]) return nil;
 
+    if ([self isStandaloneInstall]) {
+        NSString *embeddedPath = [self zs_selfImagePath];
+        BOOL embeddedIsDirectory = NO;
+        if (embeddedPath.length > 0 &&
+            [[NSFileManager defaultManager] fileExistsAtPath:embeddedPath isDirectory:&embeddedIsDirectory] &&
+            !embeddedIsDirectory) {
+            return embeddedPath;
+        }
+    }
+
     NSString *tweaksDir = [self zs_liveContainerTweaksDirectory];
     if (!tweaksDir) return nil;
 
@@ -92,7 +104,7 @@ static void zs_self_image_anchor(void) {}
 
     NSString *targetPath = [self installedDylibPath];
     if (!targetPath) {
-        finish(NO, @"Couldn't locate the installed dylib under Documents/Tweaks.");
+        finish(NO, @"Couldn't locate the installed dylib.");
         return;
     }
 
