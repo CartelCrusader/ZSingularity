@@ -23,6 +23,7 @@ typedef NS_ENUM(NSInteger, ZSAssetExplorerErrorCode) {
 @property (nonatomic, copy) NSString *cabIdentifier;
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, copy) NSString *filePath;
+@property (nonatomic, assign) BOOL nameResolved;
 @end
 
 @interface ZSAssetExplorerAsset : NSObject
@@ -31,6 +32,7 @@ typedef NS_ENUM(NSInteger, ZSAssetExplorerErrorCode) {
 @property (nonatomic, copy) NSString *typeName;
 @property (nonatomic, copy, nullable) NSString *assetName;
 @property (nonatomic, assign) uint32_t objectSize;
+@property (nonatomic, assign) uint64_t byteStart;
 @end
 
 @interface ZSAssetExplorerTexture : NSObject
@@ -61,6 +63,10 @@ typedef UIImage * _Nullable (^ZSAssetExplorerLiveFrameProvider)(NSTimeInterval e
 
 @interface ZSAssetExplorer : NSObject
 + (NSArray<ZSAssetExplorerBundle *> *)cachedBundles:(NSError **)error;
++ (void)resolveNamesForBundles:(NSArray<ZSAssetExplorerBundle *> *)bundles
+                     batchSize:(NSUInteger)batchSize
+                shouldContinue:(nullable BOOL (^)(void))shouldContinue
+                       handler:(void (^)(NSArray<ZSAssetExplorerBundle *> *updated))handler;
 + (NSArray<ZSAssetExplorerAsset *> *)assetsForBundleAtPath:(NSString *)path error:(NSError **)error;
 + (nullable ZSAssetExplorerTexture *)textureForPathID:(int64_t)pathID inBundleAtPath:(NSString *)path error:(NSError **)error;
 + (BOOL)hasVisualPreviewForClassID:(int32_t)classID;

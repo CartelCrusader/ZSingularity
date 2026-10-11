@@ -6014,6 +6014,7 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, strong) UILabel *assetExplorerTextureCaptionLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *assetExplorerTextureSpinner;
 @property (nonatomic, strong) NSArray<ZSAssetExplorerBundle *> *assetExplorerBundles;
+@property (nonatomic, assign) NSUInteger assetExplorerNamesSession;
 @property (nonatomic, strong) NSArray<ZSAssetExplorerAsset *> *assetExplorerAssets;
 @property (nonatomic, strong) ZSAssetExplorerBundle *assetExplorerSelectedBundle;
 @property (nonatomic, assign) NSUInteger assetExplorerGeneration;
@@ -15910,6 +15911,8 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
 - (void)zs_assetExplorerLoadBundles {
     self.assetExplorerGeneration += 1;
     NSUInteger generation = self.assetExplorerGeneration;
+    self.assetExplorerNamesSession += 1;
+    NSUInteger namesSession = self.assetExplorerNamesSession;
     self.assetExplorerSelectedBundle = nil;
     [self zs_assetExplorerSetTextureModeVisible:NO];
     self.assetExplorerAssets = @[];
@@ -15947,10 +15950,28 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
         NSDictionary *indexAfter = [ZSFileIndex persistedCABMap];
         BOOL moddedChanged = ![moddedBefore isEqualToArray:zs_modded_bundle_cabs()];
         BOOL indexChanged = indexBefore != indexAfter && ![indexBefore isEqualToDictionary:indexAfter];
-        if (!moddedChanged && !indexChanged) return;
-        NSError *refreshError = nil;
-        NSArray<ZSAssetExplorerBundle *> *refreshed = indexChanged ? [ZSAssetExplorer cachedBundles:&refreshError] : bundles;
-        deliver(refreshed, indexChanged ? refreshError : error);
+        NSArray<ZSAssetExplorerBundle *> *finalBundles = bundles;
+        if (moddedChanged || indexChanged) {
+            NSError *refreshError = nil;
+            NSArray<ZSAssetExplorerBundle *> *refreshed = indexChanged ? [ZSAssetExplorer cachedBundles:&refreshError] : bundles;
+            deliver(refreshed, indexChanged ? refreshError : error);
+            finalBundles = refreshed;
+        }
+
+        [ZSAssetExplorer resolveNamesForBundles:finalBundles
+                                      batchSize:150
+                                 shouldContinue:^BOOL{
+            typeof(self) strongSelf = weakSelf;
+            return strongSelf && strongSelf.assetExplorerFullScreenOpen && strongSelf.assetExplorerNamesSession == namesSession;
+        }
+                                        handler:^(NSArray<ZSAssetExplorerBundle *> *updated) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf.assetExplorerFullScreenOpen || strongSelf.assetExplorerNamesSession != namesSession) return;
+                strongSelf.assetExplorerBundles = updated;
+                if (!strongSelf.assetExplorerSelectedBundle) [strongSelf zs_assetExplorerRefreshListResettingScroll:NO];
+            });
+        }];
     });
 }
 

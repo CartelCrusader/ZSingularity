@@ -3,6 +3,7 @@
 #import <Metal/Metal.h>
 #import <CoreText/CoreText.h>
 #import <unistd.h>
+#import <sys/stat.h>
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -155,6 +156,12 @@ static uint32_t ZSAEReadU32LEBytes(const uint8_t *base) {
 static uint64_t ZSAEReadU64LEBytes(const uint8_t *base) {
     uint64_t value = 0;
     for (int i = 0; i < 8; i++) value |= ((uint64_t)base[i] << (i * 8));
+    return value;
+}
+
+static uint64_t ZSAEReadU64BEBytes(const uint8_t *base) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; i++) value = (value << 8) | base[i];
     return value;
 }
 
@@ -1092,6 +1099,7 @@ static BOOL ZSAEParseSerializedFile(NSData *data, NSArray<ZSAssetExplorerAsset *
         asset.classID = tree->classID;
         asset.typeName = tree->typeName ?: [NSString stringWithFormat:@"Class %d", tree->classID];
         asset.objectSize = byteSize;
+        asset.byteStart = byteStart;
 
         if (tree->hasName && byteStart <= length - dataOffset) {
             uint64_t objectStart = dataOffset + byteStart;
@@ -5863,7 +5871,152 @@ static ZSAssetExplorerVisual *ZSAEBuildParticleVisual(ZSAEContext *context, ZSAE
 
 @end
 
+static NSString *ZSAEReadAssetBundleName(NSString *path) {
+    ZSAEBundle *bundle = nil;
+    if (!ZSAEOpenBundle(path, &bundle, NULL)) return nil;
+
+    ZSAEBundleNode *cabNode = ZSAEFindSerializedNode(bundle);
+    if (!cabNode || cabNode.size < 64) return nil;
+
+    NSData *head = ZSAEReadBundleRange(bundle, cabNode.offset, 48, NULL);
+    if (head.length < 48) return nil;
+    const uint8_t *headBytes = head.bytes;
+    uint64_t dataOffset = ZSAEReadU64BEBytes(headBytes + 32);
+    if (dataOffset < 48 || dataOffset > cabNode.size || dataOffset > (16ULL << 20)) return nil;
+
+    NSData *metadata = ZSAEReadBundleRange(bundle, cabNode.offset, dataOffset, NULL);
+    if (!metadata) return nil;
+
+    NSArray<ZSAssetExplorerAsset *> *assets = nil;
+    if (!ZSAEParseSerializedFile(metadata, &assets, INT64_MIN, NULL, NULL, NULL, NULL, NULL)) return nil;
+
+    ZSAssetExplorerAsset *bundleAsset = nil;
+    for (ZSAssetExplorerAsset *asset in assets) {
+        if (asset.classID == 142) {
+            bundleAsset = asset;
+            break;
+        }
+    }
+    if (!bundleAsset || bundleAsset.objectSize < 5) return nil;
+
+    uint64_t objectStart = cabNode.offset + dataOffset + bundleAsset.byteStart;
+    uint64_t readLength = MIN((uint64_t)bundleAsset.objectSize, (uint64_t)1028);
+    if (objectStart + readLength > cabNode.offset + cabNode.size) return nil;
+
+    NSData *objectHead = ZSAEReadBundleRange(bundle, objectStart, readLength, NULL);
+    if (objectHead.length < 5) return nil;
+    const uint8_t *bytes = objectHead.bytes;
+    int32_t nameLength = ZSAEReadI32LEBytes(bytes);
+    if (nameLength <= 0 || (uint64_t)nameLength > objectHead.length - 4) return nil;
+    return [[NSString alloc] initWithBytes:bytes + 4 length:(NSUInteger)nameLength encoding:NSUTF8StringEncoding];
+}
+
+static NSString *ZSAENameCachePath(void) {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    return caches ? [caches stringByAppendingPathComponent:@"ZSAssetExplorerBundleNames.plist"] : nil;
+}
+
+static NSObject *ZSAENameCacheLock(void) {
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    return lock;
+}
+
+static NSMutableDictionary<NSString *, NSDictionary *> *ZSAENameCache(void) {
+    static NSMutableDictionary<NSString *, NSDictionary *> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *path = ZSAENameCachePath();
+        NSDictionary *stored = path ? [NSDictionary dictionaryWithContentsOfFile:path] : nil;
+        cache = stored ? [stored mutableCopy] : [NSMutableDictionary dictionary];
+    });
+    return cache;
+}
+
+static void ZSAESaveNameCache(void) {
+    NSString *path = ZSAENameCachePath();
+    if (!path) return;
+    NSDictionary *snapshot = nil;
+    @synchronized (ZSAENameCacheLock()) {
+        snapshot = [ZSAENameCache() copy];
+    }
+    [snapshot writeToFile:path atomically:YES];
+}
+
+static NSString *ZSAEFileSignature(NSString *path) {
+    struct stat st;
+    if (path.length == 0 || stat(path.fileSystemRepresentation, &st) != 0) return nil;
+    return [NSString stringWithFormat:@"%lld:%ld", (long long)st.st_size, (long)st.st_mtime];
+}
+
+static BOOL ZSAEApplyCachedName(ZSAssetExplorerBundle *bundle) {
+    NSString *signature = ZSAEFileSignature(bundle.filePath);
+    if (!signature) return NO;
+    NSDictionary *entry = nil;
+    @synchronized (ZSAENameCacheLock()) {
+        entry = ZSAENameCache()[bundle.cabIdentifier];
+    }
+    if (![entry[@"sig"] isEqualToString:signature]) return NO;
+    NSString *name = entry[@"name"];
+    if ([name isKindOfClass:[NSString class]] && name.length > 0) bundle.displayName = name;
+    bundle.nameResolved = YES;
+    return YES;
+}
+
 @implementation ZSAssetExplorer
+
++ (void)resolveNamesForBundles:(NSArray<ZSAssetExplorerBundle *> *)bundles
+                     batchSize:(NSUInteger)batchSize
+                shouldContinue:(BOOL (^)(void))shouldContinue
+                       handler:(void (^)(NSArray<ZSAssetExplorerBundle *> *))handler {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.120F.AssetExplorerNames", DISPATCH_QUEUE_SERIAL);
+    });
+
+    dispatch_sync(queue, ^{
+        NSMutableArray<ZSAssetExplorerBundle *> *working = [bundles mutableCopy];
+        NSUInteger sinceDelivery = 0;
+
+        for (NSUInteger i = 0; i < working.count; i++) {
+            ZSAssetExplorerBundle *original = working[i];
+            if (original.nameResolved) continue;
+            if (shouldContinue && !shouldContinue()) break;
+
+            @autoreleasepool {
+                NSString *name = ZSAEReadAssetBundleName(original.filePath);
+                NSString *signature = ZSAEFileSignature(original.filePath);
+
+                ZSAssetExplorerBundle *updated = [ZSAssetExplorerBundle new];
+                updated.cabIdentifier = original.cabIdentifier;
+                updated.filePath = original.filePath;
+                updated.displayName = name.length > 0 ? name : original.displayName;
+                updated.nameResolved = YES;
+                working[i] = updated;
+
+                if (signature) {
+                    @synchronized (ZSAENameCacheLock()) {
+                        ZSAENameCache()[original.cabIdentifier] = @{@"name": name ?: @"", @"sig": signature};
+                    }
+                }
+            }
+
+            sinceDelivery++;
+            if (batchSize > 0 && sinceDelivery >= batchSize) {
+                ZSAESaveNameCache();
+                handler([working copy]);
+                sinceDelivery = 0;
+            }
+        }
+
+        if (sinceDelivery > 0) {
+            ZSAESaveNameCache();
+            handler([working copy]);
+        }
+    });
+}
 
 + (NSArray<NSString *> *)zs_sharedRoots {
     NSMutableArray<NSString *> *roots = [NSMutableArray array];
@@ -5902,6 +6055,7 @@ static ZSAssetExplorerVisual *ZSAEBuildParticleVisual(ZSAEContext *context, ZSAE
         NSString *shortIdentifier = count > 0 ? [identifier substringToIndex:count] : identifier;
         bundle.displayName = [NSString stringWithFormat:@"CAB-%@", shortIdentifier];
         bundle.filePath = livePath;
+        ZSAEApplyCachedName(bundle);
         [bundles addObject:bundle];
     }
 
