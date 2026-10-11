@@ -6,7 +6,15 @@
 #import <objc/runtime.h>
 #import <mach-o/getsect.h>
 #import <dlfcn.h>
+#import <sys/mman.h>
+#import <sys/stat.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import "ZTweakLog.h"
+
+static const CGFloat kZSGifContentY0 = 0.44, kZSGifContentY1 = 0.60;
+static const CGFloat kZSGifContentX0 = 0.05, kZSGifContentX1 = 0.95;
+static const CGFloat kZSGifPanWindowWidth = 0.45;
 
 static NSData *zs_embedded_gif_data(void) {
     Dl_info info;
@@ -16,19 +24,6 @@ static NSData *zs_embedded_gif_data(void) {
     uint8_t *bytes = getsectiondata(header, "__DATA", "__enkephalin", &size);
     if (!bytes || size == 0) return nil;
     return [NSData dataWithBytesNoCopy:bytes length:size freeWhenDone:NO];
-}
-
-static UIImage *zs_blend_images(UIImage *from, UIImage *to, CGFloat t) {
-    if (!from || !to) return from ?: to;
-    CGSize size = from.size;
-    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
-    format.opaque = NO;
-    format.scale = from.scale;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext * _Nonnull ctx) {
-        [from drawInRect:(CGRect){CGPointZero, size}];
-        [to drawInRect:(CGRect){CGPointZero, size} blendMode:kCGBlendModeNormal alpha:t];
-    }];
 }
 
 static CATextLayerAlignmentMode zs_ca_alignment_for(NSTextAlignment alignment) {
@@ -97,6 +92,7 @@ static void zs_set_switch_texture_driven(UISwitch *sw, BOOL textureDriven);
     NSInteger _lastFrameIndex;
     BOOL _paused;
     BOOL _disabled;
+    BOOL _decodeStarted;
 
     NSHashTable<ZSGifWindow *> *_windows;
 }
@@ -121,74 +117,308 @@ static void zs_set_switch_texture_driven(UISwitch *sw, BOOL textureDriven);
 #pragma mark Decoding (source: full-resolution Enkephalin.gif, embedded at link time)
 
 static const CGFloat kZSGifPlaybackRate = 0.5;
-static const size_t kZSGifDecodeMaxPixelSize = 240;
+static const NSInteger kZSGifCrossfadeSteps = 8;
+static const uint32_t kZSGifCacheMagic = 0x5A474946;
+static const uint32_t kZSGifCacheVersion = 1;
+static const size_t kZSGifCacheHeaderBytes = 16384;
+static const size_t kZSGifCacheRowAlignment = 64;
 
-- (void)decodeFramesIfNeeded {
-    if (_frames.count > 0) return;
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t gifLength;
+    uint64_t gifHash;
+    uint32_t frameCount;
+    uint32_t width;
+    uint32_t height;
+    uint32_t bytesPerRow;
+    uint64_t frameBytes;
+    double cropX0;
+    double cropX1;
+    double cropY0;
+    double cropY1;
+} ZSGifCacheHeader;
 
-    NSData *data = zs_embedded_gif_data();
-    if (!data) {
-        ZLog(@"[ZSGifTint] couldn't find __DATA,__enkephalin section - accent tint disabled");
-        _frames = @[];
-        _frameDurations = @[];
-        return;
+static uint64_t zs_gif_fingerprint(NSData *data) {
+    const uint8_t *bytes = data.bytes;
+    uint64_t hash = 1469598103934665603ULL ^ (uint64_t)data.length;
+    for (NSUInteger i = 0; i < data.length; i += 4096) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
     }
-    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
-    if (!source) {
-        ZLog(@"[ZSGifTint] CGImageSourceCreateWithData failed on embedded gif data - accent tint disabled");
-        _frames = @[];
-        _frameDurations = @[];
-        return;
+    return hash;
+}
+
+static NSString *zs_gif_cache_path(void) {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!caches) return nil;
+    NSString *dir = [caches stringByAppendingPathComponent:@"ZSGifTint"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"enkephalin.frames"];
+}
+
+static BOOL zs_gif_write_all(int fd, const void *bytes, size_t length, off_t offset) {
+    const uint8_t *cursor = bytes;
+    while (length > 0) {
+        ssize_t written = pwrite(fd, cursor, length, offset);
+        if (written <= 0) return NO;
+        cursor += written;
+        offset += written;
+        length -= (size_t)written;
     }
+    return YES;
+}
+
+static BOOL zs_gif_build_cache(NSData *gifData, NSString *finalPath) {
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)gifData, (__bridge CFDictionaryRef)@{
+        (__bridge NSString *)kCGImageSourceShouldCache: @NO,
+    });
+    if (!source) return NO;
 
     size_t count = CGImageSourceGetCount(source);
-    NSMutableArray<UIImage *> *frames = [NSMutableArray arrayWithCapacity:count];
-    NSMutableArray<NSNumber *> *durations = [NSMutableArray arrayWithCapacity:count];
-
-    NSDictionary *thumbOptions = @{
-        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
-        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @(kZSGifDecodeMaxPixelSize),
-        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
-    };
-
-    for (size_t i = 0; i < count; i++) {
-        CGImageRef cgImage = CGImageSourceCreateThumbnailAtIndex(source, i, (__bridge CFDictionaryRef)thumbOptions);
-        if (!cgImage) continue;
-        [frames addObject:[UIImage imageWithCGImage:cgImage]];
-        CGImageRelease(cgImage);
-
-        NSTimeInterval duration = 0.06;
-        NSDictionary *props = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, i, NULL);
-        NSDictionary *gifProps = props[(__bridge NSString *)kCGImagePropertyGIFDictionary];
-        NSNumber *unclamped = gifProps[(__bridge NSString *)kCGImagePropertyGIFUnclampedDelayTime];
-        NSNumber *clamped = gifProps[(__bridge NSString *)kCGImagePropertyGIFDelayTime];
-        NSNumber *chosen = unclamped ?: clamped;
-        if (chosen && chosen.doubleValue > 0.0) duration = chosen.doubleValue;
-        [durations addObject:@(duration / kZSGifPlaybackRate)];
+    if (count == 0 || count + kZSGifCrossfadeSteps > (kZSGifCacheHeaderBytes - sizeof(ZSGifCacheHeader)) / sizeof(double)) {
+        CFRelease(source);
+        return NO;
     }
 
+    NSDictionary *firstProps = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, 0, NULL);
+    size_t fullWidth = [firstProps[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongValue];
+    size_t fullHeight = [firstProps[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongValue];
+    if (fullWidth == 0 || fullHeight == 0) {
+        CFRelease(source);
+        return NO;
+    }
+
+    size_t cropX0 = (size_t)floor(kZSGifContentX0 * fullWidth);
+    size_t cropX1 = MIN(fullWidth, (size_t)ceil(kZSGifContentX1 * fullWidth));
+    size_t cropY0 = (size_t)floor(kZSGifContentY0 * fullHeight);
+    size_t cropY1 = MIN(fullHeight, (size_t)ceil(kZSGifContentY1 * fullHeight));
+    size_t width = cropX1 - cropX0;
+    size_t height = cropY1 - cropY0;
+    size_t bytesPerRow = ((width * 4 + kZSGifCacheRowAlignment - 1) / kZSGifCacheRowAlignment) * kZSGifCacheRowAlignment;
+    size_t frameBytes = bytesPerRow * height;
+
+    NSString *tempPath = [finalPath stringByAppendingString:@".tmp"];
+    unlink(tempPath.fileSystemRepresentation);
+    int fd = open(tempPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        CFRelease(source);
+        return NO;
+    }
+
+    uint8_t *scratch = calloc(1, frameBytes);
+    uint8_t *firstFrame = calloc(1, frameBytes);
+    uint8_t *lastFrame = calloc(1, frameBytes);
+    uint8_t *blendFrame = calloc(1, frameBytes);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    NSMutableArray<NSNumber *> *durations = [NSMutableArray arrayWithCapacity:count + kZSGifCrossfadeSteps];
+    BOOL ok = scratch && firstFrame && lastFrame && blendFrame && colorSpace;
+    size_t written = 0;
+
+    for (size_t i = 0; ok && i < count; i++) {
+        @autoreleasepool {
+            CGImageRef image = CGImageSourceCreateImageAtIndex(source, i, (__bridge CFDictionaryRef)@{
+                (__bridge NSString *)kCGImageSourceShouldCache: @NO,
+            });
+            if (!image) {
+                ok = NO;
+            } else {
+                memset(scratch, 0, frameBytes);
+                CGContextRef ctx = CGBitmapContextCreate(scratch, width, height, 8, bytesPerRow, colorSpace,
+                    (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+                if (!ctx) {
+                    ok = NO;
+                } else {
+                    CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+                    CGContextDrawImage(ctx, CGRectMake(-(CGFloat)cropX0, -(CGFloat)(fullHeight - cropY1), (CGFloat)fullWidth, (CGFloat)fullHeight), image);
+                    CGContextRelease(ctx);
+                    ok = zs_gif_write_all(fd, scratch, frameBytes, (off_t)(kZSGifCacheHeaderBytes + written * frameBytes));
+                    if (ok) {
+                        if (i == 0) memcpy(firstFrame, scratch, frameBytes);
+                        if (i == count - 1) memcpy(lastFrame, scratch, frameBytes);
+                        written++;
+
+                        NSTimeInterval duration = 0.06;
+                        NSDictionary *props = (__bridge_transfer NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, i, NULL);
+                        NSDictionary *gifProps = props[(__bridge NSString *)kCGImagePropertyGIFDictionary];
+                        NSNumber *unclamped = gifProps[(__bridge NSString *)kCGImagePropertyGIFUnclampedDelayTime];
+                        NSNumber *clamped = gifProps[(__bridge NSString *)kCGImagePropertyGIFDelayTime];
+                        NSNumber *chosen = unclamped ?: clamped;
+                        if (chosen && chosen.doubleValue > 0.0) duration = chosen.doubleValue;
+                        [durations addObject:@(duration / kZSGifPlaybackRate)];
+                    }
+                }
+                CGImageRelease(image);
+            }
+        }
+    }
     CFRelease(source);
 
-    if (frames.count > 1) {
-        const NSInteger kCrossfadeSteps = 8;
-        UIImage *lastFrame = frames.lastObject;
-        UIImage *firstFrame = frames.firstObject;
+    if (ok && count > 1) {
         NSTimeInterval stepDuration = durations.firstObject.doubleValue > 0 ? durations.firstObject.doubleValue : 0.06;
-        for (NSInteger i = 1; i <= kCrossfadeSteps; i++) {
-            CGFloat t = (CGFloat)i / (CGFloat)(kCrossfadeSteps + 1);
-            UIImage *blended = zs_blend_images(lastFrame, firstFrame, t);
-            if (blended) {
-                [frames addObject:blended];
+        for (NSInteger step = 1; ok && step <= kZSGifCrossfadeSteps; step++) {
+            float t = (float)step / (float)(kZSGifCrossfadeSteps + 1);
+            for (size_t row = 0; row < height; row++) {
+                const uint8_t *from = lastFrame + row * bytesPerRow;
+                const uint8_t *to = firstFrame + row * bytesPerRow;
+                uint8_t *out = blendFrame + row * bytesPerRow;
+                for (size_t x = 0; x < width; x++) {
+                    float toAlpha = to[x * 4 + 3] / 255.0f;
+                    float fromWeight = 1.0f - t * toAlpha;
+                    for (int c = 0; c < 4; c++) {
+                        float v = to[x * 4 + c] * t + from[x * 4 + c] * fromWeight;
+                        out[x * 4 + c] = (uint8_t)MIN(255.0f, v + 0.5f);
+                    }
+                }
+            }
+            ok = zs_gif_write_all(fd, blendFrame, frameBytes, (off_t)(kZSGifCacheHeaderBytes + written * frameBytes));
+            if (ok) {
+                written++;
                 [durations addObject:@(stepDuration)];
             }
         }
     }
 
+    if (ok) {
+        ZSGifCacheHeader header = {
+            .magic = kZSGifCacheMagic,
+            .version = kZSGifCacheVersion,
+            .gifLength = gifData.length,
+            .gifHash = zs_gif_fingerprint(gifData),
+            .frameCount = (uint32_t)written,
+            .width = (uint32_t)width,
+            .height = (uint32_t)height,
+            .bytesPerRow = (uint32_t)bytesPerRow,
+            .frameBytes = frameBytes,
+            .cropX0 = kZSGifContentX0,
+            .cropX1 = kZSGifContentX1,
+            .cropY0 = kZSGifContentY0,
+            .cropY1 = kZSGifContentY1,
+        };
+        double *durationValues = calloc(written, sizeof(double));
+        for (size_t i = 0; i < written; i++) durationValues[i] = durations[i].doubleValue;
+        ok = zs_gif_write_all(fd, &header, sizeof(header), 0)
+            && zs_gif_write_all(fd, durationValues, written * sizeof(double), (off_t)sizeof(header));
+        free(durationValues);
+    }
+
+    free(scratch);
+    free(firstFrame);
+    free(lastFrame);
+    free(blendFrame);
+    if (colorSpace) CGColorSpaceRelease(colorSpace);
+    close(fd);
+
+    if (!ok) {
+        unlink(tempPath.fileSystemRepresentation);
+        return NO;
+    }
+    unlink(finalPath.fileSystemRepresentation);
+    return rename(tempPath.fileSystemRepresentation, finalPath.fileSystemRepresentation) == 0;
+}
+
+static BOOL zs_gif_load_cache(NSData *gifData, NSString *path, NSArray<UIImage *> **outFrames, NSArray<NSNumber *> **outDurations) {
+    int fd = open(path.fileSystemRepresentation, O_RDONLY);
+    if (fd < 0) return NO;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || (size_t)st.st_size < kZSGifCacheHeaderBytes) {
+        close(fd);
+        return NO;
+    }
+
+    void *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return NO;
+
+    const ZSGifCacheHeader *header = map;
+    BOOL valid = header->magic == kZSGifCacheMagic
+        && header->version == kZSGifCacheVersion
+        && header->gifLength == gifData.length
+        && header->gifHash == zs_gif_fingerprint(gifData)
+        && header->frameCount > 0
+        && header->frameCount <= (kZSGifCacheHeaderBytes - sizeof(ZSGifCacheHeader)) / sizeof(double)
+        && header->frameBytes == (uint64_t)header->bytesPerRow * header->height
+        && (uint64_t)st.st_size == kZSGifCacheHeaderBytes + (uint64_t)header->frameCount * header->frameBytes
+        && header->cropX0 == kZSGifContentX0 && header->cropX1 == kZSGifContentX1
+        && header->cropY0 == kZSGifContentY0 && header->cropY1 == kZSGifContentY1;
+    if (!valid) {
+        munmap(map, (size_t)st.st_size);
+        return NO;
+    }
+
+    const double *durationValues = (const double *)((const uint8_t *)map + sizeof(ZSGifCacheHeader));
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    NSMutableArray<UIImage *> *frames = [NSMutableArray arrayWithCapacity:header->frameCount];
+    NSMutableArray<NSNumber *> *durations = [NSMutableArray arrayWithCapacity:header->frameCount];
+
+    for (uint32_t i = 0; i < header->frameCount; i++) {
+        const uint8_t *frameBase = (const uint8_t *)map + kZSGifCacheHeaderBytes + (size_t)i * header->frameBytes;
+        CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, frameBase, header->frameBytes, NULL);
+        CGImageRef image = provider ? CGImageCreate(header->width, header->height, 8, 32, header->bytesPerRow, colorSpace,
+            (CGBitmapInfo)kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
+            provider, NULL, false, kCGRenderingIntentDefault) : NULL;
+        if (provider) CGDataProviderRelease(provider);
+        if (!image) {
+            if (colorSpace) CGColorSpaceRelease(colorSpace);
+            munmap(map, (size_t)st.st_size);
+            return NO;
+        }
+        [frames addObject:[UIImage imageWithCGImage:image scale:1.0 orientation:UIImageOrientationUp]];
+        CGImageRelease(image);
+        [durations addObject:@(durationValues[i])];
+    }
+    if (colorSpace) CGColorSpaceRelease(colorSpace);
+
+    *outFrames = frames;
+    *outDurations = durations;
+    return YES;
+}
+
+- (void)zs_applyLoadedFrames:(NSArray<UIImage *> *)frames durations:(NSArray<NSNumber *> *)durations {
     _frames = frames;
     _frameDurations = durations;
     _totalDuration = 0;
     for (NSNumber *d in durations) _totalDuration += d.doubleValue;
-    ZLog(@"[ZSGifTint] decoded %lu frame(s) (with crossfade padding), total loop duration %.2fs", (unsigned long)_frames.count, _totalDuration);
+    _lastFrameIndex = -1;
+    ZLog(@"[ZSGifTint] mapped %lu file-backed frame(s) (with crossfade padding), total loop duration %.2fs", (unsigned long)_frames.count, _totalDuration);
+    [self startOrStopDisplayLinkAsNeeded];
+}
+
+- (void)decodeFramesIfNeeded {
+    if (_frames.count > 0 || _decodeStarted) return;
+    _decodeStarted = YES;
+
+    NSData *data = zs_embedded_gif_data();
+    NSString *cachePath = zs_gif_cache_path();
+    if (!data || !cachePath) {
+        ZLog(@"[ZSGifTint] couldn't find __DATA,__enkephalin section or cache directory - accent tint disabled");
+        _frames = @[];
+        _frameDurations = @[];
+        return;
+    }
+
+    NSArray<UIImage *> *frames = nil;
+    NSArray<NSNumber *> *durations = nil;
+    if (zs_gif_load_cache(data, cachePath, &frames, &durations)) {
+        [self zs_applyLoadedFrames:frames durations:durations];
+        return;
+    }
+
+    _frames = @[];
+    _frameDurations = @[];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSArray<UIImage *> *builtFrames = nil;
+        NSArray<NSNumber *> *builtDurations = nil;
+        BOOL ok = zs_gif_build_cache(data, cachePath) && zs_gif_load_cache(data, cachePath, &builtFrames, &builtDurations);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ok) {
+                ZLog(@"[ZSGifTint] failed to build the full-resolution frame cache - accent tint disabled");
+                return;
+            }
+            [self zs_applyLoadedFrames:builtFrames durations:builtDurations];
+        });
+    });
 }
 
 - (nullable UIImage *)currentOrFirstFrame {
@@ -317,10 +547,6 @@ BOOL zs_gif_tint_is_disabled(void) {
 
 static const void *kZSGifWindowKey = &kZSGifWindowKey;
 
-static const CGFloat kZSGifContentY0 = 0.44, kZSGifContentY1 = 0.60;
-static const CGFloat kZSGifContentX0 = 0.05, kZSGifContentX1 = 0.95;
-static const CGFloat kZSGifPanWindowWidth = 0.45;
-
 static CGFloat zs_pan_unit_for_owner(UIView *owner) {
     uintptr_t addr = (uintptr_t)(__bridge void *)owner;
     uint32_t h = (uint32_t)(addr ^ (addr >> 16));
@@ -332,8 +558,9 @@ static CGFloat zs_pan_unit_for_owner(UIView *owner) {
 
 static CGRect zs_gif_content_rect(CGFloat panUnit) {
     CGFloat range = (kZSGifContentX1 - kZSGifContentX0) - kZSGifPanWindowWidth;
-    CGFloat x0 = kZSGifContentX0 + panUnit * range;
-    return CGRectMake(x0, kZSGifContentY0, kZSGifPanWindowWidth, kZSGifContentY1 - kZSGifContentY0);
+    CGFloat cropWidth = kZSGifContentX1 - kZSGifContentX0;
+    CGFloat x0 = panUnit * range / cropWidth;
+    return CGRectMake(x0, 0.0, kZSGifPanWindowWidth / cropWidth, 1.0);
 }
 
 static ZSGifWindow *zs_register(UIView *owner, ZSGifWindowKind kind, CALayer *maskLayer, CGRect texLayerFrame, BOOL atBack) {
