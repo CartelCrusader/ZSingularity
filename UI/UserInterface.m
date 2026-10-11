@@ -5801,6 +5801,18 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 
 @end
 
+static BOOL zs_mod_library_has_zeroable_assets(void) {
+    for (NSString *folderName in [ModAssetLibrary folderNames]) {
+        if ([folderName isEqualToString:kZSStoredBundlesFolderName]) continue;
+        NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:nil];
+        for (ModAssetLibraryEntry *entry in entries) {
+            if (entry.localizationKind != ModAssetLibraryLocalizationKindNone) return YES;
+            if ([entry.fileName.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) return YES;
+        }
+    }
+    return NO;
+}
+
 @interface UserInterface : NSObject <UIGestureRecognizerDelegate, UIScrollViewDelegate, UITextFieldDelegate, UIDocumentPickerDelegate, UITextViewDelegate, CLLocationManagerDelegate, UIContextMenuInteractionDelegate, UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UIVisualEffectView *glassContainer;
 @property (nonatomic, strong) UIVisualEffectView *panelGlass;
@@ -5893,6 +5905,7 @@ static UIImage *zs_asset_checkerboard_tile(void) {
 @property (nonatomic, strong) NSMutableArray<NSString *> *loadModsSummaryLines;
 
 @property (nonatomic, strong) UIStackView *modsLibraryStack;
+@property (nonatomic, strong) ZSRow *manifestZeroingRow;
 @property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedFolders;
 @property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedInfoEntries;
 
@@ -8078,6 +8091,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     self.modsOptionsDropdownFolderName = nil;
 
     self.modsLibraryStack = nil;
+    self.manifestZeroingRow = nil;
 
     self.zsFloatingFieldBackdrop = nil;
     self.zsFloatingFieldContainer = nil;
@@ -9054,6 +9068,8 @@ static const CGFloat kContentFadeHeight = 22;
 
     ZSRow *manifestZeroingRow = zs_make_switch_row(@"Manifest zeroing", PatchManifestNetwork.isZeroAllEnabled);
     [manifestZeroingRow.toggle addTarget:self action:@selector(manifestZeroingChanged:) forControlEvents:UIControlEventValueChanged];
+    self.manifestZeroingRow = manifestZeroingRow;
+    [self zs_refreshManifestZeroingRow];
 
     UIButton *manualIndexButton = zs_make_grouped_action_button(@"Manually Index Files", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [manualIndexButton addTarget:self action:@selector(manuallyIndexFilesTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -12890,7 +12906,21 @@ static const NSTimeInterval kDoctorPollInterval = 6.0;
     }];
 }
 
+- (void)zs_refreshManifestZeroingRow {
+    ZSRow *row = self.manifestZeroingRow;
+    if (!row) return;
+
+    BOOL eligible = zs_mod_library_has_zeroable_assets();
+    CGFloat alpha = eligible ? 1.0 : 0.35;
+    row.toggle.enabled = eligible;
+    row.toggle.alpha = alpha;
+    row.titleLabel.alpha = alpha;
+    [row.toggle setOn:(eligible && PatchManifestNetwork.isZeroAllEnabled) animated:NO];
+}
+
 - (void)zs_rebuildModsLibrary {
+    [self zs_refreshManifestZeroingRow];
+
     if (!self.modsLibraryStack) return;
 
     BOOL wasDropdownOpen = self.modsOptionsDropdownOpen;

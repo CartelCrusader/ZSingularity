@@ -1,6 +1,7 @@
 #import "PatchManifestNetwork.h"
 #import "ZTweakLog.h"
 #import "ZSEngine.h"
+#import "Mods.h"
 
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
@@ -23,7 +24,6 @@ static IMP gOrigDidReceiveData;
 static IMP gOrigDidComplete;
 static Class gDelegateClass;
 static BOOL gInstalled;
-static NSMutableSet<NSString *> *gPatchedSuffixes;
 
 static NSMutableDictionary<NSNumber *, NSMutableData *> *gBuffers;
 static dispatch_queue_t gStateQueue;
@@ -54,12 +54,34 @@ static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
     return matchedSuffix != nil;
 }
 
+static BOOL PMIsOnLoginScene(void) {
+    int32_t sceneState = 0;
+    return ZSGlobalScene_Current(&sceneState) && sceneState == ZSGlobalSceneStateLogin;
+}
+
+static NSSet<NSString *> *PMReplacedAssetPaths(void) {
+    NSMutableSet<NSString *> *paths = [NSMutableSet set];
+    for (NSString *path in [BankTransplant documentsRelativePathsOfSwappedBanks]) {
+        [paths addObject:path.lowercaseString];
+    }
+    for (NSString *path in [LocalizationTransplant documentsRelativePathsOfSwappedFiles]) {
+        [paths addObject:path.lowercaseString];
+    }
+    return paths;
+}
+
 static NSData *PMPatchManifestData(NSData *input) {
     if (input.length == 0 || input.length > kMaxManifestBytes) {
         return input;
     }
 
     if (![PatchManifestNetwork isZeroAllEnabled]) {
+        return input;
+    }
+
+    NSSet<NSString *> *replacedPaths = PMReplacedAssetPaths();
+    if (replacedPaths.count == 0) {
+        ZLog(@"[PatchManifestNetwork] no replaced assets - leaving manifest untouched");
         return input;
     }
 
@@ -81,6 +103,8 @@ static NSData *PMPatchManifestData(NSData *input) {
 
     NSUInteger patchedCount = 0;
     for (NSString *key in files) {
+        if (![replacedPaths containsObject:key.lowercaseString]) continue;
+
         NSMutableDictionary *entry = files[key];
         if (![entry isKindOfClass:[NSMutableDictionary class]]) continue;
 
@@ -108,7 +132,7 @@ static NSData *PMPatchManifestData(NSData *input) {
         return input;
     }
 
-    ZLog(@"[PatchManifestNetwork] zeroed Hash/Size on %lu Files entries", (unsigned long)patchedCount);
+    ZLog(@"[PatchManifestNetwork] zeroed Hash/Size on %lu replaced Files entries", (unsigned long)patchedCount);
 
     return output;
 }
@@ -125,6 +149,18 @@ static void PMDidReceiveData(id self,
     }
 
     NSNumber *key = @(task.taskIdentifier);
+    __block BOOL alreadyTracking = NO;
+    dispatch_sync(gStateQueue, ^{
+        alreadyTracking = gBuffers[key] != nil;
+    });
+
+    if (!alreadyTracking && !PMIsOnLoginScene()) {
+        ZLog(@"[PatchManifestNetwork] not on the login scene - passing request through untouched");
+        ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))gOrigDidReceiveData)(
+            self, _cmd, session, task, data);
+        return;
+    }
+
     __block NSMutableData *buffer = nil;
 
     dispatch_sync(gStateQueue, ^{
@@ -164,10 +200,14 @@ static void PMDidComplete(id self,
         [gBuffers removeObjectForKey:key];
     });
 
-    BOOL handled = NO;
+    if (!buffer) {
+        ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))gOrigDidComplete)(
+            self, _cmd, session, task, error);
+        return;
+    }
+
     if (!error && buffer.length > 0 && buffer.length <= kMaxManifestBytes) {
         NSData *patchedData = PMPatchManifestData(buffer);
-        handled = YES;
         ((void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))gOrigDidReceiveData)(
             self,
             @selector(URLSession:dataTask:didReceiveData:),
@@ -181,22 +221,6 @@ static void PMDidComplete(id self,
 
     ((void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))gOrigDidComplete)(
         self, _cmd, session, task, error);
-
-    if (handled) {
-        NSString *matchedSuffix = PMMatchedSuffixForTask(task);
-        @synchronized ([PatchManifestNetwork class]) {
-            if (matchedSuffix) [gPatchedSuffixes addObject:matchedSuffix];
-        }
-
-        int32_t sceneState = 0;
-        BOOL sceneKnown = ZSGlobalScene_Current(&sceneState);
-        if (sceneKnown && sceneState != ZSGlobalSceneStateLogin) {
-            ZLog(@"[PatchManifestNetwork] patched %@ and past the login screen (scene=%d) - deactivating", matchedSuffix, sceneState);
-            [PatchManifestNetwork uninstall];
-        } else {
-            ZLog(@"[PatchManifestNetwork] patched %@ and still on the login screen - staying active", matchedSuffix);
-        }
-    }
 }
 
 static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
@@ -272,7 +296,6 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
         gOrigDidComplete = method_getImplementation(didCompleteMethod);
 
         gBuffers = [NSMutableDictionary dictionary];
-        gPatchedSuffixes = [NSMutableSet set];
         gStateQueue = dispatch_queue_create("com.120F.PatchManifestNetwork", DISPATCH_QUEUE_SERIAL);
 
         method_setImplementation(didReceiveMethod, (IMP)PMDidReceiveData);
@@ -301,7 +324,6 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
         }
 
         gBuffers = nil;
-        gPatchedSuffixes = nil;
         gStateQueue = nil;
         gDelegateClass = Nil;
         gOrigDidReceiveData = NULL;
