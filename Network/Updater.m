@@ -944,6 +944,11 @@ static NSData *zs_patch_entry_data(NSData *data, ZSPatchZipEntry *entry, NSError
         return NO;
     }
     appexPlist[@"CFBundleIdentifier"] = donorID;
+    NSString *displayName = appexPlist[@"CFBundleDisplayName"];
+    if (![displayName isKindOfClass:[NSString class]] || displayName.length == 0) {
+        NSString *bundleName = appexPlist[@"CFBundleName"];
+        appexPlist[@"CFBundleDisplayName"] = ([bundleName isKindOfClass:[NSString class]] && bundleName.length > 0) ? bundleName : kZSPatchDefaultExecutable;
+    }
     NSString *executable = [appexPlist[@"CFBundleExecutable"] isKindOfClass:[NSString class]] ? appexPlist[@"CFBundleExecutable"] : kZSPatchDefaultExecutable;
     NSData *patchedPlist = [NSPropertyListSerialization dataWithPropertyList:appexPlist format:NSPropertyListXMLFormat_v1_0 options:0 error:error];
     if (!patchedPlist) return NO;
