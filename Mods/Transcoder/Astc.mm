@@ -326,7 +326,7 @@ static float zsa_accept_mse(ZSAstcQuality quality) {
     switch (quality) {
         case ZSAstcQualityFast: return 6.0f;
         case ZSAstcQualityHigh: return 0.75f;
-        default: return 2.0f;
+        default: return 6.0f;
     }
 }
 
