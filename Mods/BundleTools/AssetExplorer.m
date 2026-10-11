@@ -3269,6 +3269,7 @@ typedef struct {
 @property (nonatomic, assign) CGAffineTransform worldToPixel;
 @property (nonatomic, assign) NSUInteger reads;
 @property (nonatomic, assign) BOOL truncated;
+@property (nonatomic, copy) NSString *debugFrame;
 @end
 
 @implementation ZSAEAnimScene
@@ -3342,7 +3343,7 @@ static NSUInteger ZSAEAnimStreamCurveTotal(id value) {
     return (NSUInteger)((raw & 0xFFFFu) + ((raw >> 16) & 0xFFFFu));
 }
 
-static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
+static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject, NSString **diag) {
     NSDictionary *fields = clipObject.fields;
     NSDictionary *muscle = ZSAEDict(fields[@"m_MuscleClip"]);
     NSDictionary *container = ZSAEDict(muscle[@"m_Clip"]);
@@ -3492,6 +3493,16 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
         [spriteCurves addObject:@{@"path": ZSAEString(pointerCurve[@"path"]) ?: @"", @"times": times, @"values": values}];
     }
 
+    if (diag) {
+        NSUInteger pptrCurveCount = 0;
+        for (ZSAEAnimCurve *curve in curves) if (curve.pptr) pptrCurveCount++;
+        *diag = [NSString stringWithFormat:@"clip %@ mc=%d cl=%d bind=%lu map=%lu raw=0x%llx exp=%lu+%lu+%lu slots=%lu/%lu use=%@ sd=%lu cur=%lu pp=%lu ed=%lu",
+                 ZSAEString(fields[@"m_Name"]) ?: @"?", muscle ? 1 : 0, clipData ? 1 : 0,
+                 (unsigned long)ZSAEArray(bindingConstant[@"genericBindings"]).count, (unsigned long)ZSAEArray(bindingConstant[@"pptrCurveMapping"]).count,
+                 (unsigned long long)ZSAEInt(streamed[@"curveCount"]), (unsigned long)expectedStream, (unsigned long)expectedDense, (unsigned long)(expectedConstantData.length / sizeof(float)),
+                 (unsigned long)skipSlots.count, (unsigned long)countSlots.count, slots == countSlots ? @"cnt" : @"skp",
+                 (unsigned long)(streamData.length / 4), (unsigned long)curves.count, (unsigned long)pptrCurveCount, (unsigned long)spriteCurves.count];
+    }
     if (curves.count == 0 && spriteCurves.count == 0) return nil;
 
     double span = ZSAEDouble(muscle[@"m_StopTime"]) - ZSAEDouble(muscle[@"m_StartTime"]);
@@ -3512,14 +3523,17 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
     return clip;
 }
 
-static ZSAEAnimClip *ZSAEAnimLoadClip(ZSAEContext *context, ZSAEObject *owner, id pointer, NSMutableDictionary<NSString *, id> *cache) {
+static ZSAEAnimClip *ZSAEAnimLoadClip(ZSAEContext *context, ZSAEObject *owner, id pointer, NSMutableDictionary<NSString *, id> *cache, NSMutableArray<NSString *> *log) {
     NSDictionary *reference = ZSAEDict(pointer);
     if (!reference || ZSAEInt(reference[@"m_PathID"]) == 0) return nil;
     NSString *key = [NSString stringWithFormat:@"%p:%lld:%lld", owner.session, (long long)ZSAEInt(reference[@"m_FileID"]), (long long)ZSAEInt(reference[@"m_PathID"])];
     id cached = cache[key];
     if (cached) return [cached isKindOfClass:[ZSAEAnimClip class]] ? cached : nil;
     ZSAEObject *clipObject = ZSAEResolvePPtr(context, owner, reference, NULL);
-    ZSAEAnimClip *clip = (clipObject && clipObject.classID == 74) ? ZSAEDecodeAnimClip(clipObject) : nil;
+    NSString *diag = nil;
+    ZSAEAnimClip *clip = (clipObject && clipObject.classID == 74) ? ZSAEDecodeAnimClip(clipObject, &diag) : nil;
+    if (!diag) diag = [NSString stringWithFormat:@"clip pid=%lld unresolved=%d cls=%d", (long long)ZSAEInt(reference[@"m_PathID"]), clipObject ? 0 : 1, clipObject ? (int)clipObject.classID : -1];
+    if (log && log.count < 24) [log addObject:[diag stringByAppendingString:clip ? @"" : @" NIL"]];
     cache[key] = clip ?: (id)[NSNull null];
     return clip;
 }
@@ -3967,12 +3981,25 @@ static NSUInteger ZSAEAnimEvaluate(ZSAEAnimScene *scene, double time, ZSAEAnimIt
 
     NSUInteger emitted = 0;
     NSUInteger spriteCount = scene.sprites.count;
+    NSUInteger rendererCount = 0;
+    NSUInteger spriteSet = 0;
+    NSUInteger hiddenCount = 0;
+    NSUInteger missingCount = 0;
+    NSMutableString *spriteList = [NSMutableString string];
     for (NSUInteger i = 0; i < count; i++) {
         ZSAEAnimNode *node = nodes[i];
         ZSAENodeState *state = &states[i];
         NSInteger parent = node.parent;
         BOOL parentVisible = parent >= 0 ? visible[parent] : YES;
         visible[i] = parentVisible && !node.excluded && state->v[ZSAEChActive] > 0.5;
+        if (node.hasRenderer) {
+            rendererCount++;
+            if (!visible[i]) hiddenCount++;
+            if (state->sprite >= 0) {
+                spriteSet++;
+                if (spriteList.length < 90) [spriteList appendFormat:@" n%lu=s%d", (unsigned long)i, state->sprite];
+            }
+        }
 
         double angle = ZSAEAnimAngle(state);
         CGAffineTransform local = CGAffineTransformMakeScale(state->v[ZSAEChSX], state->v[ZSAEChSY]);
@@ -3983,7 +4010,10 @@ static NSUInteger ZSAEAnimEvaluate(ZSAEAnimScene *scene, double time, ZSAEAnimIt
 
         if (!visible[i] || !node.hasRenderer || state->v[ZSAEChEnabled] <= 0.5) continue;
         if (state->sprite < 0 || (NSUInteger)state->sprite >= spriteCount) continue;
-        if (![scene.sprites[(NSUInteger)state->sprite] isKindOfClass:[ZSAESpriteImage class]]) continue;
+        if (![scene.sprites[(NSUInteger)state->sprite] isKindOfClass:[ZSAESpriteImage class]]) {
+            missingCount++;
+            continue;
+        }
 
         ZSAEAnimItem *item = &items[emitted++];
         item->sprite = state->sprite;
@@ -4000,6 +4030,7 @@ static NSUInteger ZSAEAnimEvaluate(ZSAEAnimScene *scene, double time, ZSAEAnimIt
         item->index = (int32_t)i;
     }
 
+    scene.debugFrame = [NSString stringWithFormat:@"t=%.2f nodes=%lu rend=%lu set=%lu hid=%lu miss=%lu shown=%lu |%@", time, (unsigned long)count, (unsigned long)rendererCount, (unsigned long)spriteSet, (unsigned long)hiddenCount, (unsigned long)missingCount, (unsigned long)emitted, spriteList];
     free(states);
     free(worlds);
     free(worldZ);
@@ -4089,7 +4120,14 @@ static UIImage *ZSAEAnimRender(ZSAEAnimScene *scene, double time) {
     return image;
 }
 
-static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSAEObject *object, NSArray<NSDictionary *> *rows, double total, NSString *title, NSString **failure) {
+static NSString *ZSAEDebugJoin(NSArray<NSString *> *lines) {
+    if (lines.count <= 40) return [lines componentsJoinedByString:@"\n"];
+    NSMutableArray<NSString *> *limited = [NSMutableArray arrayWithArray:[lines subarrayWithRange:NSMakeRange(0, 39)]];
+    [limited addObject:lines.lastObject];
+    return [limited componentsJoinedByString:@"\n"];
+}
+
+static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSAEObject *object, NSArray<NSDictionary *> *rows, double total, NSString *title, NSMutableArray<NSString *> *lines, NSString **failure) {
     ZSAEAnimScene *scene = [ZSAEAnimScene new];
     scene.nodes = [NSMutableArray array];
     scene.roots = [NSMutableArray array];
@@ -4115,7 +4153,9 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
         }
     }
 
+    [lines addObject:[NSString stringWithFormat:@"rows=%lu total=%.2fs dir=%lu anim=%lu assets=%lu", (unsigned long)rows.count, total, (unsigned long)directors.count, (unsigned long)animators.count, (unsigned long)assets.count]];
     NSMutableDictionary<NSString *, id> *clipCache = [NSMutableDictionary dictionary];
+    NSUInteger rowNumber = 0;
     NSUInteger decodedClips = 0;
     NSUInteger animationTracks = 0;
     NSUInteger unboundTracks = 0;
@@ -4135,7 +4175,7 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
             if (ZSAEInt(assetPointer[@"m_PathID"]) == 0) continue;
             ZSAEObject *playable = ZSAEResolvePPtr(context, trackObject, assetPointer, NULL);
             if (!playable) continue;
-            ZSAEAnimClip *clip = ZSAEAnimLoadClip(context, playable, playable.fields[@"m_Clip"], clipCache);
+            ZSAEAnimClip *clip = ZSAEAnimLoadClip(context, playable, playable.fields[@"m_Clip"], clipCache, lines);
             if (!clip) continue;
             ZSAEAnimTrackClip *trackClip = [ZSAEAnimTrackClip new];
             trackClip.clip = clip;
@@ -4155,13 +4195,22 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
         ZSAEAnimTrackClip *baseClip = nil;
         NSDictionary *infinitePointer = row[@"infinitePtr"];
         if (ZSAEInt(infinitePointer[@"m_PathID"]) != 0) {
-            ZSAEAnimClip *clip = ZSAEAnimLoadClip(context, trackObject, infinitePointer, clipCache);
+            ZSAEAnimClip *clip = ZSAEAnimLoadClip(context, trackObject, infinitePointer, clipCache, lines);
             if (clip) {
                 baseClip = [ZSAEAnimTrackClip new];
                 baseClip.clip = clip;
                 baseClip.timeScale = 1;
                 decodedClips++;
             }
+        }
+        rowNumber++;
+        if (rowNumber <= 12) {
+            NSMutableString *timing = [NSMutableString string];
+            for (NSUInteger k = 0; k < trackClips.count && k < 2; k++) {
+                ZSAEAnimTrackClip *timed = trackClips[k];
+                [timing appendFormat:@" c%lu=%.2f+%.2f ts%.2f ci%.2f", (unsigned long)k, timed.start, timed.duration, timed.timeScale, timed.clipIn];
+            }
+            [lines addObject:[NSString stringWithFormat:@"T%lu %@ clips=%lu/%lu base=%d inf=%lld%@", (unsigned long)rowNumber, row[@"name"], (unsigned long)trackClips.count, (unsigned long)[row[@"clips"] count], baseClip ? 1 : 0, (long long)ZSAEInt(infinitePointer[@"m_PathID"]), timing]];
         }
         if (trackClips.count == 0 && !baseClip) continue;
         animationTracks++;
@@ -4202,12 +4251,15 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
                 }
             }
         }
+        BOOL synthetic = NO;
         if (rootIndex < 0 && hashes.count > 0) {
             rootIndex = ZSAEAnimEnsureSyntheticRoot(scene, @"synthetic");
             ZSAEAnimSynthesizeNodes(scene, rootIndex, hashes, spriteHashes, (int32_t)animationTracks);
+            synthetic = YES;
         }
         if (rootIndex < 0) {
             unboundTracks++;
+            if (rowNumber <= 12) [lines addObject:[NSString stringWithFormat:@"T%lu rig=none hashes=%lu", (unsigned long)rowNumber, (unsigned long)hashes.count]];
             continue;
         }
         ZSAEAnimRoot *root = scene.roots[(NSUInteger)rootIndex];
@@ -4221,6 +4273,26 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
         }
         play.clips = trackClips;
         [scene.tracks addObject:play];
+        if (rowNumber <= 12) {
+            NSMutableArray<ZSAEAnimTrackClip *> *bindList = [NSMutableArray arrayWithArray:trackClips];
+            if (baseClip) [bindList addObject:baseClip];
+            NSUInteger spriteBoundTotal = 0;
+            NSUInteger floatBoundTotal = 0;
+            NSString *firstSprite = @"";
+            for (ZSAEAnimTrackClip *bound in bindList) {
+                floatBoundTotal += bound.bounds.count;
+                for (ZSAEAnimSpriteBound *spriteBound in bound.spriteBounds) {
+                    NSUInteger keyTotal = spriteBound.times.length / sizeof(double);
+                    if (spriteBoundTotal == 0 && keyTotal > 0) {
+                        const double *times = (const double *)spriteBound.times.bytes;
+                        const int32_t *picks = (const int32_t *)spriteBound.sprites.bytes;
+                        firstSprite = [NSString stringWithFormat:@" sb0 n%d k=%lu t=%g..%g s=%d..%d", spriteBound.node, (unsigned long)keyTotal, times[0], times[keyTotal - 1], picks[0], picks[keyTotal - 1]];
+                    }
+                    spriteBoundTotal++;
+                }
+            }
+            [lines addObject:[NSString stringWithFormat:@"T%lu rig=%@ root=%ld hashes=%lu spr=%lu flt=%lu%@", (unsigned long)rowNumber, synthetic ? @"synth" : @"real", (long)rootIndex, (unsigned long)hashes.count, (unsigned long)spriteBoundTotal, (unsigned long)floatBoundTotal, firstSprite]];
+        }
     }
 
     if (scene.tracks.count == 0) {
@@ -4268,14 +4340,18 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
     spriteCache[@"atlases"] = [NSMutableDictionary dictionary];
     spriteCache[@"textures"] = [NSMutableDictionary dictionary];
     NSUInteger decodedSprites = 0;
+    NSString *firstSpriteError = nil;
     for (NSNumber *index in order) {
         NSError *spriteError = nil;
         ZSAESpriteImage *image = ZSAEMakeSpriteImage(context, spriteObjects[index.unsignedIntegerValue], spriteCache, &spriteError);
         if (image) {
             scene.sprites[index.unsignedIntegerValue] = image;
             decodedSprites++;
+        } else if (!firstSpriteError) {
+            firstSpriteError = spriteError.localizedDescription ?: @"nil";
         }
     }
+    [lines addObject:[NSString stringWithFormat:@"nodes=%lu roots=%lu refs=%lu objs=%lu dec=%lu bound=%lu/%lu swaps=%lu anim=%lu%@", (unsigned long)scene.nodes.count, (unsigned long)scene.roots.count, (unsigned long)refCount, (unsigned long)order.count, (unsigned long)decodedSprites, (unsigned long)boundCount, (unsigned long)mappableCount, (unsigned long)spriteSwaps, (unsigned long)animatedCurves, firstSpriteError ? [NSString stringWithFormat:@" err=%@", firstSpriteError] : @""]];
     if (decodedSprites == 0) {
         *failure = @"None of the sprites could be decoded";
         return nil;
@@ -4312,8 +4388,14 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
     scene.worldToPixel = CGAffineTransformMake(scale, 0, 0, -scale, -minX * scale + pad, maxY * scale + pad);
 
     double loopLength = total + 0.5;
+    [lines addObject:[NSString stringWithFormat:@"bounds=%.2fx%.2f ppu=%.0f canvas=%.0fx%.0f loop=%.2f", boundsWidth, boundsHeight, maxPPU, scene.canvasSize.width, scene.canvasSize.height, loopLength]];
+    NSString *staticDebug = ZSAEDebugJoin(lines);
     ZSAssetExplorerVisual *visual = [ZSAssetExplorerVisual new];
     visual.name = title;
+    visual.debugText = staticDebug;
+    visual.liveDebugProvider = ^NSString *(NSTimeInterval elapsed) {
+        return [NSString stringWithFormat:@"%@\n%@", staticDebug, scene.debugFrame ?: @""];
+    };
     visual.summary = [NSString stringWithFormat:@"%@  •  Animation  •  %lu %@  •  %lu %@  •  %@  •  %lu/%lu curves bound%@%@", title.length > 0 ? title : @"Track",
                       (unsigned long)scene.tracks.count, scene.tracks.count == 1 ? @"track" : @"tracks",
                       (unsigned long)decodedSprites, decodedSprites == 1 ? @"sprite" : @"sprites",
@@ -4369,13 +4451,16 @@ static ZSAssetExplorerVisual *ZSAEBuildTimelineVisual(ZSAEContext *context, ZSAE
     double capturedTotal = total;
     NSString *name = ZSAEString(object.fields[@"m_Name"]);
     NSString *failure = nil;
-    ZSAssetExplorerVisual *animated = ZSAEBuildAnimationVisual(context, object, captured, total, name, &failure);
+    NSMutableArray<NSString *> *debugLines = [NSMutableArray array];
+    ZSAssetExplorerVisual *animated = ZSAEBuildAnimationVisual(context, object, captured, total, name, debugLines, &failure);
     if (animated) return animated;
+    if (failure.length > 0) [debugLines addObject:[NSString stringWithFormat:@"FAIL %@", failure]];
     ZSAssetExplorerVisual *visual = [ZSAssetExplorerVisual new];
     visual.name = name;
     visual.summary = [NSString stringWithFormat:@"%@  •  Timeline  •  %lu %@  •  %lu %@  •  %@", name.length > 0 ? name : @"Track", (unsigned long)clipCount, clipCount == 1 ? @"clip" : @"clips", (unsigned long)captured.count, captured.count == 1 ? @"track" : @"tracks", ZSAETimelineSeconds(total)];
     if (failure.length > 0) visual.summary = [visual.summary stringByAppendingFormat:@"  •  No playback: %@", failure];
     visual.pageLabels = @[@"Timeline"];
+    visual.debugText = ZSAEDebugJoin(debugLines);
     visual.imageProvider = ^UIImage *(NSInteger page, NSError **providerError) {
         return ZSAERenderTimeline(captured, capturedTotal);
     };

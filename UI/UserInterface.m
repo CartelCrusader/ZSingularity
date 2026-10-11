@@ -6027,6 +6027,7 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, strong) UITextView *assetExplorerTextView;
 @property (nonatomic, strong) UILabel *assetExplorerTextureMessageLabel;
 @property (nonatomic, strong) UILabel *assetExplorerTextureCaptionLabel;
+@property (nonatomic, strong) UILabel *assetExplorerDebugLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *assetExplorerTextureSpinner;
 @property (nonatomic, strong) NSArray<ZSAssetExplorerBundle *> *assetExplorerBundles;
 @property (nonatomic, assign) NSUInteger assetExplorerNamesSession;
@@ -8151,6 +8152,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     self.assetExplorerTextView = nil;
     self.assetExplorerTextureMessageLabel = nil;
     self.assetExplorerTextureCaptionLabel = nil;
+    self.assetExplorerDebugLabel = nil;
     self.assetExplorerTextureSpinner = nil;
     self.assetExplorerBundles = nil;
     self.assetExplorerAssets = nil;
@@ -15710,6 +15712,22 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     [overlay addSubview:textureMessage];
     self.assetExplorerTextureMessageLabel = textureMessage;
 
+    UILabel *debugLabel = [[UILabel alloc] init];
+    debugLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    debugLabel.font = zs_mono_font(8, UIFontWeightMedium);
+    debugLabel.textColor = UIColor.whiteColor;
+    debugLabel.numberOfLines = 0;
+    debugLabel.textAlignment = NSTextAlignmentLeft;
+    debugLabel.userInteractionEnabled = NO;
+    debugLabel.layer.shadowColor = UIColor.blackColor.CGColor;
+    debugLabel.layer.shadowOpacity = 1;
+    debugLabel.layer.shadowRadius = 2;
+    debugLabel.layer.shadowOffset = CGSizeMake(0, 1);
+    debugLabel.layer.masksToBounds = NO;
+    debugLabel.hidden = YES;
+    [overlay addSubview:debugLabel];
+    self.assetExplorerDebugLabel = debugLabel;
+
     UIActivityIndicatorView *textureSpinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     textureSpinner.translatesAutoresizingMaskIntoConstraints = NO;
     textureSpinner.color = [UIColor colorWithWhite:1 alpha:0.7];
@@ -15899,6 +15917,9 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
         [textureCaption.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
         [textureCaption.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
         [textureCaption.bottomAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.bottomAnchor constant:-8],
+        [debugLabel.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
+        [debugLabel.bottomAnchor constraintEqualToAnchor:textureCaption.topAnchor constant:-8],
+        [debugLabel.widthAnchor constraintLessThanOrEqualToAnchor:overlay.widthAnchor multiplier:0.8],
 
         [previewClip.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
         [previewClip.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
@@ -16214,6 +16235,7 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
     self.assetExplorerTextView.hidden = YES;
     self.assetExplorerTextView.text = @"";
     self.assetExplorerTextureCaptionLabel.hidden = !visible;
+    if (!visible) [self zs_assetExplorerSetDebugText:nil];
     self.assetExplorerBackdropView.hidden = !visible;
     self.assetExplorerTexturePagerStack.hidden = !visible;
     self.assetExplorerModeControl.hidden = YES;
@@ -16261,6 +16283,13 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
     [self zs_assetExplorerLoadTextureAtCurrentIndex];
 }
 
+- (void)zs_assetExplorerSetDebugText:(NSString *)text {
+    UILabel *label = self.assetExplorerDebugLabel;
+    BOOL show = text.length > 0 && self.assetExplorerTextureOpen && !self.assetExplorerDataMode;
+    label.text = show ? text : nil;
+    label.hidden = !show;
+}
+
 - (void)zs_assetExplorerLoadTextureAtCurrentIndex {
     ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
     NSInteger index = self.assetExplorerTextureIndex;
@@ -16286,6 +16315,7 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
     self.assetExplorerBackdropView.hidden = NO;
     self.assetExplorerTextureMessageLabel.hidden = YES;
     self.assetExplorerTextureCaptionLabel.text = asset.assetName.length > 0 ? asset.assetName : asset.typeName;
+    [self zs_assetExplorerSetDebugText:nil];
     [self.assetExplorerTextureSpinner startAnimating];
     self.assetExplorerTextureExportButton.enabled = NO;
     self.assetExplorerTextureExportButton.alpha = 0.35;
@@ -16311,6 +16341,7 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
                 NSString *summary = visual.summary.length > 0 ? visual.summary : visual.name;
                 if (isText) summary = [NSString stringWithFormat:@"%@  •  %@", asset.typeName ?: @"Asset", summary ?: @""];
                 strongSelf.assetExplorerTextureCaptionLabel.text = summary;
+                [strongSelf zs_assetExplorerSetDebugText:visual.debugText];
                 [strongSelf zs_assetExplorerSyncPagePager];
                 [strongSelf zs_assetExplorerSyncModeControl];
             }
@@ -16362,11 +16393,13 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
         self.assetExplorerTextureImageView.hidden = YES;
         self.assetExplorerBackdropView.hidden = YES;
         self.assetExplorerTextureMessageLabel.hidden = YES;
+        [self zs_assetExplorerSetDebugText:nil];
         [self.assetExplorerTextureSpinner stopAnimating];
         [self zs_assetExplorerSyncPagePager];
         [self zs_assetExplorerLoadDataForCurrentAsset];
         return;
     }
+    [self zs_assetExplorerSetDebugText:visual.debugText];
     self.assetExplorerDataToken += 1;
     self.assetExplorerTextView.hidden = YES;
     self.assetExplorerTextView.text = @"";
@@ -16502,6 +16535,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 
     NSUInteger token = self.assetExplorerLiveToken;
     ZSAssetExplorerLiveFrameProvider provider = visual.liveFrameProvider;
+    ZSAssetExplorerLiveDebugProvider debugProvider = visual.liveDebugProvider;
     dispatch_queue_t queue = zs_asset_explorer_live_queue();
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     uint64_t interval = NSEC_PER_SEC / 30;
@@ -16515,6 +16549,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         NSTimeInterval elapsed = CACurrentMediaTime() - origin;
         UIImage *frame = provider(elapsed);
         if (!frame) return;
+        NSString *debugLine = debugProvider ? debugProvider(elapsed) : nil;
         pending = YES;
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
@@ -16522,6 +16557,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
             if (current) {
                 if (strongSelf.assetExplorerFullScreenOpen && strongSelf.assetExplorerTextureOpen && strongSelf.assetExplorerVisual == visual && strongSelf.assetExplorerPageIndex == page) {
                     strongSelf.assetExplorerTextureImageView.image = frame;
+                    if (debugLine.length > 0 && !strongSelf.assetExplorerDebugLabel.hidden) strongSelf.assetExplorerDebugLabel.text = debugLine;
                     strongSelf.assetExplorerLiveElapsed = elapsed;
                 } else {
                     [strongSelf zs_assetExplorerStopLive];

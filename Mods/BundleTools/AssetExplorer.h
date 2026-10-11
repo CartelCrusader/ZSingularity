@@ -46,6 +46,7 @@ typedef NS_ENUM(NSInteger, ZSAssetExplorerErrorCode) {
 
 typedef UIImage * _Nullable (^ZSAssetExplorerPageProvider)(NSInteger page, NSError * _Nullable * _Nullable error);
 typedef UIImage * _Nullable (^ZSAssetExplorerLiveFrameProvider)(NSTimeInterval elapsed);
+typedef NSString * _Nullable (^ZSAssetExplorerLiveDebugProvider)(NSTimeInterval elapsed);
 
 @interface ZSAssetExplorerVisual : NSObject
 @property (nonatomic, copy, nullable) NSString *name;
@@ -53,6 +54,8 @@ typedef UIImage * _Nullable (^ZSAssetExplorerLiveFrameProvider)(NSTimeInterval e
 @property (nonatomic, copy) NSArray<NSString *> *pageLabels;
 @property (nonatomic, copy, nullable) ZSAssetExplorerPageProvider imageProvider;
 @property (nonatomic, copy, nullable) ZSAssetExplorerLiveFrameProvider liveFrameProvider;
+@property (nonatomic, copy, nullable) ZSAssetExplorerLiveDebugProvider liveDebugProvider;
+@property (nonatomic, copy, nullable) NSString *debugText;
 @property (nonatomic, assign) NSInteger livePageIndex;
 @property (nonatomic, copy, nullable) NSString *text;
 @property (nonatomic, copy, nullable) NSData *exportData;
