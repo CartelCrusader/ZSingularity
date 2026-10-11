@@ -3165,6 +3165,7 @@ typedef struct {
 @property (nonatomic, assign) uint32_t attribute;
 @property (nonatomic, assign) int32_t typeID;
 @property (nonatomic, assign) int32_t component;
+@property (nonatomic, assign) BOOL pptr;
 @property (nonatomic, strong) NSData *keys;
 @end
 
@@ -3175,6 +3176,7 @@ typedef struct {
 @property (nonatomic, strong) ZSAEObject *owner;
 @property (nonatomic, copy) NSArray<ZSAEAnimCurve *> *curves;
 @property (nonatomic, copy) NSArray<NSDictionary *> *spriteCurves;
+@property (nonatomic, copy) NSArray<NSDictionary *> *pptrMapping;
 @property (nonatomic, assign) double span;
 @property (nonatomic, assign) BOOL loop;
 @end
@@ -3356,7 +3358,7 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
         NSDictionary *binding = ZSAEDict(entry);
         if (!binding) continue;
         if (ZSAEInt(binding[@"isPPtrCurve"]) != 0) {
-            [countSlots addObject:@{@"p": @0, @"a": @0, @"t": @(-1), @"c": @0}];
+            [countSlots addObject:@{@"p": @((uint32_t)ZSAEInt(binding[@"path"])), @"a": @((uint32_t)ZSAEInt(binding[@"attribute"])), @"t": @(-1), @"c": @0, @"x": @YES}];
             continue;
         }
         int32_t typeID = (int32_t)ZSAEInt(binding[@"typeID"]);
@@ -3384,6 +3386,7 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
         curve.attribute = (uint32_t)ZSAEInt(slot[@"a"]);
         curve.typeID = (int32_t)ZSAEInt(slot[@"t"]);
         curve.component = (int32_t)ZSAEInt(slot[@"c"]);
+        curve.pptr = [slot[@"x"] boolValue];
         curve.keys = keys;
         [curves addObject:curve];
     };
@@ -3488,8 +3491,15 @@ static ZSAEAnimClip *ZSAEDecodeAnimClip(ZSAEObject *clipObject) {
 
     double span = ZSAEDouble(muscle[@"m_StopTime"]) - ZSAEDouble(muscle[@"m_StartTime"]);
     if (!(span > 1e-6)) span = lastTime;
+    NSMutableArray<NSDictionary *> *pptrMapping = [NSMutableArray array];
+    for (id entry in ZSAEArray(bindingConstant[@"pptrCurveMapping"])) {
+        NSDictionary *pointer = ZSAEDict(entry);
+        [pptrMapping addObject:pointer ?: @{}];
+    }
+
     ZSAEAnimClip *clip = [ZSAEAnimClip new];
     clip.owner = clipObject;
+    clip.pptrMapping = pptrMapping;
     clip.curves = curves;
     clip.spriteCurves = spriteCurves;
     clip.span = span;
@@ -3635,6 +3645,68 @@ static NSInteger ZSAEAnimEnsureRoot(ZSAEContext *context, ZSAEAnimScene *scene, 
     return rootIndex;
 }
 
+static ZSAEAnimNode *ZSAEAnimBlankNode(NSString *name, NSInteger parent, NSInteger rootIndex) {
+    ZSAEAnimNode *node = [ZSAEAnimNode new];
+    node.name = name;
+    node.path = name;
+    node.parent = parent;
+    node.root = rootIndex;
+    node.active = YES;
+    node.qw = 1;
+    node.sx = 1;
+    node.sy = 1;
+    node.cr = 1;
+    node.cg = 1;
+    node.cb = 1;
+    node.ca = 1;
+    node.rendererEnabled = YES;
+    node.baseSprite = -1;
+    return node;
+}
+
+static NSInteger ZSAEAnimEnsureSyntheticRoot(ZSAEAnimScene *scene, NSString *key) {
+    NSNumber *existing = scene.rootIndexByKey[key];
+    if (existing) return existing.integerValue;
+    NSInteger rootIndex = (NSInteger)scene.roots.count;
+    ZSAEAnimRoot *root = [ZSAEAnimRoot new];
+    root.firstNode = (NSInteger)scene.nodes.count;
+    [scene.nodes addObject:ZSAEAnimBlankNode(@"", -1, rootIndex)];
+    root.hashToNode = @{@0: @(root.firstNode)};
+    root.pathToNode = @{@"": @(root.firstNode)};
+    [scene.roots addObject:root];
+    scene.rootIndexByKey[key] = @(rootIndex);
+    return rootIndex;
+}
+
+static void ZSAEAnimSynthesizeNodes(ZSAEAnimScene *scene, NSInteger rootIndex, NSSet<NSNumber *> *hashes, NSSet<NSNumber *> *spriteHashes, int32_t order) {
+    ZSAEAnimRoot *root = scene.roots[(NSUInteger)rootIndex];
+    NSMutableDictionary<NSNumber *, NSNumber *> *hashMap = [root.hashToNode mutableCopy];
+    NSMutableDictionary<NSString *, NSNumber *> *pathMap = [root.pathToNode mutableCopy];
+    for (NSNumber *hash in hashes) {
+        NSNumber *index = hashMap[hash];
+        if (!index) {
+            if (scene.nodes.count >= 4000) {
+                scene.truncated = YES;
+                continue;
+            }
+            NSString *name = [NSString stringWithFormat:@"%08x", hash.unsignedIntValue];
+            index = @(scene.nodes.count);
+            [scene.nodes addObject:ZSAEAnimBlankNode(name, root.firstNode, rootIndex)];
+            hashMap[hash] = index;
+            pathMap[name] = index;
+        }
+        if ([spriteHashes containsObject:hash]) {
+            ZSAEAnimNode *node = scene.nodes[index.unsignedIntegerValue];
+            if (!node.hasRenderer) {
+                node.hasRenderer = YES;
+                node.order = order;
+            }
+        }
+    }
+    root.hashToNode = hashMap;
+    root.pathToNode = pathMap;
+}
+
 static ZSAEObject *ZSAEAnimBoundTarget(ZSAEContext *context, ZSAEAnimScene *scene, NSArray<ZSAEObject *> *directors, int64_t trackPathID, NSString **rootKey) {
     for (ZSAEObject *director in directors) {
         for (id entry in ZSAEArray(director.fields[@"m_SceneBindings"])) {
@@ -3668,7 +3740,32 @@ static ZSAEObject *ZSAEAnimBoundTarget(ZSAEContext *context, ZSAEAnimScene *scen
 static void ZSAEAnimBindClip(ZSAEAnimScene *scene, ZSAEAnimRoot *root, ZSAEAnimTrackClip *trackClip, NSUInteger *boundCount, NSUInteger *mappableCount) {
     ZSAEAnimClip *clip = trackClip.clip;
     NSMutableArray<ZSAEAnimBound *> *bounds = [NSMutableArray array];
+    NSMutableArray<ZSAEAnimSpriteBound *> *spriteBounds = [NSMutableArray array];
     for (ZSAEAnimCurve *curve in clip.curves) {
+        if (curve.pptr) {
+            (*mappableCount)++;
+            NSNumber *pptrNode = root.hashToNode[@(curve.pathHash)];
+            NSUInteger keyCount = curve.keys.length / sizeof(ZSAEAnimKey);
+            if (!pptrNode || keyCount == 0 || clip.pptrMapping.count == 0) continue;
+            const ZSAEAnimKey *keys = (const ZSAEAnimKey *)curve.keys.bytes;
+            NSMutableData *timeData = [NSMutableData dataWithCapacity:keyCount * sizeof(double)];
+            NSMutableData *spriteData = [NSMutableData dataWithCapacity:keyCount * sizeof(int32_t)];
+            for (NSUInteger k = 0; k < keyCount; k++) {
+                double time = keys[k].t;
+                long long mapped = llroundf(keys[k].c[3]);
+                int32_t sprite = -1;
+                if (mapped >= 0 && (NSUInteger)mapped < clip.pptrMapping.count) sprite = ZSAEAnimRegisterSprite(scene, clip.owner, clip.pptrMapping[(NSUInteger)mapped]);
+                [timeData appendBytes:&time length:sizeof(time)];
+                [spriteData appendBytes:&sprite length:sizeof(sprite)];
+            }
+            ZSAEAnimSpriteBound *pptrBound = [ZSAEAnimSpriteBound new];
+            pptrBound.node = (int32_t)pptrNode.integerValue;
+            pptrBound.times = timeData;
+            pptrBound.sprites = spriteData;
+            [spriteBounds addObject:pptrBound];
+            (*boundCount)++;
+            continue;
+        }
         int channel = ZSAEAnimChannelFor(curve.typeID, curve.attribute, curve.component);
         if (channel < 0) continue;
         (*mappableCount)++;
@@ -3681,7 +3778,6 @@ static void ZSAEAnimBindClip(ZSAEAnimScene *scene, ZSAEAnimRoot *root, ZSAEAnimT
         [bounds addObject:bound];
         (*boundCount)++;
     }
-    NSMutableArray<ZSAEAnimSpriteBound *> *spriteBounds = [NSMutableArray array];
     for (NSDictionary *spriteCurve in clip.spriteCurves) {
         NSString *path = spriteCurve[@"path"];
         NSNumber *node = root.pathToNode[path] ?: root.hashToNode[@(ZSAECRC32(path.UTF8String ?: ""))];
@@ -4066,8 +4162,17 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
         animationTracks++;
 
         NSMutableSet<NSNumber *> *hashes = [NSMutableSet set];
-        for (ZSAEAnimTrackClip *trackClip in trackClips) for (ZSAEAnimCurve *curve in trackClip.clip.curves) [hashes addObject:@(curve.pathHash)];
-        for (ZSAEAnimCurve *curve in baseClip.clip.curves) [hashes addObject:@(curve.pathHash)];
+        NSMutableSet<NSNumber *> *spriteHashes = [NSMutableSet set];
+        for (ZSAEAnimTrackClip *trackClip in trackClips) {
+            for (ZSAEAnimCurve *curve in trackClip.clip.curves) {
+                [hashes addObject:@(curve.pathHash)];
+                if (curve.pptr) [spriteHashes addObject:@(curve.pathHash)];
+            }
+        }
+        for (ZSAEAnimCurve *curve in baseClip.clip.curves) {
+            [hashes addObject:@(curve.pathHash)];
+            if (curve.pptr) [spriteHashes addObject:@(curve.pathHash)];
+        }
 
         NSString *rootKey = nil;
         ZSAEObject *rootObject = ZSAEAnimBoundTarget(context, scene, directors, trackPathID, &rootKey);
@@ -4091,6 +4196,10 @@ static ZSAssetExplorerVisual *ZSAEBuildAnimationVisual(ZSAEContext *context, ZSA
                     rootIndex = candidateIndex;
                 }
             }
+        }
+        if (rootIndex < 0 && hashes.count > 0) {
+            rootIndex = ZSAEAnimEnsureSyntheticRoot(scene, @"synthetic");
+            ZSAEAnimSynthesizeNodes(scene, rootIndex, hashes, spriteHashes, (int32_t)animationTracks);
         }
         if (rootIndex < 0) {
             unboundTracks++;
