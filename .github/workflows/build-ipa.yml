@@ -253,7 +253,11 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG="ipa"
+          if [[ "${{ inputs.dylib_channel }}" == "nightly" ]]; then
+            TAG="ipa-nightly"
+          else
+            TAG="ipa"
+          fi
           TITLE="LimbusCompany v${GAME_VERSION} — ZS v${TWEAK_VERSION}"
           NOTES="ZSingularity v${TWEAK_VERSION} injected into LimbusCompany v${GAME_VERSION} (build ${{ github.run_number }}, commit ${{ github.sha }})."
 
@@ -283,6 +287,7 @@ jobs:
 
       - name: Validate Discord webhook
         id: webhook
+        if: inputs.dylib_channel != 'nightly'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
@@ -293,7 +298,7 @@ jobs:
           fi
 
       - name: Post release link to Discord
-        if: steps.webhook.outputs.valid == 'true'
+        if: inputs.dylib_channel != 'nightly' && steps.webhook.outputs.valid == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RELEASE_URL: ${{ steps.publish.outputs.url }}

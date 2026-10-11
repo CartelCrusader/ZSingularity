@@ -12,7 +12,18 @@ typedef struct {
     uint64_t fallbackAllocations;
 } RamBypassStats;
 
+typedef struct {
+    uint64_t appBytes;
+    uint64_t donatedBytes;
+    uint64_t donatedUsedBytes;
+    uint64_t totalBytes;
+} RamHudSnapshot;
+
 BOOL zs_ram_bypass_enabled(void);
+BOOL zs_ram_bypass_available(void);
+BOOL zs_ram_hud_enabled(void);
+void zs_set_ram_hud_enabled(BOOL enabled);
+void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot);
 void zs_set_donated_heap_enabled(BOOL enabled);
 void zs_ram_bypass_get_stats(RamBypassStats *outStats);
 

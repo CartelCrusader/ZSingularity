@@ -17,6 +17,7 @@
 
 static NSString * const kZSRamBypassSection = @"ramBypass";
 static NSString * const kZSRamBypassEnabledKey = @"enabled";
+static NSString * const kZSRamBypassHudKey = @"hud";
 
 static const uint64_t kZSDonatedTargetBytes = 3ull * 1024ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinimumBytes = 256ull * 1024ull * 1024ull;
@@ -59,6 +60,25 @@ BOOL zs_ram_bypass_enabled(void)
     return [stored respondsToSelector:@selector(boolValue)] ? [stored boolValue] : NO;
 }
 
+BOOL zs_ram_bypass_available(void)
+{
+    return ZSRamDonor.donorBundleIdentifier.length > 0;
+}
+
+BOOL zs_ram_hud_enabled(void)
+{
+    id stored = zs_settings_section(kZSRamBypassSection)[kZSRamBypassHudKey];
+
+    return [stored respondsToSelector:@selector(boolValue)] ? [stored boolValue] : NO;
+}
+
+void zs_set_ram_hud_enabled(BOOL enabled)
+{
+    NSMutableDictionary *section = [zs_settings_section(kZSRamBypassSection) mutableCopy] ?: [NSMutableDictionary new];
+    section[kZSRamBypassHudKey] = @(enabled);
+    zs_write_settings_section(kZSRamBypassSection, section);
+}
+
 void zs_set_donated_heap_enabled(BOOL enabled)
 {
     NSMutableDictionary *section = [zs_settings_section(kZSRamBypassSection) mutableCopy] ?: [NSMutableDictionary new];
@@ -89,6 +109,31 @@ void zs_ram_bypass_get_stats(RamBypassStats *outStats)
 
     outStats->servedAllocations = atomic_load(&g_servedCount);
     outStats->fallbackAllocations = atomic_load(&g_fallbackCount);
+}
+
+void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
+{
+    if (!outSnapshot)
+    {
+        return;
+    }
+
+    memset(outSnapshot, 0, sizeof(*outSnapshot));
+
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+    {
+        outSnapshot->appBytes = info.phys_footprint;
+    }
+
+    RamBypassStats stats;
+    zs_ram_bypass_get_stats(&stats);
+
+    outSnapshot->donatedBytes = stats.active ? stats.poolBytes : 0;
+    outSnapshot->donatedUsedBytes = stats.active ? stats.usedBytes : 0;
+    outSnapshot->totalBytes = outSnapshot->appBytes + outSnapshot->donatedBytes;
 }
 
 static inline uint64_t zs_round_page(uint64_t value)

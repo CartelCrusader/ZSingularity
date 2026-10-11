@@ -6223,6 +6223,24 @@ static CFTimeInterval r_zsmtPauseLastTime;
 static NSUInteger r_zsmtPauseReportedToken;
 static MTLPixelFormat r_zsmtPauseFailedFormat;
 
+static BOOL g_zsmtHudWanted;
+static BOOL g_zsmtHudPending;
+static NSData *g_zsmtHudData;
+static int g_zsmtHudTexW;
+static int g_zsmtHudTexH;
+static float g_zsmtHudPtW;
+static float g_zsmtHudPtH;
+static float g_zsmtHudViewW;
+static float g_zsmtHudInsetTop;
+static float g_zsmtHudInsetRight;
+static int g_zsmtHudVersion;
+static id<MTLRenderPipelineState> g_zsmtHudPipeline;
+static MTLPixelFormat g_zsmtHudPipelineFormat;
+static id<MTLTexture> r_zsmtHudTex;
+static int r_zsmtHudVersion = -1;
+static CFTimeInterval r_zsmtHudLastRequest;
+static MTLPixelFormat r_zsmtHudFailedFormat;
+
 static id<MTLTexture> r_zsmtAtlas;
 static id<MTLTexture> r_zsmtSkin;
 static int r_zsmtSkinVersion = -1;
@@ -6453,6 +6471,30 @@ static NSString * const kZSMTShaderSource =
 @"        result = pow(max(result, float3(0.0)), float3(2.2));\n"
 @"    }\n"
 @"    return float4(result, dst.a);\n"
+@"}\n"
+@"\n"
+@"vertex ZSPauseOut zs_hud_vertex(uint vid [[vertex_id]], constant ZSPauseUniforms &u [[buffer(0)]]) {\n"
+@"    float2 c = float2(float(vid & 1u), float((vid >> 1u) & 1u));\n"
+@"    float2 p = u.rect.xy + c * u.rect.zw;\n"
+@"    ZSPauseOut o;\n"
+@"    o.position = float4(p.x / u.viewport.x * 2.0 - 1.0, 1.0 - p.y / u.viewport.y * 2.0, 0.0, 1.0);\n"
+@"    o.local = c;\n"
+@"    return o;\n"
+@"}\n"
+@"\n"
+@"fragment float4 zs_hud_fragment(ZSPauseOut in [[stage_in]],\n"
+@"                                float4 dst [[color(0)]],\n"
+@"                                constant ZSPauseUniforms &u [[buffer(0)]],\n"
+@"                                texture2d<float> tex [[texture(0)]]) {\n"
+@"    constexpr sampler smp(coord::normalized, filter::linear, address::clamp_to_edge);\n"
+@"    bool lin = u.params.y > 0.5;\n"
+@"    float4 t = tex.sample(smp, in.local, level(0));\n"
+@"    float3 g = lin ? pow(max(dst.rgb, float3(0.0)), float3(1.0 / 2.2)) : dst.rgb;\n"
+@"    float3 result = g * (1.0 - t.a) + t.rgb;\n"
+@"    if (lin) {\n"
+@"        result = pow(max(result, float3(0.0)), float3(2.2));\n"
+@"    }\n"
+@"    return float4(result, dst.a);\n"
 @"}\n";
 
 static BOOL zs_mt_format_is_linear(MTLPixelFormat format) {
@@ -6490,6 +6532,23 @@ static id<MTLRenderPipelineState> zs_mt_make_pause_pipeline(id<MTLLibrary> libra
     if (!state) ZLog(@"[MetalTabs] pause pipeline creation failed: %@", error);
     return state;
 }
+
+static id<MTLRenderPipelineState> zs_mt_make_hud_pipeline(id<MTLLibrary> library, MTLPixelFormat format) {
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"zs_hud_vertex"];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"zs_hud_fragment"];
+    if (!vertexFunction || !fragmentFunction) return nil;
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.vertexFunction = vertexFunction;
+    descriptor.fragmentFunction = fragmentFunction;
+    descriptor.colorAttachments[0].pixelFormat = format;
+    descriptor.colorAttachments[0].blendingEnabled = NO;
+    NSError *error = nil;
+    id<MTLRenderPipelineState> state = [library.device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (!state) ZLog(@"[MetalTabs] hud pipeline creation failed: %@", error);
+    return state;
+}
+
+static void zs_mt_hud_request_refresh(void);
 
 static void zs_mt_request_resync(void) {
     CFTimeInterval now = CACurrentMediaTime();
@@ -6865,6 +6924,105 @@ static void zs_mt_encode_pause(id<MTLCommandBuffer> commandBuffer, id<CAMetalDra
     }
 }
 
+static void zs_mt_encode_hud(id<MTLCommandBuffer> commandBuffer, id<CAMetalDrawable> drawable) {
+    BOOL wanted;
+    NSData *data;
+    int texW, texH, version;
+    float ptW, ptH, viewW, insetTop, insetRight;
+    id<MTLLibrary> library;
+    id<MTLRenderPipelineState> pipeline = nil;
+
+    os_unfair_lock_lock(&g_zsmtLock);
+    wanted = g_zsmtHudWanted;
+    data = g_zsmtHudData;
+    texW = g_zsmtHudTexW;
+    texH = g_zsmtHudTexH;
+    ptW = g_zsmtHudPtW;
+    ptH = g_zsmtHudPtH;
+    viewW = g_zsmtHudViewW;
+    insetTop = g_zsmtHudInsetTop;
+    insetRight = g_zsmtHudInsetRight;
+    version = g_zsmtHudVersion;
+    library = g_zsmtLibrary;
+    os_unfair_lock_unlock(&g_zsmtLock);
+
+    if (!wanted) return;
+
+    CAMetalLayer *layer = g_zsmtLayer;
+    if (!layer || drawable.layer != layer) return;
+    id<MTLTexture> target = drawable.texture;
+    if (!target) return;
+
+    CFTimeInterval now = CACurrentMediaTime();
+    if (data.length == 0 || now - r_zsmtHudLastRequest >= 0.5) {
+        r_zsmtHudLastRequest = now;
+        zs_mt_hud_request_refresh();
+    }
+
+    if (!library || data.length == 0 || texW <= 0 || texH <= 0 || viewW <= 0) return;
+
+    MTLPixelFormat format = target.pixelFormat;
+    os_unfair_lock_lock(&g_zsmtLock);
+    if (g_zsmtHudPipelineFormat == format) pipeline = g_zsmtHudPipeline;
+    os_unfair_lock_unlock(&g_zsmtLock);
+    if (!pipeline) {
+        if (r_zsmtHudFailedFormat == format) return;
+        pipeline = zs_mt_make_hud_pipeline(library, format);
+        if (!pipeline) {
+            r_zsmtHudFailedFormat = format;
+            return;
+        }
+        os_unfair_lock_lock(&g_zsmtLock);
+        g_zsmtHudPipeline = pipeline;
+        g_zsmtHudPipelineFormat = format;
+        os_unfair_lock_unlock(&g_zsmtLock);
+    }
+
+    if (!r_zsmtHudTex || r_zsmtHudVersion != version) {
+        MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                                     width:(NSUInteger)texW
+                                                                                                    height:(NSUInteger)texH
+                                                                                                 mipmapped:NO];
+        textureDescriptor.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [commandBuffer.device newTextureWithDescriptor:textureDescriptor];
+        if (texture && data.length >= (NSUInteger)texW * (NSUInteger)texH * 4) {
+            [texture replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)texW, (NSUInteger)texH) mipmapLevel:0 withBytes:data.bytes bytesPerRow:(NSUInteger)texW * 4];
+            r_zsmtHudTex = texture;
+            r_zsmtHudVersion = version;
+        }
+    }
+    if (!r_zsmtHudTex) return;
+
+    float tw = (float)target.width;
+    float th = (float)target.height;
+    float scale = tw / viewW;
+    float rw = ceilf(ptW * scale);
+    float rh = ceilf(ptH * scale);
+    float rx = floorf(tw - rw - (insetRight + 8.0f) * scale);
+    float ry = floorf((insetTop + 6.0f) * scale);
+    if (rx < 0.0f || ry < 0.0f || rx + rw > tw || ry + rh > th) return;
+
+    float uniforms[12] = {
+        tw, th, 0, 0,
+        1.0f, zs_mt_format_is_linear(format) ? 1.0f : 0.0f, 0, 0,
+        rx, ry, rw, rh,
+    };
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = target;
+    pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (!encoder) return;
+    encoder.label = @"ZS RAM HUD";
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setVertexBytes:uniforms length:sizeof(uniforms) atIndex:0];
+    [encoder setFragmentBytes:uniforms length:sizeof(uniforms) atIndex:0];
+    [encoder setFragmentTexture:r_zsmtHudTex atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    [encoder endEncoding];
+}
+
 static void zs_mt_note_drawable(id commandBuffer, id drawable) {
     if (drawable) objc_setAssociatedObject(commandBuffer, kZSMTPendingDrawableKey, drawable, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -6890,6 +7048,7 @@ static void zs_mt_hook_commit(id self, SEL _cmd) {
         objc_setAssociatedObject(self, kZSMTPendingDrawableKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         zs_mt_encode(self, drawable);
         zs_mt_encode_pause(self, drawable);
+        zs_mt_encode_hud(self, drawable);
     }
     ((void (*)(id, SEL))g_zsmtOrigCommit)(self, _cmd);
 }
@@ -6965,12 +7124,103 @@ static NSData *zs_mt_compose_skin(UIImage *onBlack, UIImage *onWhite, int *width
     return [NSData dataWithBytesNoCopy:skin length:count * 4 freeWhenDone:YES];
 }
 
+static NSString *zs_mt_hud_format_bytes(uint64_t bytes) {
+    double mb = (double)bytes / (1024.0 * 1024.0);
+    if (mb >= 1024.0) return [NSString stringWithFormat:@"%.2f GB", mb / 1024.0];
+    return [NSString stringWithFormat:@"%.0f MB", mb];
+}
+
+static void zs_mt_hud_build_texture(void) {
+    RamHudSnapshot snapshot;
+    zs_ram_hud_get_snapshot(&snapshot);
+
+    NSArray<NSString *> *labels = @[@"TOTAL", @"APP", @"DONOR"];
+    NSArray<NSString *> *values = @[
+        zs_mt_hud_format_bytes(snapshot.totalBytes),
+        zs_mt_hud_format_bytes(snapshot.appBytes),
+        zs_mt_hud_format_bytes(snapshot.donatedBytes),
+    ];
+
+    UIFont *font = zs_mono_font(10, UIFontWeightSemibold);
+    UIColor *labelColor = [UIColor colorWithWhite:1 alpha:0.6];
+    NSMutableParagraphStyle *right = [[NSMutableParagraphStyle alloc] init];
+    right.alignment = NSTextAlignmentRight;
+
+    CGFloat paddingX = 7;
+    CGFloat paddingY = 5;
+    CGFloat columnGap = 10;
+    CGFloat lineHeight = ceil(font.lineHeight);
+    CGFloat labelWidth = 0;
+    CGFloat valueWidth = 0;
+    for (NSUInteger i = 0; i < labels.count; i++) {
+        labelWidth = MAX(labelWidth, ceil([labels[i] sizeWithAttributes:@{NSFontAttributeName: font}].width));
+        valueWidth = MAX(valueWidth, ceil([values[i] sizeWithAttributes:@{NSFontAttributeName: font}].width));
+    }
+    valueWidth = MAX(valueWidth, ceil([@"0.00 GB" sizeWithAttributes:@{NSFontAttributeName: font}].width));
+
+    CGFloat width = paddingX * 2 + labelWidth + columnGap + valueWidth;
+    CGFloat height = paddingY * 2 + lineHeight * labels.count;
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
+    format.scale = 3;
+    format.opaque = NO;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(width, height) format:format];
+    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        UIBezierPath *background = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, width, height) cornerRadius:8];
+        [[UIColor colorWithWhite:0 alpha:0.55] setFill];
+        [background fill];
+        for (NSUInteger i = 0; i < labels.count; i++) {
+            CGFloat y = paddingY + lineHeight * (CGFloat)i;
+            [labels[i] drawInRect:CGRectMake(paddingX, y, labelWidth, lineHeight)
+                   withAttributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: labelColor}];
+            [values[i] drawInRect:CGRectMake(paddingX + labelWidth + columnGap, y, valueWidth, lineHeight)
+                   withAttributes:@{NSFontAttributeName: font, NSForegroundColorAttributeName: UIColor.whiteColor, NSParagraphStyleAttributeName: right}];
+        }
+    }];
+
+    size_t pixelWidth = 0, pixelHeight = 0;
+    uint8_t *buffer = zs_mt_rgba_buffer(image, &pixelWidth, &pixelHeight);
+    if (!buffer) return;
+    NSData *data = [NSData dataWithBytesNoCopy:buffer length:pixelWidth * pixelHeight * 4 freeWhenDone:YES];
+
+    UIView *host = zs_ui_host_view();
+    CGFloat hostWidth = host.bounds.size.width;
+    UIEdgeInsets insets = host.safeAreaInsets;
+
+    os_unfair_lock_lock(&g_zsmtLock);
+    g_zsmtHudData = data;
+    g_zsmtHudTexW = (int)pixelWidth;
+    g_zsmtHudTexH = (int)pixelHeight;
+    g_zsmtHudPtW = (float)width;
+    g_zsmtHudPtH = (float)height;
+    g_zsmtHudViewW = (float)hostWidth;
+    g_zsmtHudInsetTop = (float)insets.top;
+    g_zsmtHudInsetRight = (float)insets.right;
+    g_zsmtHudVersion++;
+    os_unfair_lock_unlock(&g_zsmtLock);
+}
+
+static void zs_mt_hud_request_refresh(void) {
+    os_unfair_lock_lock(&g_zsmtLock);
+    BOOL pending = g_zsmtHudPending;
+    g_zsmtHudPending = YES;
+    os_unfair_lock_unlock(&g_zsmtLock);
+    if (pending) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        zs_mt_hud_build_texture();
+        os_unfair_lock_lock(&g_zsmtLock);
+        g_zsmtHudPending = NO;
+        os_unfair_lock_unlock(&g_zsmtLock);
+    });
+}
+
 @interface ZSMetalTabs : NSObject
 + (instancetype)shared;
 - (void)ensureInstalled;
 - (BOOL)isVisible;
 - (void)setVisible:(BOOL)visible snap:(BOOL)snap;
 - (void)setPauseOverlayVisible:(BOOL)visible;
+- (void)setRamHudVisible:(BOOL)visible;
 - (void)updateWithViewSize:(CGSize)size
                      rects:(NSArray<NSValue *> *)rects
                       keys:(NSArray<NSString *> *)keys
@@ -7124,6 +7374,13 @@ static NSData *zs_mt_compose_skin(UIImage *onBlack, UIImage *onWhite, int *width
     g_zsmtPausePtW = (float)width;
     g_zsmtPausePtH = (float)height;
     g_zsmtPauseVersion++;
+    os_unfair_lock_unlock(&g_zsmtLock);
+}
+
+- (void)setRamHudVisible:(BOOL)visible {
+    if (visible) [self ensureInstalled];
+    os_unfair_lock_lock(&g_zsmtLock);
+    g_zsmtHudWanted = visible;
     os_unfair_lock_unlock(&g_zsmtLock);
 }
 
@@ -7526,6 +7783,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
 
     [self zs_presentTutorialIfNeeded];
     [self zs_refreshMetalTabs];
+    [[ZSMetalTabs shared] setRamHudVisible:zs_ram_hud_enabled()];
 
     [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -8903,6 +9161,18 @@ static const CGFloat kContentFadeHeight = 22;
     [self.pendingSectionBuilders addObject:^{
     zs_add_section_header(self.stack, @"Memory management", self);
 
+    BOOL ramBypassAvailable = zs_ram_bypass_available();
+    ZSRow *ramBypassRow = zs_make_switch_row(@"RamBypass", ramBypassAvailable && zs_ram_bypass_enabled());
+    [ramBypassRow.toggle addTarget:self action:@selector(ramBypassChanged:) forControlEvents:UIControlEventValueChanged];
+    if (!ramBypassAvailable) {
+        ramBypassRow.toggle.on = NO;
+        ramBypassRow.toggle.enabled = NO;
+        ramBypassRow.alpha = 0.35;
+    }
+
+    ZSRow *ramHudRow = zs_make_switch_row(@"RAM HUD", zs_ram_hud_enabled());
+    [ramHudRow.toggle addTarget:self action:@selector(ramHudChanged:) forControlEvents:UIControlEventValueChanged];
+
     UIButton *memoryCleanupButton = zs_make_grouped_action_button(@"Memory cleanup", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [memoryCleanupButton addTarget:self action:@selector(memoryCleanupTapped:) forControlEvents:UIControlEventTouchUpInside];
 
@@ -8914,6 +9184,8 @@ static const CGFloat kContentFadeHeight = 22;
     g_zsLowResTranscodeButton = lowResTranscodeButton;
 
     UIView *memoryActionsCard = zs_make_grouped_action_card(@[
+        ramBypassRow,
+        ramHudRow,
         memoryCleanupButton,
         self.memoryUsageAnalyzeButton,
         lowResTranscodeButton,
@@ -9072,9 +9344,6 @@ static const CGFloat kContentFadeHeight = 22;
     ZSRow *disableEnkephalinRow = zs_make_switch_row(@"Disable Enkephalin", zs_enkephalin_disabled_by_user());
     [disableEnkephalinRow.toggle addTarget:self action:@selector(disableEnkephalinChanged:) forControlEvents:UIControlEventValueChanged];
 
-    ZSRow *ramBypassRow = zs_make_switch_row(@"RamBypass", zs_ram_bypass_enabled());
-    [ramBypassRow.toggle addTarget:self action:@selector(ramBypassChanged:) forControlEvents:UIControlEventValueChanged];
-
     UIButton *assetExplorerButton = zs_make_grouped_action_button(@"Asset Explorer", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [assetExplorerButton addTarget:self action:@selector(assetExplorerTapped) forControlEvents:UIControlEventTouchUpInside];
 
@@ -9083,7 +9352,6 @@ static const CGFloat kContentFadeHeight = 22;
         uidRedactorRow,
         disableLiquidGlassRow,
         disableEnkephalinRow,
-        ramBypassRow,
         assetExplorerButton,
     ]);
     miscCard.layer.borderWidth = 1;
@@ -20270,6 +20538,11 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
         zs_add_restart_action(alert);
         [presenter presentViewController:alert animated:YES completion:nil];
     }
+}
+
+- (void)ramHudChanged:(UISwitch *)toggle {
+    zs_set_ram_hud_enabled(toggle.on);
+    [[ZSMetalTabs shared] setRamHudVisible:toggle.on];
 }
 
 - (void)nightlyReleasesEnabledChanged:(UISwitch *)toggle {
