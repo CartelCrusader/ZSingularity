@@ -15716,6 +15716,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     debugLabel.translatesAutoresizingMaskIntoConstraints = NO;
     debugLabel.font = zs_mono_font(8, UIFontWeightMedium);
     debugLabel.textColor = UIColor.whiteColor;
+    debugLabel.alpha = 0.55;
     debugLabel.numberOfLines = 0;
     debugLabel.textAlignment = NSTextAlignmentLeft;
     debugLabel.userInteractionEnabled = NO;
@@ -15918,7 +15919,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
         [textureCaption.trailingAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.trailingAnchor constant:-kPanelPadding],
         [textureCaption.bottomAnchor constraintEqualToAnchor:overlay.safeAreaLayoutGuide.bottomAnchor constant:-8],
         [debugLabel.leadingAnchor constraintEqualToAnchor:overlay.leadingAnchor constant:kZSSyslogFullScreenLeftInset],
-        [debugLabel.bottomAnchor constraintEqualToAnchor:textureCaption.topAnchor constant:-8],
+        [debugLabel.bottomAnchor constraintEqualToAnchor:pageStack.topAnchor constant:-6],
         [debugLabel.widthAnchor constraintLessThanOrEqualToAnchor:overlay.widthAnchor multiplier:0.8],
 
         [previewClip.topAnchor constraintEqualToAnchor:closeButton.bottomAnchor constant:12],
@@ -16653,7 +16654,8 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     UIImage *image = self.assetExplorerTextureImageView.image;
     ZSAssetExplorerVisual *textVisual = self.assetExplorerVisual;
     BOOL isDataExport = self.assetExplorerDataMode && self.assetExplorerDataJSON.length > 0 && textVisual != nil && textVisual.text.length == 0;
-    BOOL isTextExport = isDataExport || textVisual.text.length > 0;
+    BOOL isVideoExport = !isDataExport && textVisual.text.length == 0 && textVisual.exportData.length > 0 && textVisual.fileExtension.length > 0;
+    BOOL isTextExport = isDataExport || isVideoExport || textVisual.text.length > 0;
     NSData *textData = isDataExport ? self.assetExplorerDataJSON : (isTextExport ? (textVisual.exportData ?: [textVisual.text dataUsingEncoding:NSUTF8StringEncoding]) : nil);
     NSInteger index = self.assetExplorerTextureIndex;
     if ((!image && !isTextExport) || !self.assetExplorerTextureOpen || index < 0 || index >= (NSInteger)self.assetExplorerTextureAssets.count) return;
@@ -16987,6 +16989,10 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
 }
 
 - (void)zs_assetExplorerExportAsset:(ZSAssetExplorerAsset *)asset full:(BOOL)full {
+    [self zs_assetExplorerExportAsset:asset full:full jsonOnly:NO];
+}
+
+- (void)zs_assetExplorerExportAsset:(ZSAssetExplorerAsset *)asset full:(BOOL)full jsonOnly:(BOOL)jsonOnly {
     ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
     if (!asset || !bundle || bundle.filePath.length == 0 || self.assetExplorerTextureOpen) return;
 
@@ -17000,7 +17006,7 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         NSError *error = nil;
         if ([NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil]) {
             outputPath = full
-                ? [ZSAssetExplorer fullExportAssetAtPathID:pathID inBundleAtPath:bundlePath toDirectory:directory error:&error]
+                ? [ZSAssetExplorer fullExportAssetAtPathID:pathID inBundleAtPath:bundlePath toDirectory:directory jsonOnly:jsonOnly error:&error]
                 : [ZSAssetExplorer exportAssetAtPathID:pathID inBundleAtPath:bundlePath toDirectory:directory error:&error];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -17435,10 +17441,14 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         UIAction *exportAction = [UIAction actionWithTitle:@"Export" image:[UIImage systemImageNamed:@"square.and.arrow.up"] identifier:nil handler:^(__kindof UIAction *action) {
             [weakSelf zs_assetExplorerExportAsset:asset full:NO];
         }];
-        UIAction *fullExportAction = [UIAction actionWithTitle:@"Full Export" image:[UIImage systemImageNamed:@"doc.zipper"] identifier:nil handler:^(__kindof UIAction *action) {
-            [weakSelf zs_assetExplorerExportAsset:asset full:YES];
+        UIAction *fullJSONAction = [UIAction actionWithTitle:@".json" image:[UIImage systemImageNamed:@"curlybraces"] identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf zs_assetExplorerExportAsset:asset full:YES jsonOnly:YES];
         }];
-        return [UIMenu menuWithTitle:@"" children:@[exportAction, fullExportAction]];
+        UIAction *fullRawAction = [UIAction actionWithTitle:@"raw" image:[UIImage systemImageNamed:@"doc.zipper"] identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf zs_assetExplorerExportAsset:asset full:YES jsonOnly:NO];
+        }];
+        UIMenu *fullExportMenu = [UIMenu menuWithTitle:@"Full Export" image:[UIImage systemImageNamed:@"doc.zipper"] identifier:nil options:0 children:@[fullJSONAction, fullRawAction]];
+        return [UIMenu menuWithTitle:@"" children:@[exportAction, fullExportMenu]];
     }];
 }
 

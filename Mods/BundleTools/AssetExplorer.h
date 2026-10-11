@@ -78,6 +78,7 @@ typedef NSString * _Nullable (^ZSAssetExplorerLiveDebugProvider)(NSTimeInterval 
 + (nullable NSData *)jsonDataForPathID:(int64_t)pathID inBundleAtPath:(NSString *)path error:(NSError **)error;
 + (nullable NSString *)exportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory error:(NSError **)error;
 + (nullable NSString *)fullExportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory error:(NSError **)error;
++ (nullable NSString *)fullExportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory jsonOnly:(BOOL)jsonOnly error:(NSError **)error;
 @end
 
 NS_ASSUME_NONNULL_END

@@ -2,6 +2,7 @@
 #import "UnityBundleTools.h"
 #import <Metal/Metal.h>
 #import <CoreText/CoreText.h>
+#import <AVFoundation/AVFoundation.h>
 #import <compression.h>
 #import <unistd.h>
 #import <sys/stat.h>
@@ -2457,6 +2458,138 @@ static ZSAssetExplorerVisual *ZSAEBuildFontVisual(ZSAEObject *object, NSError **
             }
         }];
     };
+    return visual;
+}
+
+@interface ZSAEVideoTempFile : NSObject
+@property (nonatomic, copy) NSString *path;
+@end
+
+@implementation ZSAEVideoTempFile
+- (void)dealloc {
+    if (_path.length > 0) [[NSFileManager defaultManager] removeItemAtPath:_path error:nil];
+}
+@end
+
+static NSString *ZSAEVideoExtension(NSData *data) {
+    const uint8_t *b = data.bytes;
+    if (data.length >= 12 && memcmp(b + 4, "ftyp", 4) == 0) return memcmp(b + 8, "qt  ", 4) == 0 ? @"mov" : @"mp4";
+    if (data.length >= 4 && b[0] == 0x1A && b[1] == 0x45 && b[2] == 0xDF && b[3] == 0xA3) return @"webm";
+    if (data.length >= 12 && memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "AVI ", 4) == 0) return @"avi";
+    if (data.length >= 4 && memcmp(b, "OggS", 4) == 0) return @"ogv";
+    return @"mp4";
+}
+
+static NSData *ZSAEVideoClipData(ZSAEObject *object, NSString **outExtension, NSError **error) {
+    NSDictionary *resource = ZSAEDict(object.fields[@"m_ExternalResources"]);
+    uint64_t offset = (uint64_t)ZSAEInt(resource[@"m_Offset"]);
+    uint64_t size = (uint64_t)ZSAEInt(resource[@"m_Size"]);
+    if (size == 0) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"This video clip has no video data.");
+        return nil;
+    }
+    if (size > 600ull * 1024ull * 1024ull) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorBundleUnreadable, @"This video clip is too large to load.");
+        return nil;
+    }
+    NSData *data = ZSAELoadPixels(object.session, nil, ZSAEString(resource[@"m_Source"]), offset, size, error);
+    if (data.length < 12) {
+        if (error && !*error) *error = ZSAEError(ZSAssetExplorerErrorBundleMalformed, @"The video data wasn't found in the bundle.");
+        return nil;
+    }
+    if (outExtension) *outExtension = ZSAEVideoExtension(data);
+    return data;
+}
+
+static ZSAssetExplorerVisual *ZSAEBuildVideoClipVisual(ZSAEObject *object, NSError **error) {
+    NSDictionary *fields = object.fields;
+    NSString *extension = nil;
+    NSData *video = ZSAEVideoClipData(object, &extension, error);
+    if (!video) return nil;
+
+    NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"ZSAEVideo-%@.%@", NSUUID.UUID.UUIDString, extension]];
+    if (![video writeToFile:path atomically:NO]) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorBundleUnreadable, @"Couldn't stage the video for playback.");
+        return nil;
+    }
+    ZSAEVideoTempFile *holder = [ZSAEVideoTempFile new];
+    holder.path = path;
+    NSData *mapped = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil] ?: video;
+    video = nil;
+
+    NSString *name = ZSAEString(fields[@"m_Name"]);
+    NSUInteger byteCount = mapped.length;
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:path] options:nil];
+    AVAssetTrack *track = [asset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+    BOOL playable = asset.playable && track != nil;
+    double duration = playable ? CMTimeGetSeconds(asset.duration) : 0;
+    double nominalRate = track ? track.nominalFrameRate : 0;
+    CGSize natural = track ? CGSizeApplyAffineTransform(track.naturalSize, track.preferredTransform) : CGSizeZero;
+#pragma clang diagnostic pop
+
+    double fps = ZSAEDouble(fields[@"m_FrameRate"]);
+    if (fps <= 0) fps = nominalRate;
+    if (fps <= 0) fps = 30;
+    int64_t frameCount = ZSAEInt(fields[@"m_FrameCount"]);
+    if (!(duration > 0) && frameCount > 0) duration = (double)frameCount / fps;
+
+    if (!playable || !(duration > 0) || isnan(duration) || isinf(duration)) {
+        ZSAssetExplorerVisual *fallback = ZSAEBuildInspectorVisual(object, error);
+        if (fallback) fallback.summary = [NSString stringWithFormat:@"%@  •  VideoClip  •  .%@ can't be previewed on iOS", name.length > 0 ? name : @"Video", extension];
+        return fallback;
+    }
+
+    NSInteger width = (NSInteger)ZSAEInt(fields[@"Width"]);
+    NSInteger height = (NSInteger)ZSAEInt(fields[@"Height"]);
+    if (width <= 0 || height <= 0) {
+        width = (NSInteger)fabs(natural.width);
+        height = (NSInteger)fabs(natural.height);
+    }
+
+    AVAssetImageGenerator *generator = [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+    generator.appliesPreferredTrackTransform = YES;
+    generator.maximumSize = CGSizeMake(1280, 1280);
+    CMTime tolerance = CMTimeMakeWithSeconds(0.5 / fps, 600);
+    generator.requestedTimeToleranceBefore = tolerance;
+    generator.requestedTimeToleranceAfter = tolerance;
+
+    double totalDuration = duration;
+    UIImage *(^frameAt)(double) = ^UIImage *(double seconds) {
+        if (!holder) return nil;
+        double t = MIN(MAX(seconds, 0), MAX(totalDuration - 0.001, 0));
+        CGImageRef cgImage = NULL;
+        @synchronized (generator) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            cgImage = [generator copyCGImageAtTime:CMTimeMakeWithSeconds(t, 600) actualTime:NULL error:NULL];
+#pragma clang diagnostic pop
+        }
+        if (!cgImage) return nil;
+        UIImage *image = [UIImage imageWithCGImage:cgImage];
+        CGImageRelease(cgImage);
+        return image;
+    };
+
+    ZSAssetExplorerVisual *visual = [ZSAssetExplorerVisual new];
+    visual.name = name;
+    visual.summary = [NSString stringWithFormat:@"%@  •  Video  •  %ldx%ld  •  %.2fs  •  %.0f fps  •  %@", name.length > 0 ? name : @"VideoClip",
+                      (long)width, (long)height, totalDuration, fps,
+                      [NSByteCountFormatter stringFromByteCount:(long long)byteCount countStyle:NSByteCountFormatterCountStyleFile]];
+    visual.pageLabels = @[@"Video"];
+    visual.livePageIndex = 0;
+    visual.imageProvider = ^UIImage *(NSInteger page, NSError **providerError) {
+        UIImage *image = frameAt(0);
+        if (!image && providerError) *providerError = ZSAEError(ZSAssetExplorerErrorTextureDecodeFailed, @"Couldn't decode a frame from this video.");
+        return image;
+    };
+    visual.liveFrameProvider = ^UIImage *(NSTimeInterval elapsed) {
+        return frameAt(fmod(elapsed, totalDuration));
+    };
+    visual.exportData = mapped;
+    visual.fileExtension = extension;
     return visual;
 }
 
@@ -6473,7 +6606,7 @@ static NSString *ZSAEClassFolderName(int32_t classID) {
             @33: @"MeshFilter", @43: @"Mesh", @48: @"Shader", @49: @"TextAsset", @74: @"AnimationClip",
             @82: @"AudioSource", @83: @"AudioClip", @89: @"CubeMap", @91: @"AnimatorController", @95: @"Animator",
             @111: @"Animation", @114: @"MonoBehaviour", @115: @"MonoScript", @117: @"Texture3D", @128: @"Font",
-            @137: @"SkinnedMeshRenderer", @198: @"ParticleSystem", @199: @"ParticleSystemRenderer", @213: @"Sprite",
+            @137: @"SkinnedMeshRenderer", @329: @"VideoClip", @198: @"ParticleSystem", @199: @"ParticleSystemRenderer", @213: @"Sprite",
             @212: @"SpriteRenderer", @187: @"Texture2DArray", @188: @"CubemapArray", @687078895: @"SpriteAtlas",
         };
     });
@@ -6521,6 +6654,8 @@ static NSData *ZSAEMediaDataForObject(ZSAEContext *context, ZSAEObject *object, 
         }
         case 128:
             return ZSAEFontFileData(object, outExtension);
+        case 329:
+            return ZSAEVideoClipData(object, outExtension, NULL);
         default:
             return nil;
     }
@@ -6831,6 +6966,8 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
             return ZSAEBuildTextAssetVisual(object, error);
         case 128:
             return ZSAEBuildFontVisual(object, error);
+        case 329:
+            return ZSAEBuildVideoClipVisual(object, error);
         default:
             return ZSAEBuildInspectorVisual(object, error);
     }
@@ -6874,6 +7011,10 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
 }
 
 + (NSString *)fullExportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory error:(NSError **)error {
+    return [self fullExportAssetAtPathID:pathID inBundleAtPath:path toDirectory:directory jsonOnly:NO error:error];
+}
+
++ (NSString *)fullExportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory jsonOnly:(BOOL)jsonOnly error:(NSError **)error {
     ZSAEContext *context = [ZSAEContext new];
     context.sessions = [NSMutableDictionary dictionary];
     ZSAESession *session = ZSAEOpenSession(path, error);
@@ -6882,7 +7023,8 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
     ZSAEObject *root = ZSAEReadObject(session, pathID, error);
     if (!root) return nil;
 
-    NSString *zipPath = [directory stringByAppendingPathComponent:[ZSAEObjectBaseName(root) stringByAppendingPathExtension:@"zip"]];
+    NSString *zipName = jsonOnly ? [ZSAEObjectBaseName(root) stringByAppendingString:@"_json"] : ZSAEObjectBaseName(root);
+    NSString *zipPath = [directory stringByAppendingPathComponent:[zipName stringByAppendingPathExtension:@"zip"]];
     ZSAEZipWriter *zip = [[ZSAEZipWriter alloc] initWithPath:zipPath];
 
     const NSUInteger kMaxObjects = 1500;
@@ -6901,16 +7043,24 @@ static NSString *ZSAEObjectKey(ZSAEObject *object) {
             NSString *base = ZSAEObjectBaseName(object);
             NSMutableArray<NSString *> *files = [NSMutableArray array];
 
-            NSString *mediaExtension = nil;
-            NSData *media = ZSAEMediaDataForObject(context, object, &mediaExtension);
-            if (media.length > 0) {
-                NSString *entry = [NSString stringWithFormat:@"%@/%@.%@", folder, base, mediaExtension];
-                if ([zip addEntryNamed:entry data:media]) [files addObject:entry];
-            }
-            NSData *raw = ZSAERawDataForObject(object);
-            if (raw.length > 0) {
-                NSString *entry = [NSString stringWithFormat:@"%@/%@.asset", folder, base];
-                if ([zip addEntryNamed:entry data:raw]) [files addObject:entry];
+            if (jsonOnly) {
+                NSData *json = ZSAEJSONDataForObject(object, NULL);
+                if (json.length > 0) {
+                    NSString *entry = [NSString stringWithFormat:@"%@/%@.json", folder, base];
+                    if ([zip addEntryNamed:entry data:json]) [files addObject:entry];
+                }
+            } else {
+                NSString *mediaExtension = nil;
+                NSData *media = ZSAEMediaDataForObject(context, object, &mediaExtension);
+                if (media.length > 0) {
+                    NSString *entry = [NSString stringWithFormat:@"%@/%@.%@", folder, base, mediaExtension];
+                    if ([zip addEntryNamed:entry data:media]) [files addObject:entry];
+                }
+                NSData *raw = ZSAERawDataForObject(object);
+                if (raw.length > 0) {
+                    NSString *entry = [NSString stringWithFormat:@"%@/%@.asset", folder, base];
+                    if ([zip addEntryNamed:entry data:raw]) [files addObject:entry];
+                }
             }
 
             NSMutableArray<NSDictionary *> *pointers = [NSMutableArray array];
