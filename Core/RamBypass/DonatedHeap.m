@@ -133,22 +133,6 @@ BOOL zs_ram_bypass_available(void)
     return ZSRamDonor.donorBundleIdentifier.length > 0;
 }
 
-BOOL zs_malloc_allocation_enabled(void)
-{
-    return atomic_load_explicit(&g_mallocAllocationEnabled, memory_order_acquire) != 0;
-}
-
-void zs_set_malloc_allocation_enabled(BOOL enabled)
-{
-    const BOOL active = enabled && zs_ram_bypass_enabled();
-    atomic_store_explicit(&g_mallocAllocationEnabled, active, memory_order_release);
-
-    if (active && atomic_load_explicit(&g_poolReady, memory_order_acquire))
-    {
-        zs_malloc_zone_register();
-    }
-}
-
 BOOL zs_ram_hud_enabled(void)
 {
     id stored = zs_settings_section(kZSRamBypassSection)[kZSRamBypassHudKey];
@@ -1681,6 +1665,7 @@ static void ZSRamBypassConstructor(void)
 {
     if (zs_ram_bypass_enabled())
     {
+        atomic_store_explicit(&g_mallocAllocationEnabled, 1, memory_order_release);
         zs_ram_bypass_start();
     }
 }

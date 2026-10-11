@@ -21,8 +21,6 @@ typedef struct {
 
 BOOL zs_ram_bypass_enabled(void);
 BOOL zs_ram_bypass_available(void);
-BOOL zs_malloc_allocation_enabled(void);
-void zs_set_malloc_allocation_enabled(BOOL enabled);
 BOOL zs_ram_hud_enabled(void);
 void zs_set_ram_hud_enabled(BOOL enabled);
 void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot);
