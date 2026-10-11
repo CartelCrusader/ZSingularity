@@ -36,7 +36,7 @@ constant ZSLRTuning kZSLRTunings[11] = {
 {10,0,0,1,3,4,5,2,1.10f,2.5f},
 {10,0,0,1,3,4,6,2,1.15f,2.0f},
 {10,0,0,1,3,4,6,2,1.20f,1.5f},
-{14,0,0,1,3,4,6,3,1.25f,0.8f}
+{14,0,0,1,3,4,6,4,1.35f,0.8f}
 };
 
 struct ZSLRConfig {
@@ -1346,6 +1346,11 @@ static void zslr_solve_endpoints(thread const uint *pk, thread const uint *vm, u
     }
 }
 
+static uint zslr_blend_color(uint c0, uint c1, uint weight) {
+    uint value16 = (((c0 * 257u) * (64u - weight) + (c1 * 257u) * weight + 32u) >> 6);
+    return (value16 * 255u + 32768u) >> 16;
+}
+
 template <uint BW>
 static float zslr_block_error(thread const uint *pk, thread const uint *vm, uint dims,
                               thread const uchar *iv, thread const uint *ipw, uint wx, uint bits,
@@ -1362,12 +1367,12 @@ static float zslr_block_error(thread const uint *pk, thread const uint *vm, uint
             if (w == 0u) continue;
             sum += w * uint(wu[gi[base + (k & 1u) + (k >> 1) * wx]]);
         }
-        float w = float(sum >> 4) * (1.0f / 64.0f);
+        uint weight = sum >> 4;
         float m = zslr_vw(vm, i);
         float4 p = zslr_unpack(pk[i]);
         for (uint c = 0; c < dims; c++) {
-            float v = d0[c] + (d1[c] - d0[c]) * w;
-            float diff = p[c] * 255.0f - v;
+            uint v = zslr_blend_color(uint(d0[c]), uint(d1[c]), weight);
+            float diff = p[c] * 255.0f - float(v);
             err += m * diff * diff;
         }
     }
@@ -1446,28 +1451,22 @@ template <uint BW>
 static void zslr_build_weight_map(uint wx, uint wy, thread uchar *iv, thread uint *ipw, thread float *den) {
     const uint N = BW * BW;
     for (uint j = 0; j < 64; j++) den[j] = 0.0f;
+    const uint ds = (1024u + BW / 2u) / (BW - 1u);
     for (uint y = 0; y < BW; y++) {
-        uint yn = y * (wy - 1u);
-        uint by = yn / (BW - 1u);
-        uint yr = yn % (BW - 1u);
-        uint fy = (yr * 16u + (BW - 1u) / 2u) / (BW - 1u);
-        if (fy >= 16u) { by++; fy = 0u; }
-        by = min(by, wy - 1u);
+        uint gt = (ds * y * (wy - 1u) + 32u) >> 6;
+        uint by = gt >> 4;
+        uint fy = gt & 15u;
         for (uint x = 0; x < BW; x++) {
-            uint xn = x * (wx - 1u);
-            uint bx = xn / (BW - 1u);
-            uint xr = xn % (BW - 1u);
-            uint fx = (xr * 16u + (BW - 1u) / 2u) / (BW - 1u);
-            if (fx >= 16u) { bx++; fx = 0u; }
-            bx = min(bx, wx - 1u);
+            uint gs = (ds * x * (wx - 1u) + 32u) >> 6;
+            uint bx = gs >> 4;
+            uint fx = gs & 15u;
             uint i = y * BW + x;
             iv[i] = uchar(by * wx + bx);
-            uint w00 = ((16u - fx) * (16u - fy) + 8u) >> 4;
-            uint w10 = (fx * (16u - fy) + 8u) >> 4;
-            uint w01 = ((16u - fx) * fy + 8u) >> 4;
-            uint top = min(16u, w00 + w10 + w01);
-            uint w11 = 16u - top;
-            ipw[i] = w00 | (w10 << 8) | (w01 << 16) | (w11 << 24);
+            uint w11 = (fx * fy + 8u) >> 4;
+            uint wRight = fx - w11;
+            uint wDown = fy - w11;
+            uint w00 = 16u - fx - fy + w11;
+            ipw[i] = w00 | (wRight << 8) | (wDown << 16) | (w11 << 24);
             for (uint k = 0; k < 4; k++) {
                 uint w = (ipw[i] >> (8u * k)) & 255u;
                 if (w == 0u) continue;
@@ -1530,14 +1529,14 @@ static float zslr_block_error_dual(thread const uint *pk, thread const uint *vm,
             sum0 += w * uint(wu[gi0[node]]);
             sum1 += w * uint(wu[gi1[node]]);
         }
-        float w0 = float(sum0 >> 4) * (1.0f / 64.0f);
-        float w1 = float(sum1 >> 4) * (1.0f / 64.0f);
+        uint weight0 = sum0 >> 4;
+        uint weight1 = sum1 >> 4;
         float m = zslr_vw(vm, i);
         float4 p = zslr_unpack(pk[i]);
         for (uint c = 0; c < dims; c++) {
-            float w = c == selector ? w1 : w0;
-            float v = d0[c] + (d1[c] - d0[c]) * w;
-            float diff = p[c] * 255.0f - v;
+            uint weight = c == selector ? weight1 : weight0;
+            uint v = zslr_blend_color(uint(d0[c]), uint(d1[c]), weight);
+            float diff = p[c] * 255.0f - float(v);
             err += m * diff * diff;
         }
     }
