@@ -2,7 +2,7 @@
 #import "UnityBundleTools.h"
 #import <Metal/Metal.h>
 #import <CoreText/CoreText.h>
-#import <Compression/Compression.h>
+#import <compression.h>
 #import <unistd.h>
 #import <sys/stat.h>
 
