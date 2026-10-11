@@ -1601,6 +1601,7 @@ static const CGFloat kFillAlpha = 1.0;
 @property (nonatomic, assign) NSInteger selectedIndex;
 @property (nonatomic, assign) NSInteger defaultIndex;
 @property (nonatomic, strong) UIColor *fillColor;
+@property (nonatomic, assign) BOOL gifTintEnabled;
 - (void)setSelectedIndex:(NSInteger)selectedIndex animated:(BOOL)animated;
 @end
 
@@ -1623,6 +1624,7 @@ static const CGFloat kFillAlpha = 1.0;
         _selectedIndex = 0;
         _defaultIndex = -1;
         _fillColor = zs_bar_fill_color();
+        _gifTintEnabled = YES;
         _segmentLabels = [NSMutableArray new];
 
         self.track = [[UIView alloc] init];
@@ -1671,6 +1673,19 @@ static const CGFloat kFillAlpha = 1.0;
 
 - (void)dealloc {
     zs_remove_gif_view_tint(self.thumb);
+}
+
+- (void)setGifTintEnabled:(BOOL)gifTintEnabled {
+    if (_gifTintEnabled == gifTintEnabled) return;
+    _gifTintEnabled = gifTintEnabled;
+    if (gifTintEnabled) {
+        self.thumb.backgroundColor = [self.fillColor colorWithAlphaComponent:1.0];
+        zs_apply_gif_view_tint(self.thumb);
+    } else {
+        zs_remove_gif_view_tint(self.thumb);
+        self.thumb.backgroundColor = zs_accent_green_color();
+    }
+    [self setNeedsLayout];
 }
 
 - (CGSize)intrinsicContentSize {
@@ -6047,7 +6062,7 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, assign) NSUInteger assetExplorerLiveToken;
 @property (nonatomic, assign) BOOL assetExplorerLivePaused;
 @property (nonatomic, assign) NSTimeInterval assetExplorerLiveElapsed;
-@property (nonatomic, strong) UISegmentedControl *assetExplorerModeControl;
+@property (nonatomic, strong) ZSModeSlider *assetExplorerModeControl;
 @property (nonatomic, assign) BOOL assetExplorerDataMode;
 @property (nonatomic, strong) NSData *assetExplorerDataJSON;
 @property (nonatomic, assign) NSUInteger assetExplorerDataToken;
@@ -15617,14 +15632,12 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     [overlay addSubview:textureExportButton];
     self.assetExplorerTextureExportButton = textureExportButton;
 
-    UISegmentedControl *modeControl = [[UISegmentedControl alloc] initWithItems:@[@"Preview", @"Data"]];
+    ZSModeSlider *modeControl = [[ZSModeSlider alloc] init];
     modeControl.translatesAutoresizingMaskIntoConstraints = NO;
-    modeControl.selectedSegmentIndex = 0;
+    modeControl.labels = @[@"Preview", @"Data"];
+    modeControl.gifTintEnabled = NO;
+    modeControl.selectedIndex = 0;
     modeControl.hidden = YES;
-    modeControl.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
-    if (@available(iOS 13.0, *)) modeControl.selectedSegmentTintColor = zs_accent_green_color();
-    [modeControl setTitleTextAttributes:@{NSFontAttributeName: zs_mono_font(10, UIFontWeightMedium), NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.75]} forState:UIControlStateNormal];
-    [modeControl setTitleTextAttributes:@{NSFontAttributeName: zs_mono_font(10, UIFontWeightSemibold), NSForegroundColorAttributeName: UIColor.blackColor} forState:UIControlStateSelected];
     [modeControl addTarget:self action:@selector(zs_assetExplorerModeChanged:) forControlEvents:UIControlEventValueChanged];
     [overlay addSubview:modeControl];
     self.assetExplorerModeControl = modeControl;
@@ -15708,6 +15721,7 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     backdrop.translatesAutoresizingMaskIntoConstraints = NO;
     backdrop.hidden = YES;
     [overlay insertSubview:backdrop atIndex:0];
+    [overlay insertSubview:self.assetExplorerPreviewClipView aboveSubview:backdrop];
     self.assetExplorerBackdropView = backdrop;
 
     UITextField *searchField = [[UITextField alloc] init];
@@ -16049,18 +16063,6 @@ static const CGFloat kZSSyslogFullScreenLeftInset = kPanelPadding * 1.5;
     CGPoint offset = self.assetExplorerPreviewOffset;
     imageView.transform = CGAffineTransformScale(CGAffineTransformMakeTranslation(offset.x, offset.y), scale, scale);
     imageView.layer.magnificationFilter = scale >= 3 ? kCAFilterNearest : kCAFilterLinear;
-    if (scale > 1.01) {
-        UIView *host = self.assetExplorerPreviewClipView.superview;
-        NSArray<UIView *> *controls = @[
-            self.assetExplorerCloseButton ?: (UIView *)[NSNull null],
-            self.assetExplorerBackButton ?: (UIView *)[NSNull null],
-            self.assetExplorerTextureBackButton ?: (UIView *)[NSNull null],
-            self.assetExplorerTextureExportButton ?: (UIView *)[NSNull null],
-        ];
-        for (UIView *control in controls) {
-            if ([control isKindOfClass:[UIView class]] && control.superview == host) [host bringSubviewToFront:control];
-        }
-    }
 }
 
 static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMax, CGFloat scale, CGFloat *outLo, CGFloat *outHi) {
@@ -16227,7 +16229,7 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
         self.assetExplorerDataMode = NO;
         self.assetExplorerDataJSON = nil;
         self.assetExplorerDataToken += 1;
-        self.assetExplorerModeControl.selectedSegmentIndex = 0;
+        self.assetExplorerModeControl.selectedIndex = 0;
         self.assetExplorerPageStack.hidden = YES;
         self.assetExplorerTextureAssets = nil;
         self.assetExplorerTextureIndex = 0;
@@ -16339,16 +16341,15 @@ static void zs_preview_axis_range(CGFloat clipLen, CGFloat winMin, CGFloat winMa
     ZSAssetExplorerVisual *visual = self.assetExplorerVisual;
     BOOL available = self.assetExplorerTextureOpen && visual != nil && visual.text.length == 0;
     self.assetExplorerModeControl.hidden = !available;
-    self.assetExplorerModeControl.selectedSegmentIndex = self.assetExplorerDataMode ? 1 : 0;
+    [self.assetExplorerModeControl setGlassEnabled:available];
+    [self.assetExplorerModeControl setSelectedIndex:self.assetExplorerDataMode ? 1 : 0 animated:NO];
 }
 
-- (void)zs_assetExplorerModeChanged:(UISegmentedControl *)control {
-    BOOL dataMode = control.selectedSegmentIndex == 1;
+- (void)zs_assetExplorerModeChanged:(ZSModeSlider *)control {
+    BOOL dataMode = control.selectedIndex == 1;
     if (dataMode == self.assetExplorerDataMode) return;
     self.assetExplorerDataMode = dataMode;
     [self zs_assetExplorerApplyDisplayMode];
-    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    [haptic impactOccurred];
 }
 
 - (void)zs_assetExplorerApplyDisplayMode {
@@ -16949,6 +16950,56 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
     });
 }
 
+- (void)zs_assetExplorerExportAsset:(ZSAssetExplorerAsset *)asset full:(BOOL)full {
+    ZSAssetExplorerBundle *bundle = self.assetExplorerSelectedBundle;
+    if (!asset || !bundle || bundle.filePath.length == 0 || self.assetExplorerTextureOpen) return;
+
+    NSString *bundlePath = [bundle.filePath copy];
+    int64_t pathID = asset.pathID;
+    [self.assetExplorerTextureSpinner startAnimating];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"ZSAssetExport-%@", NSUUID.UUID.UUIDString]];
+        NSString *outputPath = nil;
+        NSError *error = nil;
+        if ([NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil]) {
+            outputPath = full
+                ? [ZSAssetExplorer fullExportAssetAtPathID:pathID inBundleAtPath:bundlePath toDirectory:directory error:&error]
+                : [ZSAssetExplorer exportAssetAtPathID:pathID inBundleAtPath:bundlePath toDirectory:directory error:&error];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            [strongSelf.assetExplorerTextureSpinner stopAnimating];
+            if (!strongSelf.assetExplorerFullScreenOpen || strongSelf.assetExplorerSelectedBundle != bundle) {
+                [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
+                return;
+            }
+            UIViewController *presenter = zs_key_window().rootViewController;
+            while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+            if (!outputPath) {
+                [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Export Failed"
+                                                                               message:error.localizedDescription ?: @"Couldn't export this asset."
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                [presenter presentViewController:alert animated:YES completion:nil];
+                return;
+            }
+            UITableView *table = strongSelf.assetExplorerTableView;
+            UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:outputPath]] applicationActivities:nil];
+            activityVC.popoverPresentationController.sourceView = table;
+            activityVC.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(table.bounds), CGRectGetMidY(table.bounds), 1, 1);
+            activityVC.completionWithItemsHandler = ^(UIActivityType activityType, BOOL completed, NSArray *returnedItems, NSError *activityError) {
+                [NSFileManager.defaultManager removeItemAtPath:directory error:nil];
+            };
+            [presenter presentViewController:activityVC animated:YES completion:nil];
+            UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+            [haptic impactOccurred];
+        });
+    });
+}
+
 - (void)zs_assetExplorerResetViewState {
     self.assetExplorerSearchField.text = @"";
     self.assetExplorerFilterKind = nil;
@@ -17337,6 +17388,22 @@ static dispatch_queue_t zs_asset_explorer_live_queue(void) {
         }
     }
     return cell;
+}
+
+- (UIContextMenuConfiguration *)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point API_AVAILABLE(ios(13.0)) {
+    if (tableView != self.assetExplorerTableView || !self.assetExplorerSelectedBundle || self.assetExplorerTextureOpen) return nil;
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger)self.assetExplorerDisplayedAssets.count) return nil;
+    ZSAssetExplorerAsset *asset = self.assetExplorerDisplayedAssets[(NSUInteger)indexPath.row];
+    __weak typeof(self) weakSelf = self;
+    return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
+        UIAction *exportAction = [UIAction actionWithTitle:@"Export" image:[UIImage systemImageNamed:@"square.and.arrow.up"] identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf zs_assetExplorerExportAsset:asset full:NO];
+        }];
+        UIAction *fullExportAction = [UIAction actionWithTitle:@"Full Export" image:[UIImage systemImageNamed:@"doc.zipper"] identifier:nil handler:^(__kindof UIAction *action) {
+            [weakSelf zs_assetExplorerExportAsset:asset full:YES];
+        }];
+        return [UIMenu menuWithTitle:@"" children:@[exportAction, fullExportAction]];
+    }];
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {

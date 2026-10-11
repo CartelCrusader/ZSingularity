@@ -2,6 +2,7 @@
 #import "UnityBundleTools.h"
 #import <Metal/Metal.h>
 #import <CoreText/CoreText.h>
+#import <Compression/Compression.h>
 #import <unistd.h>
 #import <sys/stat.h>
 
@@ -1574,6 +1575,7 @@ static UIImage *ZSAEImageFromRGBA(NSData *rgba, int32_t width, int32_t height) {
 @property (nonatomic, strong) ZSAEBundle *bundle;
 @property (nonatomic, strong) NSData *serializedData;
 @property (nonatomic, copy) NSString *serializedPath;
+@property (nonatomic, copy) NSString *bundlePath;
 @end
 
 @implementation ZSAESession
@@ -1587,6 +1589,7 @@ static UIImage *ZSAEImageFromRGBA(NSData *rgba, int32_t width, int32_t height) {
 @property (nonatomic, assign) int32_t classID;
 @property (nonatomic, copy) NSArray<NSString *> *externals;
 @property (nonatomic, strong) ZSAESession *session;
+@property (nonatomic, assign) int64_t pathID;
 @end
 
 @implementation ZSAEObject
@@ -1649,6 +1652,7 @@ static ZSAESession *ZSAEOpenSession(NSString *bundlePath, NSError **error) {
     session.bundle = bundle;
     session.serializedData = serializedData;
     session.serializedPath = serializedPath;
+    session.bundlePath = bundlePath;
     return session;
 }
 
@@ -1662,6 +1666,7 @@ static ZSAEObject *ZSAEReadObject(ZSAESession *session, int64_t pathID, NSError 
     object.classID = classID;
     object.externals = externals ?: @[];
     object.session = session;
+    object.pathID = pathID;
     return object;
 }
 
@@ -6049,6 +6054,300 @@ static BOOL ZSAEApplyCachedName(ZSAssetExplorerBundle *bundle) {
     return YES;
 }
 
+static NSData *ZSAEJSONDataForObject(ZSAEObject *object, NSError **error) {
+    NSDictionary *fields = object.fields;
+    if (fields.count == 0) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"This object has no readable fields.");
+        return nil;
+    }
+    NSUInteger budget = 600000;
+    id safe = ZSAEJSONSafeValue(fields, 0, &budget);
+    NSJSONWritingOptions options = NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys;
+    if (@available(iOS 13.0, *)) options |= NSJSONWritingWithoutEscapingSlashes;
+    NSError *jsonError = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:safe options:options error:&jsonError];
+    if (!data) {
+        if (error) *error = jsonError ?: ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"Couldn't serialize this asset to JSON.");
+        return nil;
+    }
+    return data;
+}
+
+static uint32_t ZSAEZipCRC32(const uint8_t *bytes, size_t length) {
+    static uint32_t table[256];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            table[i] = c;
+        }
+    });
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < length; i++) crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+@interface ZSAEZipRecord : NSObject
+@property (nonatomic, copy) NSData *name;
+@property (nonatomic, assign) uint16_t method;
+@property (nonatomic, assign) uint32_t crc;
+@property (nonatomic, assign) uint32_t compressedSize;
+@property (nonatomic, assign) uint32_t size;
+@property (nonatomic, assign) uint32_t offset;
+@end
+
+@implementation ZSAEZipRecord
+@end
+
+@interface ZSAEZipWriter : NSObject
+- (instancetype)initWithPath:(NSString *)path;
+- (BOOL)addEntryNamed:(NSString *)name data:(NSData *)data;
+- (BOOL)finish;
+@end
+
+@implementation ZSAEZipWriter {
+    FILE *_file;
+    NSMutableArray<ZSAEZipRecord *> *_records;
+    NSMutableSet<NSString *> *_names;
+    uint16_t _dosTime;
+    uint16_t _dosDate;
+    BOOL _failed;
+}
+
+- (instancetype)initWithPath:(NSString *)path {
+    self = [super init];
+    if (self) {
+        _file = fopen(path.fileSystemRepresentation, "wb");
+        _records = [NSMutableArray array];
+        _names = [NSMutableSet set];
+        NSDateComponents *c = [[NSCalendar currentCalendar] components:NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay | NSCalendarUnitHour | NSCalendarUnitMinute | NSCalendarUnitSecond fromDate:[NSDate date]];
+        NSInteger year = MAX(1980, c.year);
+        _dosDate = (uint16_t)(((year - 1980) << 9) | (c.month << 5) | c.day);
+        _dosTime = (uint16_t)((c.hour << 11) | (c.minute << 5) | (c.second / 2));
+        if (!_file) _failed = YES;
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_file) fclose(_file);
+}
+
+- (void)writeU16:(uint16_t)value {
+    uint8_t b[2] = { (uint8_t)(value & 0xFF), (uint8_t)(value >> 8) };
+    if (fwrite(b, 1, 2, _file) != 2) _failed = YES;
+}
+
+- (void)writeU32:(uint32_t)value {
+    uint8_t b[4] = { (uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF), (uint8_t)((value >> 16) & 0xFF), (uint8_t)(value >> 24) };
+    if (fwrite(b, 1, 4, _file) != 4) _failed = YES;
+}
+
+- (BOOL)addEntryNamed:(NSString *)name data:(NSData *)data {
+    if (_failed || !_file || name.length == 0 || data.length >= 0xFFFFFFFFu || _records.count >= 65000) return NO;
+    NSString *unique = name;
+    NSUInteger counter = 1;
+    while ([_names containsObject:unique.lowercaseString]) {
+        NSString *extension = name.pathExtension;
+        NSString *stem = extension.length > 0 ? [name stringByDeletingPathExtension] : name;
+        unique = extension.length > 0 ? [NSString stringWithFormat:@"%@_%lu.%@", stem, (unsigned long)counter, extension] : [NSString stringWithFormat:@"%@_%lu", stem, (unsigned long)counter];
+        counter++;
+    }
+    [_names addObject:unique.lowercaseString];
+
+    NSData *nameData = [unique dataUsingEncoding:NSUTF8StringEncoding];
+    if (nameData.length == 0 || nameData.length > 0xFFFF) return NO;
+
+    uint16_t method = 0;
+    NSData *payload = data;
+    if (data.length > 64) {
+        NSMutableData *packed = [NSMutableData dataWithLength:data.length];
+        size_t written = compression_encode_buffer(packed.mutableBytes, packed.length, data.bytes, data.length, NULL, COMPRESSION_ZLIB);
+        if (written > 0 && written < data.length) {
+            packed.length = written;
+            payload = packed;
+            method = 8;
+        }
+    }
+
+    ZSAEZipRecord *record = [ZSAEZipRecord new];
+    record.name = nameData;
+    record.method = method;
+    record.crc = ZSAEZipCRC32(data.bytes, data.length);
+    record.compressedSize = (uint32_t)payload.length;
+    record.size = (uint32_t)data.length;
+    long position = ftell(_file);
+    if (position < 0 || (uint64_t)position >= 0xFFFFFFFFu) return NO;
+    record.offset = (uint32_t)position;
+
+    [self writeU32:0x04034B50];
+    [self writeU16:20];
+    [self writeU16:0x0800];
+    [self writeU16:method];
+    [self writeU16:_dosTime];
+    [self writeU16:_dosDate];
+    [self writeU32:record.crc];
+    [self writeU32:record.compressedSize];
+    [self writeU32:record.size];
+    [self writeU16:(uint16_t)nameData.length];
+    [self writeU16:0];
+    if (fwrite(nameData.bytes, 1, nameData.length, _file) != nameData.length) _failed = YES;
+    if (payload.length > 0 && fwrite(payload.bytes, 1, payload.length, _file) != payload.length) _failed = YES;
+    if (_failed) return NO;
+    [_records addObject:record];
+    return YES;
+}
+
+- (BOOL)finish {
+    if (_failed || !_file) return NO;
+    long centralStart = ftell(_file);
+    if (centralStart < 0) return NO;
+    for (ZSAEZipRecord *record in _records) {
+        [self writeU32:0x02014B50];
+        [self writeU16:20];
+        [self writeU16:20];
+        [self writeU16:0x0800];
+        [self writeU16:record.method];
+        [self writeU16:_dosTime];
+        [self writeU16:_dosDate];
+        [self writeU32:record.crc];
+        [self writeU32:record.compressedSize];
+        [self writeU32:record.size];
+        [self writeU16:(uint16_t)record.name.length];
+        [self writeU16:0];
+        [self writeU16:0];
+        [self writeU16:0];
+        [self writeU16:0];
+        [self writeU32:0];
+        [self writeU32:record.offset];
+        if (fwrite(record.name.bytes, 1, record.name.length, _file) != record.name.length) _failed = YES;
+    }
+    long centralEnd = ftell(_file);
+    if (centralEnd < 0 || _failed) return NO;
+    [self writeU32:0x06054B50];
+    [self writeU16:0];
+    [self writeU16:0];
+    [self writeU16:(uint16_t)_records.count];
+    [self writeU16:(uint16_t)_records.count];
+    [self writeU32:(uint32_t)(centralEnd - centralStart)];
+    [self writeU32:(uint32_t)centralStart];
+    [self writeU16:0];
+    BOOL ok = !_failed && fflush(_file) == 0;
+    fclose(_file);
+    _file = NULL;
+    return ok;
+}
+
+@end
+
+static NSString *ZSAESafeFileComponent(NSString *text) {
+    NSMutableCharacterSet *allowed = [NSMutableCharacterSet alphanumericCharacterSet];
+    [allowed addCharactersInString:@"-_. "];
+    NSMutableString *safe = [NSMutableString string];
+    for (NSUInteger i = 0; i < text.length; i++) {
+        unichar c = [text characterAtIndex:i];
+        [safe appendString:[allowed characterIsMember:c] ? [NSString stringWithCharacters:&c length:1] : @"_"];
+    }
+    NSString *trimmed = [safe stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@". "]];
+    if (trimmed.length > 80) trimmed = [trimmed substringToIndex:80];
+    return trimmed;
+}
+
+static NSString *ZSAEClassFolderName(int32_t classID) {
+    static NSDictionary<NSNumber *, NSString *> *names;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        names = @{
+            @1: @"GameObject", @4: @"Transform", @21: @"Material", @23: @"MeshRenderer", @28: @"Texture2D",
+            @33: @"MeshFilter", @43: @"Mesh", @48: @"Shader", @49: @"TextAsset", @74: @"AnimationClip",
+            @82: @"AudioSource", @83: @"AudioClip", @89: @"CubeMap", @91: @"AnimatorController", @95: @"Animator",
+            @111: @"Animation", @114: @"MonoBehaviour", @115: @"MonoScript", @117: @"Texture3D", @128: @"Font",
+            @137: @"SkinnedMeshRenderer", @198: @"ParticleSystem", @199: @"ParticleSystemRenderer", @213: @"Sprite",
+            @212: @"SpriteRenderer", @187: @"Texture2DArray", @188: @"CubemapArray", @687078895: @"SpriteAtlas",
+        };
+    });
+    return names[@(classID)] ?: [NSString stringWithFormat:@"Class_%d", classID];
+}
+
+static NSData *ZSAEFontFileData(ZSAEObject *object, NSString **outExtension) {
+    NSData *fontData = [object.fields[@"m_FontData"] isKindOfClass:[NSData class]] ? object.fields[@"m_FontData"] : nil;
+    if (fontData.length < 4) return nil;
+    const uint8_t *b = fontData.bytes;
+    BOOL isOTF = b[0] == 'O' && b[1] == 'T' && b[2] == 'T' && b[3] == 'O';
+    if (outExtension) *outExtension = isOTF ? @"otf" : @"ttf";
+    return fontData;
+}
+
+static NSData *ZSAEMediaDataForObject(ZSAEContext *context, ZSAEObject *object, NSString **outExtension) {
+    switch (object.classID) {
+        case 28: {
+            ZSAETextureRecord *record = nil;
+            NSMutableData *rgba = nil;
+            if (!ZSAEDecodeTextureObject(object, &record, &rgba, NULL)) return nil;
+            UIImage *image = ZSAEImageFromRGBA(rgba, record.width, record.height);
+            NSData *png = image ? UIImagePNGRepresentation(image) : nil;
+            if (png.length > 0 && outExtension) *outExtension = @"png";
+            return png.length > 0 ? png : nil;
+        }
+        case 213: {
+            ZSAssetExplorerVisual *visual = ZSAEBuildSpriteVisual(context, object, NULL);
+            UIImage *image = [visual imageAtPage:0 error:NULL];
+            NSData *png = image ? UIImagePNGRepresentation(image) : nil;
+            if (png.length > 0 && outExtension) *outExtension = @"png";
+            return png.length > 0 ? png : nil;
+        }
+        case 49: {
+            ZSAssetExplorerVisual *visual = ZSAEBuildTextAssetVisual(object, NULL);
+            if (visual.exportData.length == 0) return nil;
+            if (outExtension) *outExtension = visual.fileExtension.length > 0 ? visual.fileExtension : @"txt";
+            return visual.exportData;
+        }
+        case 128:
+            return ZSAEFontFileData(object, outExtension);
+        default:
+            return nil;
+    }
+}
+
+static NSString *ZSAEObjectBaseName(ZSAEObject *object) {
+    NSString *name = ZSAESafeFileComponent(ZSAEString(object.fields[@"m_Name"]) ?: @"");
+    NSString *type = ZSAEClassFolderName(object.classID);
+    if (name.length == 0) name = type;
+    return [NSString stringWithFormat:@"%@_%lld", name, (long long)object.pathID];
+}
+
+static void ZSAECollectPPtrs(id value, NSMutableArray<NSDictionary *> *out, NSUInteger depth) {
+    if (depth > 64) return;
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dictionary = value;
+        if (ZSAEIsPPtr(dictionary)) {
+            if (ZSAEInt(dictionary[@"m_PathID"]) != 0) [out addObject:dictionary];
+            return;
+        }
+        for (id child in dictionary.allValues) ZSAECollectPPtrs(child, out, depth + 1);
+    } else if ([value isKindOfClass:[NSArray class]]) {
+        for (id child in (NSArray *)value) ZSAECollectPPtrs(child, out, depth + 1);
+    }
+}
+
+static NSString *ZSAEBundleFolderName(ZSAEContext *context, NSString *bundlePath) {
+    if (!context.cachedBundles) context.cachedBundles = [ZSAssetExplorer cachedBundles:nil] ?: @[];
+    for (ZSAssetExplorerBundle *candidate in context.cachedBundles) {
+        if ([candidate.filePath isEqualToString:bundlePath] && candidate.cabIdentifier.length > 0) return ZSAESafeFileComponent(candidate.cabIdentifier);
+    }
+    return @"Bundle";
+}
+
+static NSString *ZSAEBaseNameForUnresolved(ZSAEObject *object) {
+    return [NSString stringWithFormat:@"%@/%@", ZSAEClassFolderName(object.classID), ZSAEObjectBaseName(object)];
+}
+
+static NSString *ZSAEObjectKey(ZSAEObject *object) {
+    return [NSString stringWithFormat:@"%@|%lld", object.session.bundlePath ?: @"", (long long)object.pathID];
+}
+
+
 @implementation ZSAssetExplorer
 
 + (void)resolveNamesForBundles:(NSArray<ZSAssetExplorerBundle *> *)bundles
@@ -6326,22 +6625,135 @@ static BOOL ZSAEApplyCachedName(ZSAssetExplorerBundle *bundle) {
     if (!session) return nil;
     ZSAEObject *object = ZSAEReadObject(session, pathID, error);
     if (!object) return nil;
-    NSDictionary *fields = object.fields;
-    if (fields.count == 0) {
-        if (error) *error = ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"This object has no readable fields.");
+    return ZSAEJSONDataForObject(object, error);
+}
+
++ (NSString *)exportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory error:(NSError **)error {
+    ZSAEContext *context = [ZSAEContext new];
+    context.sessions = [NSMutableDictionary dictionary];
+    ZSAESession *session = ZSAEOpenSession(path, error);
+    if (!session) return nil;
+    context.sessions[path] = session;
+    ZSAEObject *object = ZSAEReadObject(session, pathID, error);
+    if (!object) return nil;
+
+    NSString *extension = nil;
+    NSData *data = ZSAEMediaDataForObject(context, object, &extension);
+    if (data.length == 0) {
+        data = ZSAEJSONDataForObject(object, error);
+        extension = @"json";
+    }
+    if (data.length == 0) return nil;
+
+    NSString *fileName = [ZSAEObjectBaseName(object) stringByAppendingPathExtension:extension];
+    NSString *outputPath = [directory stringByAppendingPathComponent:fileName];
+    if (![data writeToFile:outputPath atomically:YES]) {
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorBundleUnreadable, @"Couldn't write the exported file.");
         return nil;
     }
-    NSUInteger budget = 600000;
-    id safe = ZSAEJSONSafeValue(fields, 0, &budget);
-    NSJSONWritingOptions options = NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys;
-    if (@available(iOS 13.0, *)) options |= NSJSONWritingWithoutEscapingSlashes;
-    NSError *jsonError = nil;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:safe options:options error:&jsonError];
-    if (!data) {
-        if (error) *error = jsonError ?: ZSAEError(ZSAssetExplorerErrorAssetNotFound, @"Couldn't serialize this asset to JSON.");
+    return outputPath;
+}
+
++ (NSString *)fullExportAssetAtPathID:(int64_t)pathID inBundleAtPath:(NSString *)path toDirectory:(NSString *)directory error:(NSError **)error {
+    ZSAEContext *context = [ZSAEContext new];
+    context.sessions = [NSMutableDictionary dictionary];
+    ZSAESession *session = ZSAEOpenSession(path, error);
+    if (!session) return nil;
+    context.sessions[path] = session;
+    ZSAEObject *root = ZSAEReadObject(session, pathID, error);
+    if (!root) return nil;
+
+    NSString *zipPath = [directory stringByAppendingPathComponent:[ZSAEObjectBaseName(root) stringByAppendingPathExtension:@"zip"]];
+    ZSAEZipWriter *zip = [[ZSAEZipWriter alloc] initWithPath:zipPath];
+
+    const NSUInteger kMaxObjects = 1500;
+    NSMutableArray<ZSAEObject *> *queue = [NSMutableArray arrayWithObject:root];
+    NSMutableSet<NSString *> *visited = [NSMutableSet setWithObject:ZSAEObjectKey(root)];
+    NSMutableArray<NSDictionary *> *manifestObjects = [NSMutableArray array];
+    NSMutableArray<NSString *> *unresolved = [NSMutableArray array];
+    NSMutableSet<NSString *> *unresolvedSeen = [NSMutableSet set];
+    BOOL truncated = NO;
+    NSUInteger cursor = 0;
+
+    while (cursor < queue.count) {
+        @autoreleasepool {
+            ZSAEObject *object = queue[cursor++];
+            NSString *folder = [NSString stringWithFormat:@"%@/%@", ZSAEBundleFolderName(context, object.session.bundlePath), ZSAEClassFolderName(object.classID)];
+            NSString *base = ZSAEObjectBaseName(object);
+            NSMutableArray<NSString *> *files = [NSMutableArray array];
+
+            NSString *mediaExtension = nil;
+            NSData *media = ZSAEMediaDataForObject(context, object, &mediaExtension);
+            if (media.length > 0) {
+                NSString *entry = [NSString stringWithFormat:@"%@/%@.%@", folder, base, mediaExtension];
+                if ([zip addEntryNamed:entry data:media]) [files addObject:entry];
+            }
+            NSData *json = ZSAEJSONDataForObject(object, NULL);
+            if (json.length > 0) {
+                NSString *entry = [NSString stringWithFormat:@"%@/%@.json", folder, base];
+                if ([zip addEntryNamed:entry data:json]) [files addObject:entry];
+            }
+
+            NSMutableArray<NSDictionary *> *pointers = [NSMutableArray array];
+            ZSAECollectPPtrs(object.fields, pointers, 0);
+            NSMutableArray<NSDictionary *> *references = [NSMutableArray array];
+            NSMutableSet<NSString *> *localSeen = [NSMutableSet set];
+            NSMutableSet<NSString *> *pointerSeen = [NSMutableSet set];
+            for (NSDictionary *pointer in pointers) {
+                NSString *identity = [NSString stringWithFormat:@"%lld:%lld", (long long)ZSAEInt(pointer[@"m_FileID"]), (long long)ZSAEInt(pointer[@"m_PathID"])];
+                if ([pointerSeen containsObject:identity]) continue;
+                [pointerSeen addObject:identity];
+                NSError *resolveError = nil;
+                ZSAEObject *target = ZSAEResolvePPtr(context, object, pointer, &resolveError);
+                if (!target) {
+                    NSString *reason = resolveError.localizedDescription ?: @"Unresolved reference.";
+                    NSString *line = [NSString stringWithFormat:@"%@ (PathID %lld): %@", ZSAEBaseNameForUnresolved(object), (long long)ZSAEInt(pointer[@"m_PathID"]), reason];
+                    if (![unresolvedSeen containsObject:line]) {
+                        [unresolvedSeen addObject:line];
+                        [unresolved addObject:line];
+                    }
+                    continue;
+                }
+                NSString *key = ZSAEObjectKey(target);
+                if (![localSeen containsObject:key]) {
+                    [localSeen addObject:key];
+                    [references addObject:@{@"bundle": ZSAEBundleFolderName(context, target.session.bundlePath), @"type": ZSAEClassFolderName(target.classID), @"pathID": @(target.pathID)}];
+                }
+                if ([visited containsObject:key]) continue;
+                if (queue.count >= kMaxObjects) { truncated = YES; continue; }
+                [visited addObject:key];
+                [queue addObject:target];
+            }
+
+            [manifestObjects addObject:@{
+                @"bundle": ZSAEBundleFolderName(context, object.session.bundlePath),
+                @"type": ZSAEClassFolderName(object.classID),
+                @"classID": @(object.classID),
+                @"pathID": @(object.pathID),
+                @"name": ZSAEString(object.fields[@"m_Name"]) ?: (id)[NSNull null],
+                @"isRoot": @(object == root),
+                @"files": files,
+                @"references": references,
+            }];
+        }
+    }
+
+    NSDictionary *manifest = @{
+        @"root": @{@"bundle": ZSAEBundleFolderName(context, root.session.bundlePath), @"type": ZSAEClassFolderName(root.classID), @"pathID": @(root.pathID)},
+        @"objectCount": @(manifestObjects.count),
+        @"truncated": @(truncated),
+        @"unresolvedReferences": unresolved,
+        @"objects": manifestObjects,
+    };
+    NSData *manifestData = [NSJSONSerialization dataWithJSONObject:manifest options:NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys error:nil];
+    if (manifestData.length > 0) [zip addEntryNamed:@"manifest.json" data:manifestData];
+
+    if (![zip finish]) {
+        [[NSFileManager defaultManager] removeItemAtPath:zipPath error:nil];
+        if (error) *error = ZSAEError(ZSAssetExplorerErrorBundleUnreadable, @"Couldn't write the zip archive.");
         return nil;
     }
-    return data;
+    return zipPath;
 }
 
 + (NSArray<ZSAssetExplorerAsset *> *)assetsForBundleAtPath:(NSString *)path error:(NSError **)error {
