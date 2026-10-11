@@ -2856,12 +2856,16 @@ static void zs_add_unavailable_subtext(ZSRow *row, NSString *text) {
     subLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
     subLabel.text = text;
     subLabel.numberOfLines = 0;
+    [subLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
     [row addSubview:subLabel];
 
     for (NSLayoutConstraint *constraint in row.constraints) {
         BOOL isTitle = constraint.firstItem == row.titleLabel;
         BOOL isToggle = constraint.firstItem == row.toggle;
         if ((isTitle || isToggle) && constraint.firstAttribute == NSLayoutAttributeCenterY) {
+            constraint.active = NO;
+        }
+        if (constraint.firstItem == row && constraint.firstAttribute == NSLayoutAttributeHeight) {
             constraint.active = NO;
         }
     }
