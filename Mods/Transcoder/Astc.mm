@@ -318,7 +318,7 @@ static float zsa_preset(ZSAstcQuality quality) {
     switch (quality) {
         case ZSAstcQualityFast: return ASTCENC_PRE_FASTEST;
         case ZSAstcQualityHigh: return ASTCENC_PRE_MEDIUM;
-        default: return ASTCENC_PRE_FAST;
+        default: return 5.0f;
     }
 }
 
