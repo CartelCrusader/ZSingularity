@@ -10,6 +10,7 @@ on:
 
 env:
   LZ4_REF: v1.10.0
+  ASTCENC_REF: 4.8.0
 
 jobs:
   release:
@@ -104,11 +105,75 @@ jobs:
         if: steps.lz4-cache.outputs.cache-hit == 'true'
         run: shasum -a 256 -c lz4-checksums.txt
 
+      - name: Cache astcenc source
+        id: astc-cache
+        if: hashFiles('astcenc/astcenc.h') == ''
+        uses: actions/cache@v4
+        with:
+          path: astcenc
+          key: astcenc-${{ env.ASTCENC_REF }}
+
+      - name: Fetch astcenc source
+        if: hashFiles('astcenc/astcenc.h') == ''
+        run: |
+          set -euo pipefail
+          if [[ -f astcenc/checksums.txt ]]; then
+            (cd astcenc && shasum -a 256 -c checksums.txt)
+            exit 0
+          fi
+          curl -fsSL --retry 3 --retry-all-errors "https://github.com/ARM-software/astc-encoder/archive/refs/tags/${ASTCENC_REF}.tar.gz" -o astcenc.tar.gz
+          mkdir -p astcenc-src astcenc
+          tar -xzf astcenc.tar.gz -C astcenc-src --strip-components=1
+          cp astcenc-src/Source/astcenc*.h astcenc-src/Source/astcenc_*.cpp astcenc/
+          cp astcenc-src/LICENSE.txt astcenc/
+          (cd astcenc && shasum -a 256 *.h *.cpp > checksums.txt)
+
+      - name: Compile astcenc
+        run: |
+          set -euo pipefail
+          mkdir -p astcenc-obj
+          for source in astcenc/astcenc_*.cpp; do
+            xcrun -sdk iphoneos clang++ \
+              -c \
+              -std=c++14 \
+              -O3 \
+              -fno-strict-aliasing \
+              -isysroot "${{ steps.sdk.outputs.path }}" \
+              -arch arm64 \
+              -miphoneos-version-min=15.0 \
+              -DASTCENC_NEON=1 \
+              -DASTCENC_SSE=0 \
+              -DASTCENC_AVX=0 \
+              -DASTCENC_POPCNT=0 \
+              -DASTCENC_F16C=0 \
+              -DASTCENC_SVE=0 \
+              -Iastcenc \
+              "$source" \
+              -o "astcenc-obj/$(basename "${source%.cpp}").o"
+          done
+
       - name: Compile Metal transcoder
         run: |
           set -euo pipefail
-          xcrun -sdk iphoneos metal -c -O3 -std=metal3.0 -target air64-apple-ios15.0 Mods/Transcoder/ZSLowRes.metal -o ZSLowRes.air
-          xcrun -sdk iphoneos metallib ZSLowRes.air -o ZSLowRes.metallib
+          xcrun -sdk iphoneos metal -c -O3 -std=metal3.0 -target air64-apple-ios15.0 Mods/Transcoder/ZSAstc.metal -o ZSAstc.air
+          xcrun -sdk iphoneos metallib ZSAstc.air -o ZSAstc.metallib
+
+      - name: Compile ASTC encoder
+        run: |
+          set -euo pipefail
+          clang \
+            -c \
+            -std=gnu++17 \
+            -O3 \
+            -fno-strict-aliasing \
+            -fobjc-arc \
+            -fmodules \
+            -isysroot "${{ steps.sdk.outputs.path }}" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -I. -IDiagnostics -IMods/Transcoder -Iastcenc \
+            Mods/Transcoder/ZSAstc.mm \
+            -o ZSAstc.o
 
       - name: Compile Crunch decoder
         run: |
@@ -155,7 +220,7 @@ jobs:
             -install_name "@rpath/ZSingularity.dylib" \
             -Wl,-ld_classic \
             -Wl,-sectcreate,__DATA,__enkephalin,Resources/Enkephalin.gif \
-            -Wl,-sectcreate,__DATA,__zslrmetal,ZSLowRes.metallib \
+            -Wl,-sectcreate,__DATA,__zsastcmetal,ZSAstc.metallib \
             -I. \
             -ICore -IUI -IMods -IMods/BundleTools -IMods/Transcoder -INetwork -IDiagnostics -IResources -INotifications \
             Mods/BundleTools/UnityBundleTools.m \
@@ -169,6 +234,8 @@ jobs:
             Mods/Transcoder/Transcoder.m \
             Mods/Transcoder/ZSLowRes.m \
             ZSCrunch.o \
+            ZSAstc.o \
+            astcenc-obj/*.o \
             Network/PatchManifestNetwork.m \
             Network/ZSUpdater.m \
             UI/UserInterface.m \

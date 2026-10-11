@@ -2,9 +2,6 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <Metal/Metal.h>
-#import <mach-o/getsect.h>
-#import <mach-o/loader.h>
 #import <os/lock.h>
 #import <os/proc.h>
 #include <ctype.h>
@@ -21,19 +18,16 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <stdatomic.h>
-#include <dlfcn.h>
 #include <malloc/malloc.h>
 
 #import "UnityBundleTools.h"
+#import "ZSAstc.h"
 #import "ZTweakLog.h"
 #include "lz4.h"
 #include "lz4hc.h"
 
 #define ZSLR_BLOCK_SIZE 131072u
 #define ZSLR_FORMAT_ASTC_6x6 50
-#define ZSLR_FORMAT_ASTC_8x8 51
-#define ZSLR_FORMAT_ASTC_10x10 52
-#define ZSLR_FORMAT_ASTC_12x12 53
 
 static volatile int g_zslrQuiet = 0;
 static volatile uint32_t g_zslrTargetBlock = 0;
@@ -44,11 +38,7 @@ static uint32_t zslr_block(void) {
 }
 
 static int32_t zslr_target_format(void) {
-    switch (zslr_block()) {
-        case 10: return ZSLR_FORMAT_ASTC_10x10;
-        case 12: return ZSLR_FORMAT_ASTC_12x12;
-        default: return ZSLR_FORMAT_ASTC_8x8;
-    }
+    return ZSAstcUnityFormat(zslr_block());
 }
 #define ZSLR_LOG(label, fmt, ...) do { if (!g_zslrQuiet) ZLog(@"[LowRes] %s: " fmt, (label), ##__VA_ARGS__); } while (0)
 static volatile int g_zslrVerbose = 0;
@@ -192,7 +182,6 @@ typedef struct {
 static int zslr_process_bundle(const char *label, const char *srcPath, const char *outPath, int scanOnly, const ZSLRCodec *codec, const ZSLRPolicy *policy, ZSLRResult *result, char *err, size_t errLen);
 static int64_t zslr_available_memory(void);
 static void zslr_wait_log(const char *what);
-static void zslr_pool_drain(void);
 
 static void zslr_seterr(char *err, size_t errLen, const char *fmt, ...) {
     if (!err || errLen == 0) return;
@@ -1261,8 +1250,7 @@ static uint32_t zslr_src_len(const ZSLRTexture *t) {
 }
 
 static uint64_t zslr_texture_need(const ZSLRTexture *t) {
-    uint64_t ns = zslr_astc_size(t->width, t->height, zslr_block(), zslr_block());
-    return (uint64_t)zslr_src_len(t) * 2u + ns * 2u;
+    return (uint64_t)zslr_src_len(t) * 2u + ZSAstcWorkingBytes(t->width, t->height, zslr_block());
 }
 
 static int pl_path_matches(const uint8_t *cab, size_t cabLen, const ZSLRTexture *t, const char *nodeName) {
@@ -2093,9 +2081,6 @@ static NSUInteger g_zslrMaxWorkers = 1;
 static int g_zslrLastState = -1;
 static double g_zslrLastWaitLog = 0;
 static double g_zslrLastProgressLog = 0;
-static _Atomic uint64_t g_zslrGpuBusyNs;
-static _Atomic uint64_t g_zslrGpuBlocks;
-static volatile uint32_t g_zslrChunkBlocks = 16384u;
 static NSUInteger g_zslrNoStream = 0;
 static NSMutableArray<NSDictionary *> *g_zslrItems;
 static _Atomic uint64_t g_zslrBundleReserved;
@@ -2178,7 +2163,7 @@ static NSUInteger zslr_allowed_workers(void) {
         ZLog(@"[LowRes] throttle: %s, %lu/%lu worker(s) allowed, available %lld MB", names[state], (unsigned long)allowed, (unsigned long)maxWorkers,
              (long long)(avail / (1024 * 1024)));
         if (state == 3) {
-            zslr_pool_drain();
+            ZSAstcDrainCaches();
             malloc_zone_pressure_relief(NULL, 0);
         }
     }
@@ -2286,10 +2271,9 @@ static void zslr_codec_progress(void *user, uint32_t delta) {
     }
     os_unfair_lock_unlock(&g_zslrLock);
     if (logLine) {
-        double gpuSeconds = (double)atomic_load(&g_zslrGpuBusyNs) / 1e9;
-        double gpuBlocks = (double)atomic_load(&g_zslrGpuBlocks);
+        ZSAstcGpuTelemetry gpu = ZSAstcReadTelemetry(elapsed);
         ZLog(@"[LowRes] progress: %lu/%lu texture(s), %.1f texture(s)/s, GPU time %.1fs of %.1fs wall, %.1f blocks/ms, chunk %u blocks", (unsigned long)processed, (unsigned long)total, rate,
-             gpuSeconds, elapsed, gpuSeconds > 0 ? gpuBlocks / (gpuSeconds * 1000.0) : 0.0, (unsigned)g_zslrChunkBlocks);
+             gpu.gpuSeconds, elapsed, gpu.blocksPerMs, (unsigned)gpu.chunkBlocks);
     }
 }
 
@@ -2375,426 +2359,9 @@ static BOOL zslr_ledger_has_other_block(void) {
     return other;
 }
 
-typedef struct {
-    uint32_t width;
-    uint32_t height;
-    uint32_t block;
-    uint32_t blocksX;
-    uint32_t srgb;
-    uint32_t rowOffset;
-    uint32_t rowCount;
-    uint32_t quality;
-} ZSLRGPUParams;
-
-static const double kZSLRChunkTargetMs = 12.0;
-static const double kZSLRChunkCapMs = 24.0;
-static const uint32_t kZSLRChunkMinBlocks = 1024u;
-static const uint32_t kZSLRChunkMaxBlocks = 65536u;
-static double g_zslrChunkCeiling = 65536.0;
-static os_unfair_lock g_zslrChunkLock = OS_UNFAIR_LOCK_INIT;
-static double g_zslrRateSmooth = 0;
-static double g_zslrRateBest = 0;
-#define ZSLR_TRANSCODE_REJECTED 1
-
-static const uint32_t kZSLRTranscodeQuality = 10u;
-
-static os_unfair_lock g_zslrMetalLock = OS_UNFAIR_LOCK_INIT;
-static id<MTLDevice> g_zslrMetalDevice;
-static id<MTLCommandQueue> g_zslrMetalQueue;
-static id<MTLLibrary> g_zslrMetalLibrary;
-static id<MTLCommandQueue> g_zslrMetalQueues[ZSLR_MAX_WORKERS];
-static id<MTLComputePipelineState> g_zslrMetalPipelines[6];
-static BOOL g_zslrMetalInitialized = NO;
-static NSString *g_zslrMetalError;
-
-static id<MTLComputePipelineState> zslr_metal_prepare(uint32_t block, BOOL fast, char *why, size_t whyLen) {
-    NSUInteger slot = (block == 12 ? 2 : (block == 10 ? 1 : 0)) + (fast ? 3 : 0);
-    os_unfair_lock_lock(&g_zslrMetalLock);
-    if (!g_zslrMetalInitialized) {
-        g_zslrMetalInitialized = YES;
-        NSError *error = nil;
-        g_zslrMetalDevice = MTLCreateSystemDefaultDevice();
-        if (!g_zslrMetalDevice) {
-            g_zslrMetalError = @"Metal device unavailable";
-        } else {
-            Dl_info info;
-            memset(&info, 0, sizeof(info));
-            if (!dladdr((const void *)&zslr_metal_prepare, &info) || !info.dli_fbase) {
-                g_zslrMetalError = @"Unable to locate embedded Metal library";
-            } else {
-                unsigned long librarySize = 0;
-                const void *libraryBytes = getsectiondata((const struct mach_header_64 *)info.dli_fbase, "__DATA", "__zslrmetal", &librarySize);
-                if (!libraryBytes || librarySize == 0) {
-                    g_zslrMetalError = @"Embedded Metal library is missing";
-                } else {
-                    dispatch_data_t data = dispatch_data_create(libraryBytes, librarySize, dispatch_get_main_queue(), ^{});
-                    g_zslrMetalLibrary = [g_zslrMetalDevice newLibraryWithData:data error:&error];
-                    if (!g_zslrMetalLibrary) {
-                        g_zslrMetalError = error.localizedDescription ?: @"Unable to load embedded Metal library";
-                    } else {
-                        g_zslrMetalQueue = [g_zslrMetalDevice newCommandQueue];
-                        if (!g_zslrMetalQueue) g_zslrMetalError = @"Unable to create Metal command queue";
-                    }
-                }
-            }
-        }
-    }
-    if (!g_zslrMetalError && !g_zslrMetalPipelines[slot]) {
-        NSError *error = nil;
-        uint32_t nameBlock = block == 12 ? 12u : (block == 10 ? 10u : 8u);
-        NSString *name = fast ? [NSString stringWithFormat:@"zslr_astc_encode_fast_%u", nameBlock] : [NSString stringWithFormat:@"zslr_astc_encode_%u", nameBlock];
-        id<MTLFunction> function = [g_zslrMetalLibrary newFunctionWithName:name];
-        if (!function) {
-            g_zslrMetalError = @"Metal encoder function is missing";
-        } else {
-            MTLComputePipelineDescriptor *pipelineDescriptor = [[MTLComputePipelineDescriptor alloc] init];
-            pipelineDescriptor.computeFunction = function;
-            pipelineDescriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-            g_zslrMetalPipelines[slot] = [g_zslrMetalDevice newComputePipelineStateWithDescriptor:pipelineDescriptor options:MTLPipelineOptionNone reflection:nil error:&error];
-            if (!g_zslrMetalPipelines[slot]) g_zslrMetalError = error.localizedDescription ?: @"Unable to create Metal encoder pipeline";
-        }
-    }
-    id<MTLComputePipelineState> pipeline = (g_zslrMetalDevice && g_zslrMetalQueue) ? g_zslrMetalPipelines[slot] : nil;
-    NSString *errorText = g_zslrMetalError;
-    os_unfair_lock_unlock(&g_zslrMetalLock);
-    if (!pipeline) ZSLR_WHY("%s", errorText.UTF8String ?: "Metal transcoder initialization failed");
-    return pipeline;
-}
-
-static void zslr_note_chunk(id<MTLCommandBuffer> commandBuffer, uint32_t blocks) {
-    double seconds = commandBuffer.GPUEndTime - commandBuffer.GPUStartTime;
-    if (seconds <= 0.0 || blocks == 0) return;
-    double ms = seconds * 1000.0;
-    atomic_fetch_add(&g_zslrGpuBusyNs, (uint64_t)(seconds * 1e9));
-    atomic_fetch_add(&g_zslrGpuBlocks, (uint64_t)blocks);
-    os_unfair_lock_lock(&g_zslrChunkLock);
-    uint32_t current = g_zslrChunkBlocks;
-    if ((double)blocks >= 0.9 * (double)current) {
-        double rate = (double)blocks / ms;
-        g_zslrRateSmooth = g_zslrRateSmooth > 0.0 ? g_zslrRateSmooth * 0.6 + rate * 0.4 : rate;
-        g_zslrRateBest = MAX(g_zslrRateBest * 0.998, g_zslrRateSmooth);
-        double next = (double)current;
-        if (ms > kZSLRChunkCapMs) next = (double)current * (kZSLRChunkTargetMs / ms);
-        else if (ms < kZSLRChunkTargetMs || g_zslrRateSmooth < 0.9 * g_zslrRateBest) next = (double)current * 1.2;
-        g_zslrChunkCeiling = MIN(g_zslrChunkCeiling * 1.01 + 1.0, (double)kZSLRChunkMaxBlocks);
-        next = MIN(next, g_zslrChunkCeiling);
-        g_zslrChunkBlocks = (uint32_t)MIN(MAX(next, (double)kZSLRChunkMinBlocks), (double)kZSLRChunkMaxBlocks);
-    }
-    os_unfair_lock_unlock(&g_zslrChunkLock);
-}
-
-static void zslr_chunk_shrink(void) {
-    os_unfair_lock_lock(&g_zslrChunkLock);
-    uint32_t shrunk = MAX(kZSLRChunkMinBlocks, g_zslrChunkBlocks / 4u);
-    g_zslrChunkBlocks = shrunk;
-    g_zslrChunkCeiling = MAX((double)shrunk * 2.0, (double)kZSLRChunkMinBlocks);
-    g_zslrRateSmooth = 0;
-    g_zslrRateBest = 0;
-    os_unfair_lock_unlock(&g_zslrChunkLock);
-}
-
-static id<MTLCommandQueue> zslr_queue_for(void *user) {
-    NSUInteger index = user ? ((ZSLRWorker *)user)->index : 0;
-    if (index >= ZSLR_MAX_WORKERS) index = 0;
-    os_unfair_lock_lock(&g_zslrMetalLock);
-    id<MTLCommandQueue> queue = g_zslrMetalQueues[index];
-    if (!queue) {
-        queue = [g_zslrMetalDevice newCommandQueue] ?: g_zslrMetalQueue;
-        g_zslrMetalQueues[index] = queue;
-    }
-    os_unfair_lock_unlock(&g_zslrMetalLock);
-    return queue;
-}
-
-static MTLPixelFormat zslr_source_pixel_format(BOOL srgb) {
-    return srgb ? MTLPixelFormatASTC_6x6_sRGB : MTLPixelFormatASTC_6x6_LDR;
-}
-
-
-static os_unfair_lock g_zslrPoolLock = OS_UNFAIR_LOCK_INIT;
-static NSMutableDictionary<NSNumber *, NSMutableArray<id<MTLBuffer>> *> *g_zslrBufferPool;
-static NSMutableDictionary<NSString *, NSMutableArray<id<MTLTexture>> *> *g_zslrTexturePool;
-static uint64_t g_zslrPoolBytes = 0;
-static const uint64_t kZSLRPoolCapBytes = 48ull * 1024ull * 1024ull;
-
-static void zslr_pool_drain(void) {
-    os_unfair_lock_lock(&g_zslrPoolLock);
-    NSMutableDictionary *buffers = g_zslrBufferPool;
-    NSMutableDictionary *textures = g_zslrTexturePool;
-    g_zslrBufferPool = nil;
-    g_zslrTexturePool = nil;
-    g_zslrPoolBytes = 0;
-    os_unfair_lock_unlock(&g_zslrPoolLock);
-    [buffers removeAllObjects];
-    [textures removeAllObjects];
-}
-
-static id<MTLBuffer> zslr_pool_take_buffer(size_t length) {
-    id<MTLBuffer> buffer = nil;
-    os_unfair_lock_lock(&g_zslrPoolLock);
-    NSMutableArray<id<MTLBuffer>> *list = g_zslrBufferPool[@(length)];
-    buffer = list.lastObject;
-    if (buffer) {
-        [list removeLastObject];
-        g_zslrPoolBytes -= MIN(g_zslrPoolBytes, (uint64_t)buffer.allocatedSize);
-    }
-    os_unfair_lock_unlock(&g_zslrPoolLock);
-    if (buffer) return buffer;
-    return [g_zslrMetalDevice newBufferWithLength:length options:MTLResourceStorageModeShared];
-}
-
-static void zslr_pool_give_buffer(id<MTLBuffer> buffer) {
-    if (!buffer) return;
-    uint64_t size = buffer.allocatedSize;
-    NSNumber *key = @(buffer.length);
-    os_unfair_lock_lock(&g_zslrPoolLock);
-    if (g_zslrPoolBytes + size <= kZSLRPoolCapBytes) {
-        if (!g_zslrBufferPool) g_zslrBufferPool = [NSMutableDictionary dictionary];
-        NSMutableArray<id<MTLBuffer>> *list = g_zslrBufferPool[key];
-        if (!list) {
-            list = [NSMutableArray array];
-            g_zslrBufferPool[key] = list;
-        }
-        [list addObject:buffer];
-        g_zslrPoolBytes += size;
-    }
-    os_unfair_lock_unlock(&g_zslrPoolLock);
-}
-
-static NSString *zslr_texture_key(uint32_t width, uint32_t height, BOOL srgb) {
-    return [NSString stringWithFormat:@"%u.%u.%d", width, height, srgb ? 1 : 0];
-}
-
-static id<MTLTexture> zslr_pool_take_texture(uint32_t width, uint32_t height, BOOL srgb) {
-    NSString *key = zslr_texture_key(width, height, srgb);
-    id<MTLTexture> texture = nil;
-    os_unfair_lock_lock(&g_zslrPoolLock);
-    NSMutableArray<id<MTLTexture>> *list = g_zslrTexturePool[key];
-    texture = list.lastObject;
-    if (texture) {
-        [list removeLastObject];
-        g_zslrPoolBytes -= MIN(g_zslrPoolBytes, (uint64_t)texture.allocatedSize);
-    }
-    os_unfair_lock_unlock(&g_zslrPoolLock);
-    if (texture) return texture;
-    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:zslr_source_pixel_format(srgb)
-                                                                                           width:width
-                                                                                          height:height
-                                                                                       mipmapped:NO];
-    descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageShaderRead;
-    return [g_zslrMetalDevice newTextureWithDescriptor:descriptor];
-}
-
-static void zslr_pool_give_texture(id<MTLTexture> texture, uint32_t width, uint32_t height, BOOL srgb) {
-    if (!texture) return;
-    NSString *key = zslr_texture_key(width, height, srgb);
-    uint64_t size = texture.allocatedSize;
-    os_unfair_lock_lock(&g_zslrPoolLock);
-    if (g_zslrPoolBytes + size <= kZSLRPoolCapBytes) {
-        if (!g_zslrTexturePool) g_zslrTexturePool = [NSMutableDictionary dictionary];
-        NSMutableArray<id<MTLTexture>> *list = g_zslrTexturePool[key];
-        if (!list) {
-            list = [NSMutableArray array];
-            g_zslrTexturePool[key] = list;
-        }
-        [list addObject:texture];
-        g_zslrPoolBytes += size;
-    }
-    os_unfair_lock_unlock(&g_zslrPoolLock);
-}
-
-static _Atomic uint32_t g_zslrPaceUs;
-static _Atomic int g_zslrPaceBusy;
-static dispatch_source_t g_zslrPaceTimer;
-static double g_zslrPaceEwma;
-
-static void zslr_pace_start(void) {
-    if (g_zslrPaceTimer) return;
-    g_zslrPaceEwma = 0;
-    atomic_store(&g_zslrPaceUs, 0u);
-    atomic_store(&g_zslrPaceBusy, 0);
-    atomic_store(&g_zslrGpuBusyNs, 0ull);
-    atomic_store(&g_zslrGpuBlocks, 0ull);
-    os_unfair_lock_lock(&g_zslrChunkLock);
-    g_zslrChunkBlocks = 16384u;
-    g_zslrChunkCeiling = (double)kZSLRChunkMaxBlocks;
-    g_zslrRateSmooth = 0;
-    g_zslrRateBest = 0;
-    os_unfair_lock_unlock(&g_zslrChunkLock);
-}
-
-static void zslr_pace_stop(void) {
-    dispatch_source_t timer = g_zslrPaceTimer;
-    g_zslrPaceTimer = nil;
-    if (timer) dispatch_source_cancel(timer);
-    atomic_store(&g_zslrPaceUs, 0u);
-}
-
-typedef struct {
-    atomic_int failed;
-    atomic_int interactivity;
-    char error[160];
-} ZSLRGPUState;
-
-static int zslr_gpu_run_once(int *interactivityOut, id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, id<MTLTexture> sourceTexture, id<MTLBuffer> outputBuffer, id<MTLBuffer> metricBuffer,
-                        uint32_t width, uint32_t height, uint32_t block, uint32_t blocksX, uint32_t blocksY, int srgb, uint32_t quality,
-                        char *why, size_t whyLen) {
-    NSUInteger groupWidth = MAX((NSUInteger)1, pipeline.threadExecutionWidth);
-    NSUInteger groupHeight = MIN((NSUInteger)4, MAX((NSUInteger)1, pipeline.maxTotalThreadsPerThreadgroup / groupWidth));
-    MTLSize threadsPerGroup = MTLSizeMake(groupWidth, groupHeight, 1);
-    dispatch_group_t finished = dispatch_group_create();
-    dispatch_semaphore_t gate = dispatch_semaphore_create(4);
-    ZSLRGPUState state;
-    atomic_init(&state.failed, 0);
-    atomic_init(&state.interactivity, 0);
-    state.error[0] = 0;
-    ZSLRGPUState *statePtr = &state;
-    int rc = 0;
-    uint32_t rowOffset = 0;
-    while (rowOffset < blocksY && atomic_load(&state.failed) == 0) {
-        uint32_t rowsPerChunk = MAX((uint32_t)1, g_zslrChunkBlocks / MAX(blocksX, 1u));
-        uint32_t rowCount = MIN(rowsPerChunk, blocksY - rowOffset);
-        ZSLRGPUParams params = { width, height, block, blocksX, srgb ? 1u : 0u, rowOffset, rowCount, quality };
-        dispatch_semaphore_wait(gate, DISPATCH_TIME_FOREVER);
-        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = commandBuffer ? [commandBuffer computeCommandEncoder] : nil;
-        if (!commandBuffer || !encoder) {
-            dispatch_semaphore_signal(gate);
-            ZSLR_WHY("Metal command encoding unavailable");
-            rc = -1;
-            break;
-        }
-        [encoder setComputePipelineState:pipeline];
-        [encoder setTexture:sourceTexture atIndex:0];
-        [encoder setBuffer:outputBuffer offset:0 atIndex:0];
-        [encoder setBytes:&params length:sizeof(params) atIndex:1];
-        [encoder setBuffer:metricBuffer offset:0 atIndex:2];
-        MTLSize threadgroups = MTLSizeMake((blocksX + groupWidth - 1) / groupWidth,
-                                           (rowCount + groupHeight - 1) / groupHeight,
-                                           1);
-        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
-        [encoder endEncoding];
-        uint32_t chunkBlocks = rowCount * blocksX;
-        dispatch_group_enter(finished);
-        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
-            if (completed.status != MTLCommandBufferStatusCompleted) {
-                int expected = 0;
-                if (completed.error.code == 14) atomic_store(&statePtr->interactivity, 1);
-                if (atomic_compare_exchange_strong(&statePtr->failed, &expected, 1)) {
-                    snprintf(statePtr->error, sizeof(statePtr->error), "%s", completed.error.localizedDescription.UTF8String ?: "unknown error");
-                }
-            } else {
-                zslr_note_chunk(completed, chunkBlocks);
-            }
-            dispatch_semaphore_signal(gate);
-            dispatch_group_leave(finished);
-        }];
-        [commandBuffer commit];
-        rowOffset += rowCount;
-    }
-    dispatch_group_wait(finished, DISPATCH_TIME_FOREVER);
-    if (rc == 0 && atomic_load(&state.failed) != 0) {
-        ZSLR_WHY("Metal ASTC kernel failed: %s", state.error[0] ? state.error : "unknown error");
-        rc = -1;
-    }
-    if (interactivityOut) *interactivityOut = atomic_load(&state.interactivity);
-    return rc;
-}
-
-static int zslr_gpu_run(id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline, id<MTLTexture> sourceTexture, id<MTLBuffer> outputBuffer, id<MTLBuffer> metricBuffer,
-                        uint32_t width, uint32_t height, uint32_t block, uint32_t blocksX, uint32_t blocksY, int srgb, uint32_t quality,
-                        char *why, size_t whyLen) {
-    int rc = -1;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        int interactivity = 0;
-        if (why && whyLen) why[0] = 0;
-        rc = zslr_gpu_run_once(&interactivity, queue, pipeline, sourceTexture, outputBuffer, metricBuffer, width, height, block, blocksX, blocksY, srgb, quality, why, whyLen);
-        if (rc == 0 || !interactivity || g_zslrCancel) break;
-        zslr_chunk_shrink();
-        ZLog(@"[LowRes] GPU watchdog interrupted a chunk, shrinking to %u blocks and retrying %ux%u texture (attempt %d)", (unsigned)g_zslrChunkBlocks, width, height, attempt + 2);
-        usleep(30000u * (useconds_t)(attempt + 1));
-    }
-    return rc;
-}
-
-static int zslr_codec_transcode_inner(void *user, const uint8_t *src, size_t srcLen, uint32_t width, uint32_t height, int srgb, uint8_t **out, size_t *outLen, char *why, size_t whyLen) {
-    if (out) *out = NULL;
-    if (outLen) *outLen = 0;
-    if (why && whyLen) why[0] = 0;
-    if (!src || !out || !outLen || width == 0 || height == 0) {
-        ZSLR_WHY("invalid Metal transcode input");
-        return -1;
-    }
-    uint32_t block = zslr_block();
-    uint32_t quality = ZSLowResQualityDefault;
-    id<MTLComputePipelineState> pipeline = zslr_metal_prepare(block, quality == 0, why, whyLen);
-    if (!pipeline) return -1;
-
-    uint32_t blocksX = (width + block - 1) / block;
-    uint32_t blocksY = (height + block - 1) / block;
-    size_t blockCount = (size_t)blocksX * blocksY;
-    size_t encodedLen = blockCount * 16;
-    size_t sourceRowBytes = (size_t)((width + 5) / 6) * 16;
-    if (encodedLen == 0 || encodedLen / 16 != blockCount || sourceRowBytes * ((height + 5) / 6) != srcLen) {
-        ZSLR_WHY("ASTC source or target size mismatch");
-        return -1;
-    }
-
-    double phase = CACurrentMediaTime();
-    id<MTLTexture> sourceTexture = zslr_pool_take_texture(width, height, srgb != 0);
-    if (!sourceTexture) {
-        ZSLR_WHY("Metal cannot allocate ASTC 6x6 source texture");
-        return -1;
-    }
-    [sourceTexture replaceRegion:MTLRegionMake2D(0, 0, width, height)
-                     mipmapLevel:0
-                       withBytes:src
-                     bytesPerRow:sourceRowBytes];
-    double decodeMs = ZSLR_MS(phase);
-
-    size_t metricLen = blockCount * sizeof(float);
-    id<MTLBuffer> outputBuffer = zslr_pool_take_buffer(encodedLen);
-    id<MTLBuffer> metricBuffer = zslr_pool_take_buffer(metricLen);
-    if (!outputBuffer || !metricBuffer) {
-        zslr_pool_give_texture(sourceTexture, width, height, srgb != 0);
-        zslr_pool_give_buffer(outputBuffer);
-        zslr_pool_give_buffer(metricBuffer);
-        ZSLR_WHY("Metal buffer allocation failed for %zu-byte output and %zu-byte metrics", encodedLen, metricLen);
-        return -1;
-    }
-
-    int gpuRc = zslr_gpu_run(zslr_queue_for(user), pipeline, sourceTexture, outputBuffer, metricBuffer, width, height, block, blocksX, blocksY, srgb, quality, why, whyLen);
-    zslr_pool_give_texture(sourceTexture, width, height, srgb != 0);
-    if (gpuRc != 0) {
-        zslr_pool_give_buffer(outputBuffer);
-        zslr_pool_give_buffer(metricBuffer);
-        return -1;
-    }
-    double encodeMs = ZSLR_MS(phase) - decodeMs;
-
-    zslr_pool_give_buffer(metricBuffer);
-
-    uint8_t *encoded = (uint8_t *)malloc(encodedLen);
-    if (!encoded) {
-        zslr_pool_give_buffer(outputBuffer);
-        ZSLR_WHY("out of memory allocating %zu-byte ASTC output", encodedLen);
-        return -1;
-    }
-    memcpy(encoded, outputBuffer.contents, encodedLen);
-    zslr_pool_give_buffer(outputBuffer);
-    *out = encoded;
-    *outLen = encodedLen;
-    ZSLR_WHY("GPU ASTC %ux%u %s encode q%u, %s, decode %.0f ms, encode %.0f ms", block, block, quality == 0 ? "fast" : "multi-mode", quality, srgb ? "sRGB" : "linear", decodeMs, encodeMs);
-    return 0;
-}
-
 static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, uint32_t width, uint32_t height, int srgb, uint8_t **out, size_t *outLen, char *why, size_t whyLen) {
-    int rc;
-    @autoreleasepool {
-        rc = zslr_codec_transcode_inner(user, src, srcLen, width, height, srgb, out, outLen, why, whyLen);
-    }
-    return rc;
+    ZSAstcJob job = { width, height, zslr_block(), srgb != 0, ZSAstcQualityBalanced, ZSAstcSourceASTC6, user ? (uint32_t)((ZSLRWorker *)user)->index : 0u, 1u };
+    return ZSAstcEncode(&job, src, srcLen, out, outLen, NULL, why, whyLen);
 }
 
 @implementation ZSLowRes
@@ -3241,6 +2808,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     g_zslrStatus.running = YES;
     g_zslrStatus.mode = mode;
     g_zslrTargetBlock = (blockSize == 10 || blockSize == 12) ? (uint32_t)blockSize : 8;
+    ZSAstcSetCancelFlag(&g_zslrCancel);
     g_zslrCancel = NO;
     g_zslrHoldPaused = NO;
     g_zslrWarningUntil = 0;
@@ -3261,12 +2829,12 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
     memset(g_zslrWorkerDone, 0, sizeof(g_zslrWorkerDone));
     g_zslrMaxWorkers = kZSLowResMaxWorkers;
     os_unfair_lock_unlock(&g_zslrLock);
-    ZLog(@"[LowRes] %@ requested at ASTC %ux%u, quality %u, available memory %lld MB", mode == ZSLowResModeScan ? @"scan" : @"transcode", zslr_block(), zslr_block(), (unsigned)ZSLowResQualityDefault, (long long)(zslr_available_memory() / (1024 * 1024)));
+    ZLog(@"[LowRes] %@ requested at ASTC %ux%u, available memory %lld MB", mode == ZSLowResModeScan ? @"scan" : @"transcode", zslr_block(), zslr_block(), (long long)(zslr_available_memory() / (1024 * 1024)));
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         double runStart = CACurrentMediaTime();
         NSFileManager *fm = NSFileManager.defaultManager;
-        if (mode == ZSLowResModeTranscode) zslr_pace_start();
+        if (mode == ZSLowResModeTranscode) ZSAstcResetTelemetry();
         if (mode == ZSLowResModeTranscode) {
             NSError *dirError = nil;
             if (![fm createDirectoryAtPath:[ZSLowRes stagingDirectory] withIntermediateDirectories:YES attributes:nil error:&dirError]) {
@@ -3368,8 +2936,7 @@ static int zslr_codec_transcode(void *user, const uint8_t *src, size_t srcLen, u
             });
         }
         dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-        zslr_pace_stop();
-        zslr_pool_drain();
+        ZSAstcDrainCaches();
         ZLog(@"[LowRes] all workers finished");
         if (mode == ZSLowResModeTranscode) [ZSLowRes saveLedger];
         if (mode == ZSLowResModeTranscode && !g_zslrCancel) {
@@ -3607,74 +3174,6 @@ static NSString *zslr_bytes(uint64_t bytes) {
     if (g_zslrGaveUp) [text appendString:@"\n(stopped: available memory stayed too low, progress is saved)"];
     else if (s.cancelled) [text appendString:@"\n(cancelled)"];
     return text;
-}
-
-
-+ (NSData *)encodeRGBA8DataToASTC6:(NSData *)rgbaData width:(uint32_t)width height:(uint32_t)height sRGB:(BOOL)sRGB error:(NSError **)error {
-    if (error) *error = nil;
-    if (!rgbaData || width == 0 || height == 0 || rgbaData.length != (size_t)width * height * 4u) {
-        if (error) *error = [NSError errorWithDomain:@"ZSLowResErrorDomain" code:1 userInfo:@{NSLocalizedDescriptionKey: @"RGBA8 input size does not match texture dimensions."}];
-        return nil;
-    }
-    char why[256] = {0};
-    id<MTLComputePipelineState> bootstrap = zslr_metal_prepare(8u, YES, why, sizeof(why));
-    if (!bootstrap) {
-        if (error) *error = [NSError errorWithDomain:@"ZSLowResErrorDomain" code:2 userInfo:@{NSLocalizedDescriptionKey: why[0] ? [NSString stringWithUTF8String:why] : @"Metal ASTC encoder initialization failed."}];
-        return nil;
-    }
-    static id<MTLComputePipelineState> g_astc6Pipeline;
-    static dispatch_once_t onceToken;
-    static NSString *pipelineError;
-    dispatch_once(&onceToken, ^{
-        os_unfair_lock_lock(&g_zslrMetalLock);
-        NSError *pipelineCreateError = nil;
-        id<MTLFunction> function = [g_zslrMetalLibrary newFunctionWithName:@"zslr_astc_encode_6"];
-        if (!function) pipelineError = @"Metal ASTC 6x6 encoder function is missing.";
-        else {
-            MTLComputePipelineDescriptor *descriptor = [MTLComputePipelineDescriptor new];
-            descriptor.computeFunction = function;
-            descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
-            g_astc6Pipeline = [g_zslrMetalDevice newComputePipelineStateWithDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&pipelineCreateError];
-            if (!g_astc6Pipeline) pipelineError = pipelineCreateError.localizedDescription ?: @"Metal ASTC 6x6 encoder pipeline creation failed.";
-        }
-        os_unfair_lock_unlock(&g_zslrMetalLock);
-    });
-    if (!g_astc6Pipeline) {
-        if (error) *error = [NSError errorWithDomain:@"ZSLowResErrorDomain" code:3 userInfo:@{NSLocalizedDescriptionKey: pipelineError ?: @"Metal ASTC 6x6 encoder pipeline is unavailable."}];
-        return nil;
-    }
-    uint32_t blocksX = (width + 5u) / 6u;
-    uint32_t blocksY = (height + 5u) / 6u;
-    size_t blockCount = (size_t)blocksX * blocksY;
-    if (blockCount > SIZE_MAX / 16u) {
-        if (error) *error = [NSError errorWithDomain:@"ZSLowResErrorDomain" code:4 userInfo:@{NSLocalizedDescriptionKey: @"ASTC output size overflowed."}];
-        return nil;
-    }
-    size_t outputLength = blockCount * 16u;
-    MTLTextureDescriptor *sourceDescriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:sRGB ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
-    sourceDescriptor.storageMode = MTLStorageModeShared;
-    sourceDescriptor.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> sourceTexture = [g_zslrMetalDevice newTextureWithDescriptor:sourceDescriptor];
-    id<MTLBuffer> outputBuffer = zslr_pool_take_buffer(outputLength);
-    id<MTLBuffer> metricBuffer = zslr_pool_take_buffer(blockCount * sizeof(float));
-    if (!sourceTexture || !outputBuffer || !metricBuffer) {
-        zslr_pool_give_buffer(outputBuffer);
-        zslr_pool_give_buffer(metricBuffer);
-        if (error) *error = [NSError errorWithDomain:@"ZSLowResErrorDomain" code:5 userInfo:@{NSLocalizedDescriptionKey: @"Metal ASTC 6x6 encoder resource allocation failed."}];
-        return nil;
-    }
-    [sourceTexture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:rgbaData.bytes bytesPerRow:(NSUInteger)width * 4u];
-    char gpuWhy[256] = {0};
-    int rc = zslr_gpu_run(g_zslrMetalQueue, g_astc6Pipeline, sourceTexture, outputBuffer, metricBuffer, width, height, 6u, blocksX, blocksY, sRGB ? 1 : 0, kZSLRTranscodeQuality, gpuWhy, sizeof(gpuWhy));
-    zslr_pool_give_buffer(metricBuffer);
-    NSData *result = nil;
-    if (rc == 0) result = [NSData dataWithBytes:outputBuffer.contents length:outputLength];
-    zslr_pool_give_buffer(outputBuffer);
-    if (rc != 0) {
-        if (error) *error = [NSError errorWithDomain:@"ZSLowResErrorDomain" code:6 userInfo:@{NSLocalizedDescriptionKey: gpuWhy[0] ? [NSString stringWithUTF8String:gpuWhy] : @"Metal ASTC 6x6 encoding failed."}];
-        return nil;
-    }
-    return result;
 }
 
 @end

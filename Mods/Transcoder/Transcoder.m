@@ -2,11 +2,10 @@
 #import "ZTweakLog.h"
 #import "UnityBundleTools.h"
 #import "Mods.h"
-#import "ZSLowRes.h"
+#import "ZSAstc.h"
 #import "ZSCrunch.h"
 #import "ZSEngine.h"
 #import "IL2CppIntrospection.h"
-#import <CommonCrypto/CommonDigest.h>
 #import <Metal/Metal.h>
 #import <mach-o/dyld.h>
 #import <mach-o/getsect.h>
@@ -81,10 +80,6 @@ NSError *ZTMakeTranscoderError(NSInteger code, NSString *message) {
     return [NSError errorWithDomain:ZTranscoderServiceErrorDomain
                                code:code
                            userInfo:@{NSLocalizedDescriptionKey: message ?: @"Unknown transcoder error."}];
-}
-
-static uint16_t zt_be16(const uint8_t *p) {
-    return ((uint16_t)p[0] << 8) | p[1];
 }
 
 static uint32_t zt_be32(const uint8_t *p) {
@@ -192,27 +187,6 @@ static BOOL zt_copy_file_to_handle(NSFileHandle *output, NSString *path, NSError
 static uint64_t zt_file_size(NSString *path) {
     NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
     return [attrs[NSFileSize] unsignedLongLongValue];
-}
-
-static NSString *zt_sha256_range(const uint8_t *base, uint64_t offset, uint64_t length) {
-    CC_SHA256_CTX ctx;
-    CC_SHA256_Init(&ctx);
-    const size_t chunk = 1024u * 1024u;
-    while (length) {
-        size_t n = (size_t)MIN((uint64_t)chunk, length);
-        CC_SHA256_Update(&ctx, base + offset, (CC_LONG)n);
-        offset += n;
-        length -= n;
-    }
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256_Final(digest, &ctx);
-    NSMutableString *text = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-    for (NSUInteger i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [text appendFormat:@"%02x", digest[i]];
-    return text;
-}
-
-static uint64_t zt_mip_dimension(uint32_t value, uint32_t mip) {
-    return MAX(1u, value >> mip);
 }
 
 static BOOL zt_format_is_crunched(int32_t format) {
@@ -1198,7 +1172,7 @@ static BOOL zt_make_astc_replacement(ZTTextureRecord *source, ZTTextureRecord *d
     uint64_t totalOutput = 0;
     if (ok) {
         NSError *encodeError = nil;
-        NSData *astc = [ZSLowRes encodeRGBA8DataToASTC6:rgba width:outWidth height:outHeight sRGB:(destination.colorSpace != 0) error:&encodeError];
+        NSData *astc = ZSAstcEncodeRGBA8(rgba, outWidth, outHeight, 6u, destination.colorSpace != 0, ZSAstcQualityHigh, &encodeError);
         rgba = nil;
         if (!astc) {
             if (error) *error = encodeError ?: ZTMakeTranscoderError(ZTranscoderServiceErrorCantReadModdedBundle, [NSString stringWithFormat:@"Couldn't encode Texture2D %@ as ASTC 6x6.", source.name]);
