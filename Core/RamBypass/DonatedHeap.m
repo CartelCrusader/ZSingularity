@@ -25,10 +25,10 @@ static NSString * const kZSRamBypassHudKey = @"hud";
 
 static const uint64_t kZSDonatedTargetBytes = 3ull * 1024ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinimumBytes = 256ull * 1024ull * 1024ull;
-static const uint64_t kZSDonatedMinAllocation = 2ull * 1024ull * 1024ull;
+static const uint64_t kZSDonatedMinAllocation = 256ull * 1024ull;
 static const uint64_t kZSDonatedLogStride = 256ull * 1024ull * 1024ull;
 
-#define ZS_POOL_MAX_FREE 2048
+#define ZS_POOL_MAX_FREE 8192
 
 typedef struct {
     uint64_t offset;
@@ -54,6 +54,7 @@ static _Atomic(uint64_t) g_largeCalls;
 static _Atomic(uint64_t) g_rejectedCalls;
 static _Atomic(uint32_t) g_rejectLogged;
 static _Atomic(uint64_t) g_vmLargeCalls;
+static _Atomic(uint64_t) g_reserveCalls;
 
 static void *(*g_origMmap)(void *, size_t, int, int, int, off_t);
 static int (*g_origMunmap)(void *, size_t);
@@ -343,8 +344,8 @@ static void zs_pool_install(void *base, uint64_t size)
 
     atomic_store_explicit(&g_poolReady, 1, memory_order_release);
 
-    ZLog(@"[RamBypass] pool ready: %llu MB at %p, serving anonymous mappings of %llu MB or more",
-         size / (1024 * 1024), base, kZSDonatedMinAllocation / (1024 * 1024));
+    ZLog(@"[RamBypass] pool ready: %llu MB at %p, serving anonymous mappings of %llu KB or more",
+         size / (1024 * 1024), base, kZSDonatedMinAllocation / 1024);
 }
 
 static void zs_log_rejected_mmap(size_t length, void *address, int prot, int flags, int fd)
@@ -355,8 +356,8 @@ static void zs_log_rejected_mmap(size_t length, void *address, int prot, int fla
     }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        ZLog(@"[RamBypass] large mmap of %zu MB not eligible: addr=%p prot=0x%x flags=0x%x fd=%d",
-             length / (1024 * 1024), address, prot, flags, fd);
+        ZLog(@"[RamBypass] large mmap of %zu KB not eligible: addr=%p prot=0x%x flags=0x%x fd=%d",
+             length / 1024, address, prot, flags, fd);
     });
 }
 
@@ -365,7 +366,7 @@ static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int
     const BOOL anonymous = (flags & MAP_ANON) != 0 && (fd == -1 || ((uint32_t)fd & 0xff000000u) != 0);
 
     const BOOL large = length >= kZSDonatedMinAllocation;
-    const BOOL eligible = address == NULL && large && anonymous &&
+    const BOOL eligible = large && anonymous &&
         (flags & MAP_PRIVATE) != 0 && (flags & (MAP_FIXED | MAP_JIT | MAP_SHARED)) == 0 &&
         prot == (PROT_READ | PROT_WRITE);
 
@@ -379,7 +380,15 @@ static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int
     if (large && !eligible)
     {
         atomic_fetch_add(&g_rejectedCalls, 1);
-        zs_log_rejected_mmap(length, address, prot, flags, fd);
+
+        if (anonymous && prot == PROT_NONE)
+        {
+            atomic_fetch_add(&g_reserveCalls, 1);
+        }
+        else if (anonymous)
+        {
+            zs_log_rejected_mmap(length, address, prot, flags, fd);
+        }
     }
 
     if (eligible)
@@ -419,7 +428,7 @@ static void zs_log_rejected_vm(const char *api, uint64_t length, int flags)
     }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        ZLog(@"[RamBypass] large %s of %llu MB not eligible: flags=0x%x", api, length / (1024 * 1024), flags);
+        ZLog(@"[RamBypass] large %s of %llu KB not eligible: flags=0x%x", api, length / 1024, flags);
     });
 }
 
@@ -741,10 +750,10 @@ static void zs_ram_bypass_start(void)
     {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            ZLog(@"[RamBypass] after %@s: hook saw %llu mmap calls (%llu large, %llu not eligible) and %llu large vm_allocate calls, %llu served, %llu fell through, pool %@",
+            ZLog(@"[RamBypass] after %@s: hook saw %llu mmap calls (%llu large, %llu not eligible, %llu of those PROT_NONE reservations) and %llu large vm_allocate calls, %llu served, %llu fell through, pool %@",
                  delay,
                  atomic_load(&g_mmapCalls), atomic_load(&g_largeCalls), atomic_load(&g_rejectedCalls),
-                 atomic_load(&g_vmLargeCalls),
+                 atomic_load(&g_reserveCalls), atomic_load(&g_vmLargeCalls),
                  atomic_load(&g_servedCount), atomic_load(&g_fallbackCount),
                  atomic_load(&g_poolReady) ? @"ready" : @"not ready");
         });
