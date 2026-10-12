@@ -38,7 +38,6 @@ h1 { font-family: var(--serif); font-weight: 600; font-size: clamp(36px, 8vw, 50
 .divider span { font-size: 15px; letter-spacing: 2px; }
 section { margin: 0 0 8px; }
 h2 { font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 2.5px; color: var(--accent); text-align: center; margin: 0 0 22px; }
-.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 button, .drop { font-family: var(--sans); outline: none; }
 .btn {
   appearance: none; -webkit-appearance: none; background: transparent; color: var(--text); border: 1px solid var(--border);
@@ -46,13 +45,12 @@ button, .drop { font-family: var(--sans); outline: none; }
   width: 100%;
 }
 .btn.big { font-size: 13px; letter-spacing: 2.5px; padding: 14px 32px; }
-.seg .btn[aria-pressed="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
 .btn:disabled { opacity: 0.3; cursor: default; }
 @media (hover: hover) {
   .btn:not(:disabled):hover, .drop:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
 }
 .btn:not(:disabled):active { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
-.ver { margin-top: 14px; font-size: 13px; color: var(--accent-soft); font-style: italic; text-align: center; min-height: 22px; }
+.ver { margin-top: 16px; font-size: 13px; color: var(--accent-soft); font-style: italic; text-align: center; min-height: 22px; }
 .drop {
   display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 2px;
   border: 1px solid var(--border); padding: 30px 14px; cursor: pointer; transition: all 0.3s ease; background: transparent;
@@ -78,6 +76,19 @@ input[type=file] { display: none; }
 .note { font-size: 12px; color: var(--text-muted); text-align: center; letter-spacing: 0.5px; margin-top: 16px; line-height: 1.6; }
 .hidden { display: none !important; }
 .fail .stage { color: var(--err); }
+.row { display: flex; gap: 12px; margin-top: 18px; align-items: stretch; }
+.row .pop { position: relative; flex: 1 1 0; min-width: 0; }
+.row .pop .btn { padding: 13px 4px; font-size: 11px; letter-spacing: 1.4px; white-space: nowrap; }
+.row .inject { flex: 1.25 1 0; min-width: 0; padding: 13px 4px; font-size: 11px; letter-spacing: 1.4px; white-space: nowrap; }
+.row .btn.open { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
+.menu { position: absolute; left: 0; top: calc(100% + 6px); min-width: 100%; width: max-content; max-width: 78vw; max-height: 244px; overflow-y: auto; background: #000; border: 1px solid var(--accent); box-shadow: 0 0 15px var(--glow); z-index: 20; }
+.menu button { display: block; width: 100%; text-align: left; background: transparent; color: var(--text); border: 0; border-bottom: 1px solid #2a2a2a; padding: 12px 14px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 2px; cursor: pointer; transition: all 0.2s ease; white-space: nowrap; }
+.menu button:last-child { border-bottom: 0; }
+.menu button.sel { color: var(--accent); }
+.menu button:disabled { opacity: 0.3; cursor: default; }
+@media (hover: hover) { .menu button:not(:disabled):hover { background: var(--accent); color: var(--bg); } }
+.menu button:not(:disabled):active { background: var(--accent); color: var(--bg); }
+@media (max-width: 380px) { .row { flex-wrap: wrap; } .row .inject { flex: 1 1 100%; } }
 </style>
 </head>
 <body>
@@ -90,25 +101,17 @@ input[type=file] { display: none; }
   <div class="divider"><span>§</span></div>
 
   <section>
-    <h2>Tweak Build</h2>
-    <div class="seg" id="channels">
-      <button type="button" class="btn" data-ch="latest" aria-pressed="true">「 Release 」</button>
-      <button type="button" class="btn" data-ch="nightly" aria-pressed="false">「 Nightly 」</button>
-    </div>
-    <div class="ver" id="ver">Loading…</div>
-  </section>
-
-  <div class="divider"><span>§</span></div>
-
-  <section>
     <h2>Decrypted Game IPA</h2>
     <label class="drop" id="drop">
       <strong id="pickTitle">「 Choose .ipa 」</strong>
       <input type="file" id="file">
     </label>
-    <div class="actions">
-      <button class="btn big" id="go" disabled>「 Inject 」</button>
+    <div class="row">
+      <div class="pop"><button type="button" class="btn" id="channelBtn">「 Channel 」</button></div>
+      <div class="pop hidden" id="versionPop"><button type="button" class="btn" id="versionBtn">「 Version 」</button></div>
+      <button class="btn inject" id="go" disabled>「 Inject 」</button>
     </div>
+    <div class="ver" id="ver">Loading…</div>
   </section>
 
   <section id="progressCard" class="hidden">
@@ -129,14 +132,16 @@ input[type=file] { display: none; }
     </div>
     <div class="note">Sideload with SideStore, AltStore, Sideloadly or LiveContainer. They re-sign it for you.</div>
   </section>
-
 </div>
 
 <script type="module">
 import { inject } from "./js/inject.js";
 
 const $ = (id) => document.getElementById(id);
-const state = { channel: "latest", manifests: {}, file: null, outUrl: null, outBlob: null, outName: "" };
+const state = {
+  channel: "release", versions: [], version: null, manifests: {}, nightly: null,
+  file: null, busy: false, outUrl: null, outBlob: null, outName: "",
+};
 
 function fmtSize(n) {
   if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
@@ -152,31 +157,98 @@ function log(msg, cls) {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
+function basePath() {
+  return state.channel === "nightly" ? "payload/nightly/" : "payload/release/" + state.version + "/";
+}
+
+function current() {
+  return state.channel === "nightly" ? state.nightly : state.manifests[state.version];
+}
+
 function refresh() {
-  const m = state.manifests[state.channel];
-  $("ver").textContent = m ? "ZSingularity " + m.version + (m.build ? " · build " + m.build : "") : "Not published yet";
-  $("go").disabled = !(m && state.file);
-  for (const b of document.querySelectorAll("#channels button")) {
-    b.setAttribute("aria-pressed", String(b.dataset.ch === state.channel));
-    b.disabled = !state.manifests[b.dataset.ch];
-  }
+  const m = current();
+  const name = state.channel === "nightly" ? "Nightly" : "Release";
+  if (m) $("ver").textContent = name + " \u00b7 " + m.version + (m.build ? " \u00b7 build " + m.build : "");
+  else if (!state.versions.length && !state.nightly) $("ver").textContent = "No builds are published on this site yet.";
+  else $("ver").textContent = "Loading\u2026";
+  $("versionPop").classList.toggle("hidden", !(state.channel === "release" && state.versions.length));
+  $("channelBtn").disabled = state.busy;
+  $("versionBtn").disabled = state.busy;
+  $("go").disabled = !(m && state.file) || state.busy;
 }
 
-async function loadManifests() {
-  for (const ch of ["latest", "nightly"]) {
-    try {
-      const r = await fetch("payload/" + ch + "/manifest.json", { cache: "no-store" });
-      if (r.ok) state.manifests[ch] = await r.json();
-    } catch (e) {}
-  }
-  if (!state.manifests.latest && state.manifests.nightly) state.channel = "nightly";
-  if (!state.manifests.latest && !state.manifests.nightly) $("ver").textContent = "No builds are published on this site yet.";
-  else refresh();
+async function fetchJson(path) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return r.json();
 }
 
-for (const b of document.querySelectorAll("#channels button")) {
-  b.addEventListener("click", () => { state.channel = b.dataset.ch; refresh(); });
+async function ensureManifest(version) {
+  if (!state.manifests[version]) state.manifests[version] = await fetchJson("payload/release/" + version + "/manifest.json");
 }
+
+async function loadAll() {
+  try { state.nightly = await fetchJson("payload/nightly/manifest.json"); } catch (e) {}
+  try {
+    const idx = await fetchJson("payload/release/index.json");
+    state.versions = idx.versions || [];
+    if (state.versions.length) {
+      state.version = state.versions[0];
+      await ensureManifest(state.version);
+    }
+  } catch (e) { state.versions = []; }
+  if (!state.versions.length && state.nightly) state.channel = "nightly";
+  refresh();
+}
+
+let openMenu = null;
+
+function closeMenu() {
+  if (!openMenu) return;
+  openMenu.el.remove();
+  openMenu.btn.classList.remove("open");
+  openMenu = null;
+}
+
+function showMenu(btn, items, selected, onPick) {
+  if (openMenu && openMenu.btn === btn) { closeMenu(); return; }
+  closeMenu();
+  const el = document.createElement("div");
+  el.className = "menu";
+  for (const it of items) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = (it.value === selected ? "\u00a7 " : "") + it.label;
+    if (it.value === selected) b.className = "sel";
+    b.disabled = !!it.disabled;
+    b.addEventListener("click", () => { closeMenu(); onPick(it.value); });
+    el.appendChild(b);
+  }
+  btn.parentElement.appendChild(el);
+  btn.classList.add("open");
+  openMenu = { el, btn };
+}
+
+document.addEventListener("pointerdown", (e) => {
+  if (openMenu && !openMenu.el.contains(e.target) && !openMenu.btn.contains(e.target)) closeMenu();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+
+$("channelBtn").addEventListener("click", () => {
+  showMenu($("channelBtn"), [
+    { value: "release", label: "Release", disabled: !state.versions.length },
+    { value: "nightly", label: "Nightly", disabled: !state.nightly },
+  ], state.channel, (v) => { state.channel = v; refresh(); });
+});
+
+$("versionBtn").addEventListener("click", () => {
+  showMenu($("versionBtn"), state.versions.map((v) => ({ value: v, label: v })), state.version, async (v) => {
+    state.version = v;
+    refresh();
+    try { await ensureManifest(v); } catch (e) { $("ver").textContent = "Could not load " + v; return; }
+    refresh();
+  });
+});
 
 function setFile(f) {
   state.file = f || null;
@@ -226,27 +298,32 @@ function reset() {
 const STAGE_SPAN = { "Reading IPA": [0, 0.05], "Patching Info.plist": [0.05, 0.08], "Patching executable": [0.08, 0.7], "Writing IPA": [0.7, 1], Done: [1, 1] };
 
 $("go").addEventListener("click", async () => {
-  const m = state.manifests[state.channel];
+  const m = current();
   if (!m || !state.file) return;
+  closeMenu();
   reset();
-  $("go").disabled = true;
+  state.busy = true;
+  refresh();
+  const base = basePath();
   let lock = null;
   try { lock = await navigator.wakeLock?.request("screen"); } catch (e) {}
   const t0 = performance.now();
   try {
     $("stage").textContent = "Downloading tweak payload";
-    log("Fetching " + m.dylib.file + (state.manifests[state.channel].build ? " (build " + m.build + ")" : ""));
-    const dylib = new Uint8Array(await fetchVerified("payload/" + state.channel + "/" + m.dylib.file, m.dylib.sha256));
-    if (!m.appex) throw new Error("This build has no ZSRamDonor.appex.zip published, so it can't be injected.");
-    const appex = new Blob([await fetchVerified("payload/" + state.channel + "/" + m.appex.file, m.appex.sha256)]);
-    log("Fetched " + m.appex.file);
+    log("Fetching " + m.dylib.file + " (" + m.version + (m.build ? ", build " + m.build : "") + ")");
+    const dylib = new Uint8Array(await fetchVerified(base + m.dylib.file, m.dylib.sha256));
+    let appex = null;
+    if (m.appex) {
+      appex = new Blob([await fetchVerified(base + m.appex.file, m.appex.sha256)]);
+      log("Fetched " + m.appex.file);
+    } else log("No extension in this build, skipping embed");
     log("Checksums OK", "k");
     let lastStage = "";
     const res = await inject(state.file, { dylib, appex }, {
       onProgress(stage, f) {
         const [a, b] = STAGE_SPAN[stage] || [0, 1];
         $("barFill").style.width = Math.round((a + (b - a) * f) * 100) + "%";
-        if (stage !== lastStage) { lastStage = stage; $("stage").textContent = stage + "…"; log(stage); }
+        if (stage !== lastStage) { lastStage = stage; $("stage").textContent = stage + "\u2026"; log(stage); }
       },
     });
     for (const w of res.warnings) log(w, "w");
@@ -254,8 +331,8 @@ $("go").addEventListener("click", async () => {
     state.outName = "LC" + res.gameVersion + "\u2014ZS" + m.version + ".ipa";
     state.outUrl = URL.createObjectURL(res.blob);
     $("stage").textContent = "Done in " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
-    log("Game " + res.gameVersion + " · " + res.arch.join("+") + " · " + res.appId, "k");
-    $("outMeta").textContent = state.outName + " · " + fmtSize(res.blob.size);
+    log("Game " + res.gameVersion + " \u00b7 " + res.arch.join("+") + " \u00b7 " + res.appId, "k");
+    $("outMeta").textContent = state.outName + " \u00b7 " + fmtSize(res.blob.size);
     $("result").classList.remove("hidden");
     const canShare = (() => { try { return !!(navigator.canShare && navigator.canShare({ files: [new File([new Blob()], "x.ipa")] })); } catch (e) { return false; } })();
     $("share").classList.toggle("hidden", !canShare);
@@ -266,6 +343,7 @@ $("go").addEventListener("click", async () => {
     log(err && err.message ? err.message : String(err), "e");
   } finally {
     try { await lock?.release(); } catch (e) {}
+    state.busy = false;
     refresh();
   }
 });
@@ -287,7 +365,7 @@ $("share").addEventListener("click", async () => {
   } catch (e) {}
 });
 
-loadManifests();
+loadAll();
 </script>
 </body>
 </html>
