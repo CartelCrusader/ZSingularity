@@ -3598,7 +3598,7 @@ static UIStackView *zs_make_lowres_info_view(id target, SEL action, SEL codecAct
 static UIControl *zs_make_disclosure_row(NSString *title, NSString *value, id target, SEL action) {
     UIControl *row = [[UIControl alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
-    [row addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
+    if (target && action) [row addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
 
     UILabel *titleLabel = [[UILabel alloc] init];
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3653,6 +3653,36 @@ static UIControl *zs_make_disclosure_row(NSString *title, NSString *value, id ta
 static void zs_disclosure_row_set_value(UIControl *row, NSString *value) {
     UILabel *valueLabel = objc_getAssociatedObject(row, "zs_valueLabel");
     valueLabel.text = value;
+}
+
+static void zs_disclosure_row_install_menu(UIControl *row, NSArray<NSString *> *titles, NSInteger selectedIndex, void (^onSelect)(NSInteger index)) {
+    __weak UIControl *weakRow = row;
+    void (^builder)(NSInteger) = ^(NSInteger current) {
+        UIControl *strongRow = weakRow;
+        if (!strongRow) return;
+        NSMutableArray<UIMenuElement *> *actions = [NSMutableArray arrayWithCapacity:titles.count];
+        for (NSUInteger i = 0; i < titles.count; i++) {
+            NSInteger index = (NSInteger)i;
+            UIAction *action = [UIAction actionWithTitle:titles[i] image:nil identifier:nil handler:^(__kindof UIAction *picked) {
+                UIControl *innerRow = weakRow;
+                if (!innerRow) return;
+                zs_disclosure_row_set_value(innerRow, titles[index]);
+                void (^refresh)(NSInteger) = objc_getAssociatedObject(innerRow, "zs_menuRebuild");
+                if (refresh) refresh(index);
+                if (onSelect) onSelect(index);
+                UISelectionFeedbackGenerator *haptic = [UISelectionFeedbackGenerator new];
+                [haptic selectionChanged];
+            }];
+            action.state = index == current ? UIMenuElementStateOn : UIMenuElementStateOff;
+            [actions addObject:action];
+        }
+        strongRow.menu = [UIMenu menuWithTitle:@"" children:actions];
+    };
+    objc_setAssociatedObject(row, "zs_menuRebuild", builder, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    NSInteger clamped = MAX((NSInteger)0, MIN((NSInteger)titles.count - 1, selectedIndex));
+    zs_disclosure_row_set_value(row, titles[clamped]);
+    builder(clamped);
+    row.showsMenuAsPrimaryAction = YES;
 }
 
 static UIView *zs_enclosing_grouped_card(UIView *view) {
@@ -9343,8 +9373,12 @@ static const CGFloat kContentFadeHeight = 22;
     ZSRow *ramHudRow = zs_make_switch_row(@"Memory Usage HUD", zs_ram_hud_enabled());
     [ramHudRow.toggle addTarget:self action:@selector(ramHudChanged:) forControlEvents:UIControlEventValueChanged];
 
-    ZSRow *ramRedirectModeRow = zs_make_mode_slider_row(@"Redirect minimum", @[@"256 KB", @"16 KB"], zs_ram_redirect_mode(), 0);
-    [ramRedirectModeRow.modeSlider addTarget:self action:@selector(ramRedirectModeChanged:) forControlEvents:UIControlEventValueChanged];
+    __weak typeof(self) weakRedirectSelf = self;
+    UIControl *ramRedirectModeRow = zs_make_disclosure_row(@"Redirect minimum", @"", nil, NULL);
+    zs_disclosure_row_install_menu(ramRedirectModeRow, @[@"256 KB", @"16 KB"], zs_ram_redirect_mode(), ^(NSInteger index) {
+        zs_set_ram_redirect_mode(index);
+        [weakRedirectSelf zs_scheduleSave];
+    });
 
     UIButton *memoryCleanupButton = zs_make_grouped_action_button(@"Memory cleanup", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [memoryCleanupButton addTarget:self action:@selector(memoryCleanupTapped:) forControlEvents:UIControlEventTouchUpInside];
@@ -21484,11 +21518,6 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
 - (void)ramHudChanged:(UISwitch *)toggle {
     zs_set_ram_hud_enabled(toggle.on);
     [[ZSMetalTabs shared] setRamHudVisible:toggle.on];
-}
-
-- (void)ramRedirectModeChanged:(ZSModeSlider *)slider {
-    zs_set_ram_redirect_mode(slider.selectedIndex);
-    [self zs_scheduleSave];
 }
 
 - (void)nightlyReleasesEnabledChanged:(UISwitch *)toggle {
