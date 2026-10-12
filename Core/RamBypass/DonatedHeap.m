@@ -20,12 +20,17 @@
 static NSString * const kZSRamBypassSection = @"ramBypass";
 static NSString * const kZSRamBypassEnabledKey = @"enabled";
 static NSString * const kZSRamBypassHudKey = @"hud";
+static NSString * const kZSRamRedirectModeKey = @"redirectMode";
 
 #define ZS_MALLOC_ALLOCATION_MAGIC 0x5A534D414C4C4F43ull
 #define ZS_MALLOC_SLAB_MAGIC 0x5A53534C41424D47ull
 #define ZS_MALLOC_SMALL_CLASS_COUNT 4096
+#define ZS_MALLOC_SHARD_COUNT 64
 #define ZS_MALLOC_KIND_LARGE 1u
 #define ZS_MALLOC_KIND_SMALL 2u
+#define ZS_POOL_SIZE_BIN_COUNT 64
+#define ZS_POOL_RANGE_NONE UINT32_MAX
+#define ZS_MALLOC_MAX_CLASS_BLOCK_SIZE ((ZS_MALLOC_SMALL_CLASS_COUNT - 1u) * 16u)
 
 typedef struct __attribute__((aligned(16))) {
     uint64_t magic;
@@ -37,15 +42,17 @@ typedef struct __attribute__((aligned(16))) {
     uint32_t classIndex;
 } ZSMallocAllocationHeader;
 
-typedef struct ZSMallocSlab {
+typedef struct __attribute__((aligned(16))) ZSMallocSlab {
     uint64_t magic;
     uint32_t classIndex;
     uint32_t blockSize;
     uint32_t totalBlocks;
     uint32_t freeBlocks;
+    uint32_t spanSize;
+    uint32_t linked;
     uintptr_t freeList;
     struct ZSMallocSlab *next;
-    uint64_t reserved;
+    struct ZSMallocSlab *prev;
 } ZSMallocSlab;
 
 #ifndef VM_FLAGS_OVERWRITE
@@ -55,13 +62,20 @@ typedef struct ZSMallocSlab {
 static const uint64_t kZSDonatedTargetBytes = 3ull * 1024ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinimumBytes = 256ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinAllocation = 256ull * 1024ull;
-static const uint64_t kZSDonatedLogStride = 256ull * 1024ull * 1024ull;
+static const uint64_t kZSDonatedMinAllocation16KB = 16ull * 1024ull;
 
 #define ZS_POOL_MAX_FREE 8192
 
 typedef struct {
     uint64_t offset;
     uint64_t size;
+    uint32_t sizePrev;
+    uint32_t sizeNext;
+    uint32_t treeLeft;
+    uint32_t treeRight;
+    uint32_t treeParent;
+    uint32_t treeHeight;
+    uint8_t inUse;
 } ZSPoolRange;
 
 static struct {
@@ -71,13 +85,17 @@ static struct {
     uint64_t cleanOffset;
     uint64_t used;
     uint32_t freeCount;
+    uint32_t freeNodeHead;
+    uint32_t addressRoot;
+    uint32_t sizeBins[ZS_POOL_SIZE_BIN_COUNT];
     ZSPoolRange free[ZS_POOL_MAX_FREE];
 } g_pool;
 
 static _Atomic(uint8_t) g_poolReady;
 static _Atomic(uint8_t) g_mallocAllocationEnabled;
 static _Atomic(uint8_t) g_mallocZoneRegistered;
-static os_unfair_lock g_mallocZoneLock = OS_UNFAIR_LOCK_INIT;
+static _Atomic(uint8_t) g_mallocRedirect16KB;
+static os_unfair_lock g_mallocShardLocks[ZS_MALLOC_SHARD_COUNT];
 static ZSMallocSlab *g_mallocSlabs[ZS_MALLOC_SMALL_CLASS_COUNT];
 static malloc_zone_t g_mallocZone;
 static malloc_introspection_t g_mallocIntrospection;
@@ -145,6 +163,29 @@ void zs_set_ram_hud_enabled(BOOL enabled)
     NSMutableDictionary *section = [zs_settings_section(kZSRamBypassSection) mutableCopy] ?: [NSMutableDictionary new];
     section[kZSRamBypassHudKey] = @(enabled);
     zs_write_settings_section(kZSRamBypassSection, section);
+}
+
+NSInteger zs_ram_redirect_mode(void)
+{
+    id stored = zs_settings_section(kZSRamBypassSection)[kZSRamRedirectModeKey];
+    NSInteger mode = [stored respondsToSelector:@selector(integerValue)] ? [stored integerValue] : 0;
+    return mode == 1 ? 1 : 0;
+}
+
+void zs_set_ram_redirect_mode(NSInteger mode)
+{
+    mode = mode == 1 ? 1 : 0;
+    atomic_store_explicit(&g_mallocRedirect16KB, mode == 1, memory_order_release);
+    NSMutableDictionary *section = [zs_settings_section(kZSRamBypassSection) mutableCopy] ?: [NSMutableDictionary new];
+    section[kZSRamRedirectModeKey] = @(mode);
+    zs_write_settings_section(kZSRamBypassSection, section);
+}
+
+static uint64_t zs_donated_min_allocation(void)
+{
+    return atomic_load_explicit(&g_mallocRedirect16KB, memory_order_acquire)
+        ? kZSDonatedMinAllocation16KB
+        : kZSDonatedMinAllocation;
 }
 
 void zs_set_donated_heap_enabled(BOOL enabled)
@@ -240,61 +281,406 @@ static inline BOOL zs_pool_contains(const void *address, uint64_t length)
     return start >= g_pool.base && start + length <= g_pool.base + g_pool.size && start + length >= start;
 }
 
-static void zs_pool_log_async(uint64_t used)
+static uint32_t zs_pool_size_bin(uint64_t size)
 {
-    const uint64_t served = atomic_load(&g_servedCount);
-    const uint64_t fallback = atomic_load(&g_fallbackCount);
+    uint64_t pages = MAX(size / vm_page_size, (uint64_t)1);
+    uint32_t bin = 0;
 
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        ZLog(@"[RamBypass] %llu MB of %llu MB in use, %llu allocations served, %llu large allocations fell through",
-             used / (1024 * 1024), g_pool.size / (1024 * 1024), served, fallback);
-    });
+    while (pages > 1 && bin + 1 < ZS_POOL_SIZE_BIN_COUNT)
+    {
+        pages >>= 1;
+        bin++;
+    }
+
+    return bin;
+}
+
+static void zs_pool_size_bin_remove(uint32_t index)
+{
+    ZSPoolRange *range = &g_pool.free[index];
+    const uint32_t bin = zs_pool_size_bin(range->size);
+
+    if (range->sizePrev != ZS_POOL_RANGE_NONE)
+    {
+        g_pool.free[range->sizePrev].sizeNext = range->sizeNext;
+    }
+    else
+    {
+        g_pool.sizeBins[bin] = range->sizeNext;
+    }
+
+    if (range->sizeNext != ZS_POOL_RANGE_NONE)
+    {
+        g_pool.free[range->sizeNext].sizePrev = range->sizePrev;
+    }
+
+    range->sizePrev = ZS_POOL_RANGE_NONE;
+    range->sizeNext = ZS_POOL_RANGE_NONE;
+}
+
+static void zs_pool_size_bin_insert(uint32_t index)
+{
+    ZSPoolRange *range = &g_pool.free[index];
+    const uint32_t bin = zs_pool_size_bin(range->size);
+    const uint32_t head = g_pool.sizeBins[bin];
+
+    range->sizePrev = ZS_POOL_RANGE_NONE;
+    range->sizeNext = head;
+
+    if (head != ZS_POOL_RANGE_NONE)
+    {
+        g_pool.free[head].sizePrev = index;
+    }
+
+    g_pool.sizeBins[bin] = index;
+}
+
+static uint32_t zs_pool_tree_height(uint32_t index)
+{
+    return index == ZS_POOL_RANGE_NONE ? 0 : g_pool.free[index].treeHeight;
+}
+
+static void zs_pool_tree_update_height(uint32_t index)
+{
+    const uint32_t leftHeight = zs_pool_tree_height(g_pool.free[index].treeLeft);
+    const uint32_t rightHeight = zs_pool_tree_height(g_pool.free[index].treeRight);
+    g_pool.free[index].treeHeight = 1 + MAX(leftHeight, rightHeight);
+}
+
+static uint32_t zs_pool_tree_rotate_left(uint32_t index)
+{
+    ZSPoolRange *node = &g_pool.free[index];
+    const uint32_t pivot = node->treeRight;
+    ZSPoolRange *pivotNode = &g_pool.free[pivot];
+    const uint32_t parent = node->treeParent;
+    const uint32_t middle = pivotNode->treeLeft;
+
+    if (parent == ZS_POOL_RANGE_NONE)
+    {
+        g_pool.addressRoot = pivot;
+    }
+    else if (g_pool.free[parent].treeLeft == index)
+    {
+        g_pool.free[parent].treeLeft = pivot;
+    }
+    else
+    {
+        g_pool.free[parent].treeRight = pivot;
+    }
+
+    pivotNode->treeParent = parent;
+    pivotNode->treeLeft = index;
+    node->treeParent = pivot;
+    node->treeRight = middle;
+
+    if (middle != ZS_POOL_RANGE_NONE)
+    {
+        g_pool.free[middle].treeParent = index;
+    }
+
+    zs_pool_tree_update_height(index);
+    zs_pool_tree_update_height(pivot);
+    return pivot;
+}
+
+static uint32_t zs_pool_tree_rotate_right(uint32_t index)
+{
+    ZSPoolRange *node = &g_pool.free[index];
+    const uint32_t pivot = node->treeLeft;
+    ZSPoolRange *pivotNode = &g_pool.free[pivot];
+    const uint32_t parent = node->treeParent;
+    const uint32_t middle = pivotNode->treeRight;
+
+    if (parent == ZS_POOL_RANGE_NONE)
+    {
+        g_pool.addressRoot = pivot;
+    }
+    else if (g_pool.free[parent].treeLeft == index)
+    {
+        g_pool.free[parent].treeLeft = pivot;
+    }
+    else
+    {
+        g_pool.free[parent].treeRight = pivot;
+    }
+
+    pivotNode->treeParent = parent;
+    pivotNode->treeRight = index;
+    node->treeParent = pivot;
+    node->treeLeft = middle;
+
+    if (middle != ZS_POOL_RANGE_NONE)
+    {
+        g_pool.free[middle].treeParent = index;
+    }
+
+    zs_pool_tree_update_height(index);
+    zs_pool_tree_update_height(pivot);
+    return pivot;
+}
+
+static void zs_pool_tree_rebalance(uint32_t index)
+{
+    while (index != ZS_POOL_RANGE_NONE)
+    {
+        zs_pool_tree_update_height(index);
+        const int balance = (int)zs_pool_tree_height(g_pool.free[index].treeLeft) -
+                            (int)zs_pool_tree_height(g_pool.free[index].treeRight);
+
+        if (balance > 1)
+        {
+            const uint32_t left = g_pool.free[index].treeLeft;
+            if (zs_pool_tree_height(g_pool.free[left].treeLeft) < zs_pool_tree_height(g_pool.free[left].treeRight))
+            {
+                zs_pool_tree_rotate_left(left);
+            }
+
+            const uint32_t root = zs_pool_tree_rotate_right(index);
+            index = g_pool.free[root].treeParent;
+        }
+        else if (balance < -1)
+        {
+            const uint32_t right = g_pool.free[index].treeRight;
+            if (zs_pool_tree_height(g_pool.free[right].treeRight) < zs_pool_tree_height(g_pool.free[right].treeLeft))
+            {
+                zs_pool_tree_rotate_right(right);
+            }
+
+            const uint32_t root = zs_pool_tree_rotate_left(index);
+            index = g_pool.free[root].treeParent;
+        }
+        else
+        {
+            index = g_pool.free[index].treeParent;
+        }
+    }
+}
+
+static void zs_pool_address_insert(uint32_t index)
+{
+    ZSPoolRange *range = &g_pool.free[index];
+    range->treeLeft = ZS_POOL_RANGE_NONE;
+    range->treeRight = ZS_POOL_RANGE_NONE;
+    range->treeParent = ZS_POOL_RANGE_NONE;
+    range->treeHeight = 1;
+
+    if (g_pool.addressRoot == ZS_POOL_RANGE_NONE)
+    {
+        g_pool.addressRoot = index;
+        return;
+    }
+
+    uint32_t cursor = g_pool.addressRoot;
+    uint32_t parent = ZS_POOL_RANGE_NONE;
+
+    while (cursor != ZS_POOL_RANGE_NONE)
+    {
+        parent = cursor;
+        cursor = range->offset < g_pool.free[cursor].offset
+            ? g_pool.free[cursor].treeLeft
+            : g_pool.free[cursor].treeRight;
+    }
+
+    range->treeParent = parent;
+    if (range->offset < g_pool.free[parent].offset)
+    {
+        g_pool.free[parent].treeLeft = index;
+    }
+    else
+    {
+        g_pool.free[parent].treeRight = index;
+    }
+
+    zs_pool_tree_rebalance(parent);
+}
+
+static void zs_pool_address_neighbors(uint64_t offset, uint32_t *previous, uint32_t *next)
+{
+    uint32_t cursor = g_pool.addressRoot;
+    *previous = ZS_POOL_RANGE_NONE;
+    *next = ZS_POOL_RANGE_NONE;
+
+    while (cursor != ZS_POOL_RANGE_NONE)
+    {
+        if (g_pool.free[cursor].offset < offset)
+        {
+            *previous = cursor;
+            cursor = g_pool.free[cursor].treeRight;
+        }
+        else
+        {
+            *next = cursor;
+            cursor = g_pool.free[cursor].treeLeft;
+        }
+    }
+}
+
+static uint32_t zs_pool_tree_minimum(uint32_t index)
+{
+    while (g_pool.free[index].treeLeft != ZS_POOL_RANGE_NONE)
+    {
+        index = g_pool.free[index].treeLeft;
+    }
+
+    return index;
+}
+
+static void zs_pool_tree_transplant(uint32_t oldIndex, uint32_t newIndex)
+{
+    const uint32_t parent = g_pool.free[oldIndex].treeParent;
+
+    if (parent == ZS_POOL_RANGE_NONE)
+    {
+        g_pool.addressRoot = newIndex;
+    }
+    else if (g_pool.free[parent].treeLeft == oldIndex)
+    {
+        g_pool.free[parent].treeLeft = newIndex;
+    }
+    else
+    {
+        g_pool.free[parent].treeRight = newIndex;
+    }
+
+    if (newIndex != ZS_POOL_RANGE_NONE)
+    {
+        g_pool.free[newIndex].treeParent = parent;
+    }
+}
+
+static void zs_pool_address_remove(uint32_t index)
+{
+    ZSPoolRange *range = &g_pool.free[index];
+    uint32_t rebalanceFrom;
+
+    if (range->treeLeft == ZS_POOL_RANGE_NONE)
+    {
+        rebalanceFrom = range->treeParent;
+        zs_pool_tree_transplant(index, range->treeRight);
+    }
+    else if (range->treeRight == ZS_POOL_RANGE_NONE)
+    {
+        rebalanceFrom = range->treeParent;
+        zs_pool_tree_transplant(index, range->treeLeft);
+    }
+    else
+    {
+        const uint32_t successor = zs_pool_tree_minimum(range->treeRight);
+
+        if (g_pool.free[successor].treeParent != index)
+        {
+            rebalanceFrom = g_pool.free[successor].treeParent;
+            zs_pool_tree_transplant(successor, g_pool.free[successor].treeRight);
+            g_pool.free[successor].treeRight = range->treeRight;
+            g_pool.free[range->treeRight].treeParent = successor;
+        }
+        else
+        {
+            rebalanceFrom = successor;
+        }
+
+        zs_pool_tree_transplant(index, successor);
+        g_pool.free[successor].treeLeft = range->treeLeft;
+        g_pool.free[range->treeLeft].treeParent = successor;
+    }
+
+    range->treeLeft = ZS_POOL_RANGE_NONE;
+    range->treeRight = ZS_POOL_RANGE_NONE;
+    range->treeParent = ZS_POOL_RANGE_NONE;
+    range->treeHeight = 0;
+
+    if (rebalanceFrom != ZS_POOL_RANGE_NONE)
+    {
+        zs_pool_tree_rebalance(rebalanceFrom);
+    }
+}
+
+static uint32_t zs_pool_range_acquire(void)
+{
+    const uint32_t index = g_pool.freeNodeHead;
+
+    if (index == ZS_POOL_RANGE_NONE)
+    {
+        return ZS_POOL_RANGE_NONE;
+    }
+
+    g_pool.freeNodeHead = g_pool.free[index].sizeNext;
+    g_pool.free[index].inUse = 1;
+    g_pool.free[index].sizePrev = ZS_POOL_RANGE_NONE;
+    g_pool.free[index].sizeNext = ZS_POOL_RANGE_NONE;
+    g_pool.free[index].treeLeft = ZS_POOL_RANGE_NONE;
+    g_pool.free[index].treeRight = ZS_POOL_RANGE_NONE;
+    g_pool.free[index].treeParent = ZS_POOL_RANGE_NONE;
+    g_pool.free[index].treeHeight = 0;
+    return index;
+}
+
+static void zs_pool_range_release(uint32_t index)
+{
+    ZSPoolRange *range = &g_pool.free[index];
+    range->inUse = 0;
+    range->sizePrev = ZS_POOL_RANGE_NONE;
+    range->sizeNext = g_pool.freeNodeHead;
+    range->treeLeft = ZS_POOL_RANGE_NONE;
+    range->treeRight = ZS_POOL_RANGE_NONE;
+    range->treeParent = ZS_POOL_RANGE_NONE;
+    range->treeHeight = 0;
+    g_pool.freeNodeHead = index;
 }
 
 static void *zs_pool_take(uint64_t length)
 {
+    if (length == 0 || length > UINT64_MAX - ((uint64_t)vm_page_size - 1))
+    {
+        return NULL;
+    }
+
     const uint64_t need = zs_round_page(length);
     void *result = NULL;
-    BOOL dirty = NO;
-    BOOL crossedStride = NO;
-    uint64_t usedAfter = 0;
 
     os_unfair_lock_lock(&g_pool.lock);
 
-    int best = -1;
-    uint64_t bestSize = UINT64_MAX;
+    const uint32_t firstBin = zs_pool_size_bin(need);
+    uint32_t selected = ZS_POOL_RANGE_NONE;
 
-    for (uint32_t i = 0; i < g_pool.freeCount; i++)
+    for (uint32_t bin = firstBin; bin < ZS_POOL_SIZE_BIN_COUNT && selected == ZS_POOL_RANGE_NONE; bin++)
     {
-        const uint64_t candidate = g_pool.free[i].size;
-
-        if (candidate >= need && candidate < bestSize)
+        if (bin == firstBin)
         {
-            best = (int)i;
-            bestSize = candidate;
-
-            if (candidate == need)
+            for (uint32_t index = g_pool.sizeBins[bin]; index != ZS_POOL_RANGE_NONE; index = g_pool.free[index].sizeNext)
             {
-                break;
+                if (g_pool.free[index].size >= need)
+                {
+                    selected = index;
+                    break;
+                }
             }
+        }
+        else if (g_pool.sizeBins[bin] != ZS_POOL_RANGE_NONE)
+        {
+            selected = g_pool.sizeBins[bin];
         }
     }
 
-    if (best >= 0)
+    if (selected != ZS_POOL_RANGE_NONE)
     {
-        result = (void *)(g_pool.base + g_pool.free[best].offset);
-        dirty = YES;
+        ZSPoolRange *range = &g_pool.free[selected];
+        result = (void *)(g_pool.base + range->offset);
+        zs_pool_size_bin_remove(selected);
 
-        if (g_pool.free[best].size == need)
+        if (range->size == need)
         {
-            memmove(&g_pool.free[best], &g_pool.free[best + 1],
-                    (g_pool.freeCount - (uint32_t)best - 1) * sizeof(ZSPoolRange));
+            zs_pool_address_remove(selected);
+            zs_pool_range_release(selected);
             g_pool.freeCount--;
         }
         else
         {
-            g_pool.free[best].offset += need;
-            g_pool.free[best].size -= need;
+            zs_pool_address_remove(selected);
+            range->offset += need;
+            range->size -= need;
+            zs_pool_address_insert(selected);
+            zs_pool_size_bin_insert(selected);
         }
     }
     else if (g_pool.size - g_pool.cleanOffset >= need)
@@ -305,10 +691,7 @@ static void *zs_pool_take(uint64_t length)
 
     if (result)
     {
-        const uint64_t before = g_pool.used;
         g_pool.used += need;
-        usedAfter = g_pool.used;
-        crossedStride = (before / kZSDonatedLogStride) != (usedAfter / kZSDonatedLogStride);
     }
 
     os_unfair_lock_unlock(&g_pool.lock);
@@ -318,17 +701,7 @@ static void *zs_pool_take(uint64_t length)
         return NULL;
     }
 
-    if (dirty)
-    {
-        memset(result, 0, need);
-    }
-
     atomic_fetch_add(&g_servedCount, 1);
-
-    if (crossedStride)
-    {
-        zs_pool_log_async(usedAfter);
-    }
 
     return result;
 }
@@ -336,8 +709,14 @@ static void *zs_pool_take(uint64_t length)
 static void zs_pool_give(void *address, uint64_t length)
 {
     const uint64_t size = zs_round_page(length);
-    const uint64_t offset = (uintptr_t)address - g_pool.base;
+    const uintptr_t pointer = (uintptr_t)address;
 
+    if (pointer < g_pool.base || size > g_pool.size || pointer - g_pool.base > g_pool.size - size)
+    {
+        return;
+    }
+
+    const uint64_t offset = pointer - g_pool.base;
     os_unfair_lock_lock(&g_pool.lock);
 
     if (offset + size > g_pool.cleanOffset)
@@ -346,17 +725,14 @@ static void zs_pool_give(void *address, uint64_t length)
         return;
     }
 
-    uint32_t index = 0;
+    uint32_t previous = ZS_POOL_RANGE_NONE;
+    uint32_t next = ZS_POOL_RANGE_NONE;
+    zs_pool_address_neighbors(offset, &previous, &next);
 
-    while (index < g_pool.freeCount && g_pool.free[index].offset < offset)
-    {
-        index++;
-    }
-
-    const BOOL overlapsPrevious = index > 0 &&
-        g_pool.free[index - 1].offset + g_pool.free[index - 1].size > offset;
-    const BOOL overlapsNext = index < g_pool.freeCount &&
-        g_pool.free[index].offset < offset + size;
+    const BOOL overlapsPrevious = previous != ZS_POOL_RANGE_NONE &&
+        g_pool.free[previous].offset + g_pool.free[previous].size > offset;
+    const BOOL overlapsNext = next != ZS_POOL_RANGE_NONE &&
+        g_pool.free[next].offset < offset + size;
 
     if (overlapsPrevious || overlapsNext)
     {
@@ -364,44 +740,62 @@ static void zs_pool_give(void *address, uint64_t length)
         return;
     }
 
-    const BOOL mergesPrevious = index > 0 &&
-        g_pool.free[index - 1].offset + g_pool.free[index - 1].size == offset;
-    const BOOL mergesNext = index < g_pool.freeCount &&
-        g_pool.free[index].offset == offset + size;
+    const BOOL mergesPrevious = previous != ZS_POOL_RANGE_NONE &&
+        g_pool.free[previous].offset + g_pool.free[previous].size == offset;
+    const BOOL mergesNext = next != ZS_POOL_RANGE_NONE &&
+        g_pool.free[next].offset == offset + size;
 
     if (mergesPrevious && mergesNext)
     {
-        g_pool.free[index - 1].size += size + g_pool.free[index].size;
-        memmove(&g_pool.free[index], &g_pool.free[index + 1],
-                (g_pool.freeCount - index - 1) * sizeof(ZSPoolRange));
+        zs_pool_size_bin_remove(previous);
+        zs_pool_size_bin_remove(next);
+        const uint64_t nextSize = g_pool.free[next].size;
+        zs_pool_address_remove(next);
+        g_pool.free[previous].size += size + nextSize;
+        zs_pool_range_release(next);
         g_pool.freeCount--;
+        zs_pool_size_bin_insert(previous);
     }
     else if (mergesPrevious)
     {
-        g_pool.free[index - 1].size += size;
+        zs_pool_size_bin_remove(previous);
+        g_pool.free[previous].size += size;
+        zs_pool_size_bin_insert(previous);
     }
     else if (mergesNext)
     {
-        g_pool.free[index].offset = offset;
-        g_pool.free[index].size += size;
+        zs_pool_size_bin_remove(next);
+        zs_pool_address_remove(next);
+        g_pool.free[next].offset = offset;
+        g_pool.free[next].size += size;
+        zs_pool_address_insert(next);
+        zs_pool_size_bin_insert(next);
     }
-    else if (g_pool.freeCount < ZS_POOL_MAX_FREE)
+    else
     {
-        memmove(&g_pool.free[index + 1], &g_pool.free[index],
-                (g_pool.freeCount - index) * sizeof(ZSPoolRange));
-        g_pool.free[index].offset = offset;
-        g_pool.free[index].size = size;
+        uint32_t index = zs_pool_range_acquire();
+
+        if (index == ZS_POOL_RANGE_NONE)
+        {
+            os_unfair_lock_unlock(&g_pool.lock);
+            if (!atomic_exchange(&g_freeOverflowLogged, 1))
+            {
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                    ZLog(@"[RamBypass] free range metadata is exhausted, further fragmented frees are leaked");
+                });
+            }
+            return;
+        }
+
+        ZSPoolRange *range = &g_pool.free[index];
+        range->offset = offset;
+        range->size = size;
+        zs_pool_address_insert(index);
+        zs_pool_size_bin_insert(index);
         g_pool.freeCount++;
-    }
-    else if (!atomic_exchange(&g_freeOverflowLogged, 1))
-    {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            ZLog(@"[RamBypass] free list is full, further fragmented frees are leaked");
-        });
     }
 
     g_pool.used -= MIN(g_pool.used, size);
-
     os_unfair_lock_unlock(&g_pool.lock);
 }
 
@@ -412,6 +806,25 @@ static void zs_pool_install(void *base, uint64_t size)
     g_pool.cleanOffset = 0;
     g_pool.used = 0;
     g_pool.freeCount = 0;
+    g_pool.addressRoot = ZS_POOL_RANGE_NONE;
+    g_pool.freeNodeHead = 0;
+
+    for (uint32_t i = 0; i < ZS_POOL_SIZE_BIN_COUNT; i++)
+    {
+        g_pool.sizeBins[i] = ZS_POOL_RANGE_NONE;
+    }
+
+    for (uint32_t i = 0; i < ZS_POOL_MAX_FREE; i++)
+    {
+        ZSPoolRange *range = &g_pool.free[i];
+        range->inUse = 0;
+        range->sizePrev = ZS_POOL_RANGE_NONE;
+        range->sizeNext = i + 1 < ZS_POOL_MAX_FREE ? i + 1 : ZS_POOL_RANGE_NONE;
+        range->treeLeft = ZS_POOL_RANGE_NONE;
+        range->treeRight = ZS_POOL_RANGE_NONE;
+        range->treeParent = ZS_POOL_RANGE_NONE;
+        range->treeHeight = 0;
+    }
 
     atomic_store_explicit(&g_poolReady, 1, memory_order_release);
 
@@ -421,7 +834,7 @@ static void zs_pool_install(void *base, uint64_t size)
     }
 
     ZLog(@"[RamBypass] pool ready: %llu MB at %p, serving anonymous mappings of %llu KB or more",
-         size / (1024 * 1024), base, kZSDonatedMinAllocation / 1024);
+         size / (1024 * 1024), base, zs_donated_min_allocation() / 1024);
 }
 
 static void zs_log_rejected_mmap(size_t length, void *address, int prot, int flags, int fd)
@@ -441,7 +854,7 @@ static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int
 {
     const BOOL anonymous = (flags & MAP_ANON) != 0 && (fd == -1 || ((uint32_t)fd & 0xff000000u) != 0);
 
-    const BOOL large = length >= kZSDonatedMinAllocation;
+    const BOOL large = length >= zs_donated_min_allocation();
     const BOOL eligible = large && anonymous &&
         (flags & MAP_PRIVATE) != 0 && (flags & (MAP_FIXED | MAP_JIT | MAP_SHARED)) == 0 &&
         prot == (PROT_READ | PROT_WRITE);
@@ -475,6 +888,7 @@ static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int
 
             if (served)
             {
+                memset(served, 0, zs_round_page(length));
                 return served;
             }
         }
@@ -510,7 +924,7 @@ static void zs_log_rejected_vm(const char *api, uint64_t length, int flags)
 
 static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *address, uint64_t size, int flags)
 {
-    if (!address || target != mach_task_self() || size < kZSDonatedMinAllocation)
+    if (!address || target != mach_task_self() || size < zs_donated_min_allocation())
     {
         return NO;
     }
@@ -536,6 +950,7 @@ static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *ad
         return NO;
     }
 
+    memset(served, 0, zs_round_page(size));
     *address = (uint64_t)(uintptr_t)served;
 
     return YES;
@@ -654,8 +1069,11 @@ static ZSMallocAllocationHeader *zs_malloc_header_for_pointer(const void *pointe
         const uintptr_t firstBlock = owner + sizeof(*slab);
 
         if (slab->magic != ZS_MALLOC_SLAB_MAGIC || slab->blockSize < sizeof(*header) ||
-            headerAddress < firstBlock || headerAddress + sizeof(*header) > owner + vm_page_size ||
+            slab->spanSize < vm_page_size || slab->spanSize % vm_page_size != 0 ||
+            owner + slab->spanSize > poolEnd ||
+            headerAddress < firstBlock || headerAddress + sizeof(*header) > owner + slab->spanSize ||
             (headerAddress - firstBlock) % slab->blockSize != 0 ||
+            (headerAddress - firstBlock) / slab->blockSize >= slab->totalBlocks ||
             header->allocationSize != slab->blockSize ||
             header->capacity != slab->blockSize - sizeof(*header) ||
             header->classIndex != slab->classIndex)
@@ -698,6 +1116,58 @@ static void zs_malloc_record_free(size_t requested)
     atomic_fetch_sub_explicit(&g_mallocBytesInUse, requested, memory_order_relaxed);
 }
 
+static inline os_unfair_lock *zs_malloc_class_lock(uint32_t classIndex)
+{
+    return &g_mallocShardLocks[classIndex % ZS_MALLOC_SHARD_COUNT];
+}
+
+static void zs_malloc_slab_link(ZSMallocSlab *slab)
+{
+    if (slab->linked)
+    {
+        return;
+    }
+
+    const uint32_t classIndex = slab->classIndex;
+    ZSMallocSlab *head = g_mallocSlabs[classIndex];
+    slab->prev = NULL;
+    slab->next = head;
+
+    if (head)
+    {
+        head->prev = slab;
+    }
+
+    g_mallocSlabs[classIndex] = slab;
+    slab->linked = 1;
+}
+
+static void zs_malloc_slab_unlink(ZSMallocSlab *slab)
+{
+    if (!slab->linked)
+    {
+        return;
+    }
+
+    if (slab->prev)
+    {
+        slab->prev->next = slab->next;
+    }
+    else
+    {
+        g_mallocSlabs[slab->classIndex] = slab->next;
+    }
+
+    if (slab->next)
+    {
+        slab->next->prev = slab->prev;
+    }
+
+    slab->next = NULL;
+    slab->prev = NULL;
+    slab->linked = 0;
+}
+
 static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL zeroed)
 {
     if (!atomic_load_explicit(&g_poolReady, memory_order_acquire))
@@ -714,9 +1184,7 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
         return NULL;
     }
 
-    const size_t smallLimit = (size_t)vm_page_size / 2;
-
-    if (alignment <= 16 && actualSize <= smallLimit)
+    if (alignment <= 16 && actualSize + sizeof(ZSMallocAllocationHeader) <= ZS_MALLOC_MAX_CLASS_BLOCK_SIZE)
     {
         const size_t blockSize = zs_malloc_align_size(actualSize + sizeof(ZSMallocAllocationHeader), 16);
         const size_t classIndex = blockSize / 16;
@@ -726,36 +1194,54 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
             return NULL;
         }
 
-        os_unfair_lock_lock(&g_mallocZoneLock);
-
+        os_unfair_lock *lock = zs_malloc_class_lock((uint32_t)classIndex);
+        os_unfair_lock_lock(lock);
         ZSMallocSlab *slab = g_mallocSlabs[classIndex];
 
         if (!slab)
         {
-            void *page = zs_pool_take(vm_page_size);
-
-            if (!page)
+            size_t spanSize = vm_page_size;
+            if (blockSize >= (size_t)vm_page_size / 2)
             {
-                os_unfair_lock_unlock(&g_mallocZoneLock);
+                const size_t targetSpan = blockSize > SIZE_MAX / 8 ? SIZE_MAX : blockSize * 8;
+                spanSize = MAX((size_t)vm_page_size * 4, (size_t)zs_round_page(targetSpan));
+            }
+
+            if (spanSize > UINT32_MAX)
+            {
+                os_unfair_lock_unlock(lock);
                 return NULL;
             }
 
-            slab = (ZSMallocSlab *)page;
-            memset(slab, 0, sizeof(*slab));
+            void *span = zs_pool_take(spanSize);
+
+            if (!span)
+            {
+                os_unfair_lock_unlock(lock);
+                return NULL;
+            }
+
+            slab = (ZSMallocSlab *)span;
             slab->magic = ZS_MALLOC_SLAB_MAGIC;
             slab->classIndex = (uint32_t)classIndex;
             slab->blockSize = (uint32_t)blockSize;
-            slab->totalBlocks = (uint32_t)(((size_t)vm_page_size - sizeof(*slab)) / blockSize);
+            slab->spanSize = (uint32_t)spanSize;
+            slab->totalBlocks = (uint32_t)(((size_t)spanSize - sizeof(*slab)) / blockSize);
             slab->freeBlocks = slab->totalBlocks;
+            slab->linked = 0;
+            slab->freeList = 0;
+            slab->next = NULL;
+            slab->prev = NULL;
 
             if (slab->totalBlocks == 0)
             {
-                os_unfair_lock_unlock(&g_mallocZoneLock);
-                zs_pool_give(page, vm_page_size);
+                slab->magic = 0;
+                os_unfair_lock_unlock(lock);
+                zs_pool_give(span, spanSize);
                 return NULL;
             }
 
-            uint8_t *firstBlock = (uint8_t *)page + sizeof(*slab);
+            uint8_t *firstBlock = (uint8_t *)span + sizeof(*slab);
 
             for (uint32_t i = 0; i < slab->totalBlocks; i++)
             {
@@ -764,10 +1250,8 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
                 slab->freeList = block;
             }
 
-            slab->next = g_mallocSlabs[classIndex];
-            slab->reserved = 1;
-            g_mallocSlabs[classIndex] = slab;
-            atomic_fetch_add_explicit(&g_mallocBytesAllocated, vm_page_size, memory_order_relaxed);
+            zs_malloc_slab_link(slab);
+            atomic_fetch_add_explicit(&g_mallocBytesAllocated, spanSize, memory_order_relaxed);
         }
 
         uintptr_t block = slab->freeList;
@@ -776,9 +1260,7 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
 
         if (!slab->freeList)
         {
-            g_mallocSlabs[classIndex] = slab->next;
-            slab->next = NULL;
-            slab->reserved = 0;
+            zs_malloc_slab_unlink(slab);
         }
 
         ZSMallocAllocationHeader *header = (ZSMallocAllocationHeader *)block;
@@ -791,7 +1273,7 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
         header->classIndex = (uint32_t)classIndex;
 
         void *result = (uint8_t *)header + sizeof(*header);
-        os_unfair_lock_unlock(&g_mallocZoneLock);
+        os_unfair_lock_unlock(lock);
 
         if (zeroed && requested)
         {
@@ -854,26 +1336,38 @@ static void zs_malloc_zone_free_pointer(void *pointer)
     if (kind == ZS_MALLOC_KIND_SMALL)
     {
         ZSMallocSlab *slab = (ZSMallocSlab *)owner;
-
         if (slab->magic != ZS_MALLOC_SLAB_MAGIC)
         {
             return;
         }
 
-        os_unfair_lock_lock(&g_mallocZoneLock);
+        os_unfair_lock *lock = zs_malloc_class_lock(slab->classIndex);
+        BOOL releaseSpan = NO;
+        uint32_t spanSize = slab->spanSize;
+
+        os_unfair_lock_lock(lock);
         *(uintptr_t *)header = slab->freeList;
         slab->freeList = (uintptr_t)header;
         slab->freeBlocks++;
 
-        if (!slab->reserved)
+        if (slab->freeBlocks == slab->totalBlocks)
         {
-            const uint32_t slabClass = slab->classIndex;
-            slab->next = g_mallocSlabs[slabClass];
-            slab->reserved = 1;
-            g_mallocSlabs[slabClass] = slab;
+            zs_malloc_slab_unlink(slab);
+            slab->magic = 0;
+            releaseSpan = YES;
+        }
+        else
+        {
+            zs_malloc_slab_link(slab);
         }
 
-        os_unfair_lock_unlock(&g_mallocZoneLock);
+        os_unfair_lock_unlock(lock);
+
+        if (releaseSpan)
+        {
+            atomic_fetch_sub_explicit(&g_mallocBytesAllocated, spanSize, memory_order_relaxed);
+            zs_pool_give((void *)owner, spanSize);
+        }
         return;
     }
 
@@ -1041,9 +1535,7 @@ static kern_return_t zs_malloc_zone_enumerator(task_t task, void *context, unsig
 static size_t zs_malloc_zone_good_size(malloc_zone_t *zone, size_t size)
 {
     const size_t actualSize = MAX(size, (size_t)1);
-    const size_t smallLimit = (size_t)vm_page_size / 2;
-
-    if (actualSize <= smallLimit)
+    if (actualSize <= ZS_MALLOC_MAX_CLASS_BLOCK_SIZE - sizeof(ZSMallocAllocationHeader))
     {
         return zs_malloc_align_size(actualSize + sizeof(ZSMallocAllocationHeader), 16) - sizeof(ZSMallocAllocationHeader);
     }
@@ -1071,12 +1563,18 @@ static void zs_malloc_zone_log(malloc_zone_t *zone, void *address)
 
 static void zs_malloc_zone_force_lock(malloc_zone_t *zone)
 {
-    os_unfair_lock_lock(&g_mallocZoneLock);
+    for (uint32_t i = 0; i < ZS_MALLOC_SHARD_COUNT; i++)
+    {
+        os_unfair_lock_lock(&g_mallocShardLocks[i]);
+    }
 }
 
 static void zs_malloc_zone_force_unlock(malloc_zone_t *zone)
 {
-    os_unfair_lock_unlock(&g_mallocZoneLock);
+    for (uint32_t i = ZS_MALLOC_SHARD_COUNT; i > 0; i--)
+    {
+        os_unfair_lock_unlock(&g_mallocShardLocks[i - 1]);
+    }
 }
 
 static void zs_malloc_zone_statistics(malloc_zone_t *zone, malloc_statistics_t *stats)
@@ -1100,7 +1598,10 @@ static boolean_t zs_malloc_zone_locked(malloc_zone_t *zone)
 
 static void zs_malloc_zone_reinit_lock(malloc_zone_t *zone)
 {
-    g_mallocZoneLock = OS_UNFAIR_LOCK_INIT;
+    for (uint32_t i = 0; i < ZS_MALLOC_SHARD_COUNT; i++)
+    {
+        g_mallocShardLocks[i] = OS_UNFAIR_LOCK_INIT;
+    }
 }
 
 static void zs_malloc_zone_register(void)
@@ -1691,6 +2192,8 @@ static void zs_ram_bypass_start(void)
 __attribute__((constructor))
 static void ZSRamBypassConstructor(void)
 {
+    atomic_store_explicit(&g_mallocRedirect16KB, zs_ram_redirect_mode() == 1, memory_order_release);
+
     if (zs_ram_bypass_enabled())
     {
         atomic_store_explicit(&g_mallocAllocationEnabled, 1, memory_order_release);

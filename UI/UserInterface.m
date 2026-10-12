@@ -9343,6 +9343,9 @@ static const CGFloat kContentFadeHeight = 22;
     ZSRow *ramHudRow = zs_make_switch_row(@"Memory Usage HUD", zs_ram_hud_enabled());
     [ramHudRow.toggle addTarget:self action:@selector(ramHudChanged:) forControlEvents:UIControlEventValueChanged];
 
+    ZSRow *ramRedirectModeRow = zs_make_mode_slider_row(@"Redirect minimum", @[@"256 KB", @"16 KB"], zs_ram_redirect_mode(), 0);
+    [ramRedirectModeRow.modeSlider addTarget:self action:@selector(ramRedirectModeChanged:) forControlEvents:UIControlEventValueChanged];
+
     UIButton *memoryCleanupButton = zs_make_grouped_action_button(@"Memory cleanup", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [memoryCleanupButton addTarget:self action:@selector(memoryCleanupTapped:) forControlEvents:UIControlEventTouchUpInside];
 
@@ -9356,6 +9359,7 @@ static const CGFloat kContentFadeHeight = 22;
     UIView *memoryActionsCard = zs_make_grouped_action_card(@[
         ramBypassRow,
         ramHudRow,
+        ramRedirectModeRow,
         memoryCleanupButton,
         self.memoryUsageAnalyzeButton,
         lowResTranscodeButton,
@@ -21480,6 +21484,11 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
 - (void)ramHudChanged:(UISwitch *)toggle {
     zs_set_ram_hud_enabled(toggle.on);
     [[ZSMetalTabs shared] setRamHudVisible:toggle.on];
+}
+
+- (void)ramRedirectModeChanged:(ZSModeSlider *)slider {
+    zs_set_ram_redirect_mode(slider.selectedIndex);
+    [self zs_scheduleSave];
 }
 
 - (void)nightlyReleasesEnabledChanged:(UISwitch *)toggle {
