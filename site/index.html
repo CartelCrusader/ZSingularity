@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="color-scheme" content="dark only">
+<meta name="theme-color" content="#000000">
+<title>ZSingularity Injector</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=Work+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #000000;
+  --accent: #f2deff;
+  --accent-soft: #d5c3e0;
+  --text: #ffffff;
+  --text-muted: #d6d6d6;
+  --border: #e4daf0;
+  --glow: rgba(242, 222, 255, 0.25);
+  --err: #ff2b2b;
+  --serif: 'Cormorant Garamond', Georgia, 'Times New Roman', serif;
+  --sans: 'Work Sans', -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; border-radius: 0; }
+html { background: var(--bg); }
+body {
+  margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.7; overflow-x: hidden;
+  padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px);
+  padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.wrap { max-width: 640px; margin: 0 auto; padding: 72px 24px 90px; opacity: 0; transform: translateY(10px); animation: enter 1s ease 0.1s forwards; }
+@keyframes enter { to { opacity: 1; transform: translateY(0); } }
+header { text-align: center; }
+h1 { font-family: var(--serif); font-weight: 600; font-size: clamp(36px, 8vw, 50px); color: var(--accent); margin: 0; letter-spacing: 0.5px; line-height: 1.15; }
+.tag { font-family: var(--serif); font-style: italic; font-size: 17px; color: var(--text-muted); letter-spacing: 1px; margin: 4px 0 0; }
+.divider { display: flex; align-items: center; justify-content: center; gap: 14px; margin: 44px 0; }
+.divider::before, .divider::after { content: ''; height: 1px; flex: 1; background: var(--text); }
+.divider span { font-size: 15px; letter-spacing: 2px; }
+section { margin: 0 0 8px; }
+h2 { font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 2.5px; color: var(--accent); text-align: center; margin: 0 0 22px; }
+.seg { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+button, .drop { font-family: var(--sans); outline: none; }
+.btn {
+  appearance: none; -webkit-appearance: none; background: transparent; color: var(--text); border: 1px solid var(--border);
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 2px; padding: 12px 18px; cursor: pointer; transition: all 0.3s ease;
+  width: 100%;
+}
+.btn.big { font-size: 13px; letter-spacing: 2.5px; padding: 14px 32px; }
+.seg .btn[aria-pressed="true"] { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
+.btn:disabled { opacity: 0.3; cursor: default; }
+@media (hover: hover) {
+  .btn:not(:disabled):hover, .drop:hover { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
+}
+.btn:not(:disabled):active { background: var(--accent); color: var(--bg); border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
+.ver { margin-top: 14px; font-size: 13px; color: var(--accent-soft); font-style: italic; text-align: center; min-height: 22px; }
+.drop {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 2px;
+  border: 1px solid var(--border); padding: 30px 14px; cursor: pointer; transition: all 0.3s ease; background: transparent;
+}
+.drop strong { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 2.5px; color: var(--text); transition: color 0.3s ease; }
+.drop span { color: var(--text-muted); font-size: 12px; letter-spacing: 1px; word-break: break-all; transition: color 0.3s ease; }
+.drop.over { border-color: var(--accent); box-shadow: 0 0 15px var(--glow); }
+.drop.has-file { border-color: var(--accent); }
+.drop.has-file strong { color: var(--accent); }
+@media (hover: hover) { .drop:hover strong, .drop:hover span { color: var(--bg); } }
+input[type=file] { display: none; }
+.opt { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 18px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; font-weight: 600; cursor: pointer; }
+.opt input { appearance: none; -webkit-appearance: none; width: 16px; height: 16px; border: 1px solid var(--border); background: transparent; margin: 0; cursor: pointer; transition: all 0.2s ease; }
+.opt input:checked { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 10px var(--glow); }
+.actions { margin-top: 36px; display: flex; flex-direction: column; gap: 12px; }
+.bar { height: 2px; background: #2a2a2a; margin-top: 4px; }
+.bar > i { display: block; height: 100%; width: 0%; background: var(--accent); box-shadow: 0 0 10px var(--glow); transition: width 0.12s linear; }
+.stage { font-size: 12px; color: var(--accent); letter-spacing: 1.5px; text-transform: uppercase; margin-top: 12px; min-height: 20px; text-align: center; }
+.log { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-muted); white-space: pre-wrap; margin-top: 12px; max-height: 190px; overflow: auto; border: 1px solid #2a2a2a; padding: 10px 12px; }
+.log:empty { display: none; }
+.log .e { color: var(--err); } .log .w { color: var(--accent-soft); } .log .k { color: var(--accent); }
+.meta { font-size: 13px; color: var(--accent-soft); text-align: center; word-break: break-all; font-style: italic; margin-bottom: 16px; }
+.note { font-size: 12px; color: var(--text-muted); text-align: center; letter-spacing: 0.5px; margin-top: 16px; line-height: 1.6; }
+.hidden { display: none !important; }
+.fail .stage { color: var(--err); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ZSingularity</h1>
+    <p class="tag">on-device injector</p>
+  </header>
+
+  <div class="divider"><span>§</span></div>
+
+  <section>
+    <h2>Tweak Build</h2>
+    <div class="seg" id="channels">
+      <button type="button" class="btn" data-ch="latest" aria-pressed="true">「 Release 」</button>
+      <button type="button" class="btn" data-ch="nightly" aria-pressed="false">「 Nightly 」</button>
+    </div>
+    <div class="ver" id="ver">Loading…</div>
+  </section>
+
+  <div class="divider"><span>§</span></div>
+
+  <section>
+    <h2>Decrypted Game IPA</h2>
+    <label class="drop" id="drop">
+      <strong id="pickTitle">「 Choose .ipa 」</strong>
+      <input type="file" id="file">
+    </label>
+    <div class="actions">
+      <button class="btn big" id="go" disabled>「 Inject 」</button>
+    </div>
+  </section>
+
+  <section id="progressCard" class="hidden">
+    <div class="divider"><span>§</span></div>
+    <h2>Progress</h2>
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="stage" id="stage"></div>
+    <div class="log" id="log"></div>
+  </section>
+
+  <section id="result" class="hidden">
+    <div class="divider"><span>§</span></div>
+    <h2>Finished</h2>
+    <div class="meta" id="outMeta"></div>
+    <div class="actions" style="margin-top:0">
+      <button class="btn big" id="dl">「 Save IPA 」</button>
+      <button class="btn big hidden" id="share">「 Share 」</button>
+    </div>
+    <div class="note">Sideload with SideStore, AltStore, Sideloadly or LiveContainer. They re-sign it for you.</div>
+  </section>
+
+</div>
+
+<script type="module">
+import { inject } from "./js/inject.js";
+
+const $ = (id) => document.getElementById(id);
+const state = { channel: "latest", manifests: {}, file: null, outUrl: null, outBlob: null, outName: "" };
+
+function fmtSize(n) {
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+  return Math.max(1, Math.round(n / 1024)) + " KB";
+}
+
+function log(msg, cls) {
+  const d = document.createElement("div");
+  if (cls) d.className = cls;
+  d.textContent = msg;
+  $("log").appendChild(d);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function refresh() {
+  const m = state.manifests[state.channel];
+  $("ver").textContent = m ? "ZSingularity " + m.version + (m.build ? " · build " + m.build : "") : "Not published yet";
+  $("go").disabled = !(m && state.file);
+  for (const b of document.querySelectorAll("#channels button")) {
+    b.setAttribute("aria-pressed", String(b.dataset.ch === state.channel));
+    b.disabled = !state.manifests[b.dataset.ch];
+  }
+}
+
+async function loadManifests() {
+  for (const ch of ["latest", "nightly"]) {
+    try {
+      const r = await fetch("payload/" + ch + "/manifest.json", { cache: "no-store" });
+      if (r.ok) state.manifests[ch] = await r.json();
+    } catch (e) {}
+  }
+  if (!state.manifests.latest && state.manifests.nightly) state.channel = "nightly";
+  if (!state.manifests.latest && !state.manifests.nightly) $("ver").textContent = "No builds are published on this site yet.";
+  else refresh();
+}
+
+for (const b of document.querySelectorAll("#channels button")) {
+  b.addEventListener("click", () => { state.channel = b.dataset.ch; refresh(); });
+}
+
+function setFile(f) {
+  state.file = f || null;
+  $("pickTitle").textContent = f ? f.name : "\u300c Choose .ipa \u300d";
+  $("drop").classList.toggle("has-file", !!f);
+  refresh();
+}
+
+$("file").addEventListener("change", (e) => setFile(e.target.files[0]));
+const drop = $("drop");
+drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  drop.classList.remove("over");
+  if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+});
+
+async function sha256Hex(buf) {
+  const h = await crypto.subtle.digest("SHA-256", buf);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function fetchVerified(path, expected) {
+  const r = await fetch(path, { cache: "no-store" });
+  if (!r.ok) throw new Error("Could not download " + path + " (" + r.status + ")");
+  const buf = await r.arrayBuffer();
+  if (expected) {
+    const got = await sha256Hex(buf);
+    if (got !== expected) throw new Error("Checksum mismatch for " + path + ". The site may be mid-update, try again in a minute.");
+  }
+  return buf;
+}
+
+function reset() {
+  if (state.outUrl) URL.revokeObjectURL(state.outUrl);
+  state.outUrl = null;
+  state.outBlob = null;
+  $("result").classList.add("hidden");
+  $("log").textContent = "";
+  $("barFill").style.width = "0%";
+  $("stage").textContent = "";
+  $("progressCard").classList.remove("hidden");
+  $("progressCard").classList.remove("fail");
+}
+
+const STAGE_SPAN = { "Reading IPA": [0, 0.05], "Patching Info.plist": [0.05, 0.08], "Patching executable": [0.08, 0.7], "Writing IPA": [0.7, 1], Done: [1, 1] };
+
+$("go").addEventListener("click", async () => {
+  const m = state.manifests[state.channel];
+  if (!m || !state.file) return;
+  reset();
+  $("go").disabled = true;
+  let lock = null;
+  try { lock = await navigator.wakeLock?.request("screen"); } catch (e) {}
+  const t0 = performance.now();
+  try {
+    $("stage").textContent = "Downloading tweak payload";
+    log("Fetching " + m.dylib.file + (state.manifests[state.channel].build ? " (build " + m.build + ")" : ""));
+    const dylib = new Uint8Array(await fetchVerified("payload/" + state.channel + "/" + m.dylib.file, m.dylib.sha256));
+    if (!m.appex) throw new Error("This build has no ZSRamDonor.appex.zip published, so it can't be injected.");
+    const appex = new Blob([await fetchVerified("payload/" + state.channel + "/" + m.appex.file, m.appex.sha256)]);
+    log("Fetched " + m.appex.file);
+    log("Checksums OK", "k");
+    let lastStage = "";
+    const res = await inject(state.file, { dylib, appex }, {
+      onProgress(stage, f) {
+        const [a, b] = STAGE_SPAN[stage] || [0, 1];
+        $("barFill").style.width = Math.round((a + (b - a) * f) * 100) + "%";
+        if (stage !== lastStage) { lastStage = stage; $("stage").textContent = stage + "…"; log(stage); }
+      },
+    });
+    for (const w of res.warnings) log(w, "w");
+    state.outBlob = res.blob;
+    state.outName = "LC" + res.gameVersion + "\u2014ZS" + m.version + ".ipa";
+    state.outUrl = URL.createObjectURL(res.blob);
+    $("stage").textContent = "Done in " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
+    log("Game " + res.gameVersion + " · " + res.arch.join("+") + " · " + res.appId, "k");
+    $("outMeta").textContent = state.outName + " · " + fmtSize(res.blob.size);
+    $("result").classList.remove("hidden");
+    const canShare = (() => { try { return !!(navigator.canShare && navigator.canShare({ files: [new File([new Blob()], "x.ipa")] })); } catch (e) { return false; } })();
+    $("share").classList.toggle("hidden", !canShare);
+  } catch (err) {
+    console.error(err);
+    $("stage").textContent = "Failed";
+    $("progressCard").classList.add("fail");
+    log(err && err.message ? err.message : String(err), "e");
+  } finally {
+    try { await lock?.release(); } catch (e) {}
+    refresh();
+  }
+});
+
+$("dl").addEventListener("click", () => {
+  if (!state.outUrl) return;
+  const a = document.createElement("a");
+  a.href = state.outUrl;
+  a.download = state.outName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+});
+
+$("share").addEventListener("click", async () => {
+  if (!state.outBlob) return;
+  try {
+    await navigator.share({ files: [new File([state.outBlob], state.outName, { type: "application/octet-stream" })] });
+  } catch (e) {}
+});
+
+loadManifests();
+</script>
+</body>
+</html>
