@@ -9,6 +9,7 @@ on:
       - 'assets/**'
       - '.github/workflows/**'
       - 'demo/**'
+      - 'site/**'
 
 env:
   LZ4_REF: v1.10.0
