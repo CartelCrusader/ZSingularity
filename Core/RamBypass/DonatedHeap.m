@@ -180,6 +180,22 @@ void zs_ram_bypass_get_stats(RamBypassStats *outStats)
     outStats->fallbackAllocations = atomic_load(&g_fallbackCount);
 }
 
+static _Atomic(uint64_t) g_donatedUsedCache;
+static _Atomic(uint8_t) g_donatedUsedRefreshing;
+
+static uint64_t zs_donated_used_cached(void)
+{
+    if (!atomic_exchange_explicit(&g_donatedUsedRefreshing, 1, memory_order_acq_rel))
+    {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            atomic_store_explicit(&g_donatedUsedCache, [ZSRamDonor.shared donatedBytes], memory_order_release);
+            atomic_store_explicit(&g_donatedUsedRefreshing, 0, memory_order_release);
+        });
+    }
+
+    return atomic_load_explicit(&g_donatedUsedCache, memory_order_acquire);
+}
+
 void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
 {
     if (!outSnapshot)
@@ -201,7 +217,7 @@ void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
     zs_ram_bypass_get_stats(&stats);
 
     outSnapshot->donatedBytes = stats.active ? stats.poolBytes : 0;
-    outSnapshot->donatedUsedBytes = stats.active ? [ZSRamDonor.shared donatedBytes] : 0;
+    outSnapshot->donatedUsedBytes = stats.active ? zs_donated_used_cached() : 0;
     outSnapshot->totalBytes = outSnapshot->appBytes + outSnapshot->donatedUsedBytes;
 }
 
