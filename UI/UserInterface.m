@@ -3656,10 +3656,22 @@ static void zs_disclosure_row_set_value(UIControl *row, NSString *value) {
 }
 
 static void zs_disclosure_row_install_menu(UIControl *row, NSArray<NSString *> *titles, NSInteger selectedIndex, void (^onSelect)(NSInteger index)) {
+    UIButton *menuButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    menuButton.translatesAutoresizingMaskIntoConstraints = NO;
+    menuButton.backgroundColor = [UIColor clearColor];
+    [row addSubview:menuButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [menuButton.topAnchor constraintEqualToAnchor:row.topAnchor],
+        [menuButton.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+        [menuButton.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [menuButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+    ]];
+
     __weak UIControl *weakRow = row;
+    __weak UIButton *weakButton = menuButton;
     void (^builder)(NSInteger) = ^(NSInteger current) {
-        UIControl *strongRow = weakRow;
-        if (!strongRow) return;
+        UIButton *strongButton = weakButton;
+        if (!strongButton) return;
         NSMutableArray<UIMenuElement *> *actions = [NSMutableArray arrayWithCapacity:titles.count];
         for (NSUInteger i = 0; i < titles.count; i++) {
             NSInteger index = (NSInteger)i;
@@ -3676,13 +3688,13 @@ static void zs_disclosure_row_install_menu(UIControl *row, NSArray<NSString *> *
             action.state = index == current ? UIMenuElementStateOn : UIMenuElementStateOff;
             [actions addObject:action];
         }
-        strongRow.menu = [UIMenu menuWithTitle:@"" children:actions];
+        strongButton.menu = [UIMenu menuWithTitle:@"" children:actions];
     };
     objc_setAssociatedObject(row, "zs_menuRebuild", builder, OBJC_ASSOCIATION_COPY_NONATOMIC);
     NSInteger clamped = MAX((NSInteger)0, MIN((NSInteger)titles.count - 1, selectedIndex));
     zs_disclosure_row_set_value(row, titles[clamped]);
     builder(clamped);
-    row.showsMenuAsPrimaryAction = YES;
+    menuButton.showsMenuAsPrimaryAction = YES;
 }
 
 static UIView *zs_enclosing_grouped_card(UIView *view) {
