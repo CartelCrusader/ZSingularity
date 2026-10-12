@@ -2,6 +2,8 @@ name: Deploy IPA Injector
 
 on:
   workflow_dispatch:
+  release:
+    types: [published, edited, deleted]
   push:
     branches: [main]
     paths:
@@ -39,57 +41,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          stage() {
-            local channel="$1" tag="$2"
-            local dir="site/payload/$channel"
-            rm -rf "$dir"
-            mkdir -p "$dir"
-
-            if ! gh release view $tag --repo "$REPO" > /dev/null 2>&1; then
-              echo "No release for channel '$channel', skipping."
-              rm -rf "$dir"
-              return 0
-            fi
-
-            gh release download $tag \
-              --repo "$REPO" \
-              --pattern 'ZSingularity.dylib' \
-              --pattern 'ZSRamDonor.appex.zip' \
-              --dir "$dir" \
-              --clobber
-
-            if [[ ! -s "$dir/ZSingularity.dylib" ]]; then
-              echo "::warning::'$channel' release has no ZSingularity.dylib, skipping."
-              rm -rf "$dir"
-              return 0
-            fi
-
-            local version="" build="" commit=""
-            if [[ "$channel" == "nightly" ]]; then
-              commit="$(gh release view nightly --repo "$REPO" --json targetCommitish -q .targetCommitish || true)"
-              local header=""
-              if [[ -n "$commit" ]]; then
-                header="$(gh api "repos/$REPO/contents/Core/Version.h?ref=$commit" -H 'Accept: application/vnd.github.raw' || true)"
-              fi
-              if [[ -z "$header" ]]; then
-                header="$(cat Core/Version.h)"
-              fi
-              part() { printf '%s' "$header" | grep -oE "#define ZS_VERSION_$1 [0-9]+" | grep -oE '[0-9]+$'; }
-              version="$(part MAJOR).$(part MINOR).$(part PATCH)"
-              build="$(gh release view nightly --repo "$REPO" --json body -q .body | grep -oE 'build [0-9]+' | head -n1 | grep -oE '[0-9]+' || true)"
-            else
-              local name
-              name="$(gh release view --repo "$REPO" --json tagName -q .tagName)"
-              version="${name#v}"
-            fi
-
+          write_manifest() {
+            local dir="$1" channel="$2" version="$3" build="$4" commit="$5"
             local dylib_sha appex_sha="" appex_file=""
             dylib_sha="$(sha256sum "$dir/ZSingularity.dylib" | cut -d' ' -f1)"
             if [[ -s "$dir/ZSRamDonor.appex.zip" ]]; then
               appex_sha="$(sha256sum "$dir/ZSRamDonor.appex.zip" | cut -d' ' -f1)"
               appex_file="ZSRamDonor.appex.zip"
             fi
-
             jq -n \
               --arg channel "$channel" \
               --arg version "$version" \
@@ -108,8 +67,79 @@ jobs:
               }' > "$dir/manifest.json"
           }
 
-          stage latest ""
-          stage nightly nightly
+          download_assets() {
+            local tag="$1" dir="$2"
+            mkdir -p "$dir"
+            gh release download "$tag" \
+              --repo "$REPO" \
+              --pattern 'ZSingularity.dylib' \
+              --pattern 'ZSRamDonor.appex.zip' \
+              --dir "$dir" \
+              --clobber || true
+            if [[ ! -s "$dir/ZSingularity.dylib" ]]; then
+              echo "::warning::release '$tag' has no ZSingularity.dylib, skipping."
+              rm -rf "$dir"
+              return 1
+            fi
+          }
+
+          build_of() {
+            gh release view "$1" --repo "$REPO" --json body -q .body | grep -oE 'build [0-9]+' | head -n1 | grep -oE '[0-9]+' || true
+          }
+
+          stage_nightly() {
+            local dir="site/payload/nightly"
+            rm -rf "$dir"
+            if ! gh release view nightly --repo "$REPO" > /dev/null 2>&1; then
+              echo "No nightly release, skipping."
+              return 0
+            fi
+            download_assets nightly "$dir" || return 0
+
+            local commit header=""
+            commit="$(gh release view nightly --repo "$REPO" --json targetCommitish -q .targetCommitish || true)"
+            if [[ -n "$commit" ]]; then
+              header="$(gh api "repos/$REPO/contents/Core/Version.h?ref=$commit" -H 'Accept: application/vnd.github.raw' || true)"
+            fi
+            if [[ -z "$header" ]]; then
+              header="$(cat Core/Version.h)"
+            fi
+            part() { printf '%s' "$header" | grep -oE "#define ZS_VERSION_$1 [0-9]+" | grep -oE '[0-9]+$'; }
+            write_manifest "$dir" nightly "$(part MAJOR).$(part MINOR).$(part PATCH)" "$(build_of nightly)" "$commit"
+          }
+
+          stage_releases() {
+            local root="site/payload/release"
+            rm -rf "$root"
+            mkdir -p "$root"
+
+            local tags
+            tags="$(gh release list --repo "$REPO" --limit 200 --json tagName,isDraft,isPrerelease \
+              -q '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName')"
+
+            local staged=()
+            local tag version dir
+            while IFS= read -r tag; do
+              [[ -z "$tag" || "$tag" == "nightly" ]] && continue
+              version="${tag#v}"
+              dir="$root/$version"
+              if download_assets "$tag" "$dir"; then
+                write_manifest "$dir" release "$version" "$(build_of "$tag")" ""
+                staged+=("$version")
+              fi
+            done <<< "$tags"
+
+            if [[ ${#staged[@]} -gt 0 ]]; then
+              printf '%s\n' "${staged[@]}" | sort -rV | jq -R . | jq -s '{versions: .}' > "$root/index.json"
+            else
+              echo '{"versions":[]}' > "$root/index.json"
+            fi
+            cat "$root/index.json"
+          }
+
+          rm -rf site/payload/latest
+          stage_releases
+          stage_nightly
           touch site/.nojekyll
 
       - name: Configure Pages
