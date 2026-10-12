@@ -15,11 +15,4 @@ Supported Formats:
 
 ## Processing
 
-- **Unity AssetBundles** usually can't be installed as-is — they're normally built for a different platform's texture compression, so the game won't load them until they're re-encoded. The tweak now transcodes eligible bundles locally on-device.
-
-## The Transcoder pipeline
-
-The on-device transcoder reads the imported bundle and the game's stock bundle, matches the relevant assets, and re-encodes the required textures to ASTC 6x6. No GitHub repository, PAT, or remote workflow is required.
-
-Once transcoding finishes, the processed bundle is installed immediately in place of the original. The original stock bundle is backed up first (via `ZTranscoderInstaller`) so it can be restored later.
-
+Unity asset bundles are processed on-device with an astcenc + metal compute hybrid and repackaged to work for iOS

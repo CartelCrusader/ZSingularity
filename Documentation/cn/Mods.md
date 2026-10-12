@@ -15,11 +15,4 @@ Mods 部分是一个本地的“mod 文件夹”库。每个文件夹都包含�
 
 ## 处理
 
-- **Unity AssetBundle** 通常不能直接安装。它们通常使用其他平台的纹理压缩方式构建，因此必须重新编码后游戏才能加载。现在 tweak 会直接在设备上转码符合条件的 bundle。
-
-## 转码流程
-
-设备端转码器会读取导入的 bundle 和游戏原始 bundle，匹配对应的 assets，并将需要的纹理重新编码为 ASTC 6x6。不再需要 GitHub 仓库、PAT 或远程 workflow。
-
-转码完成后，处理后的 bundle 会立即替换原文件并安装。原始 bundle 会先由 `ZTranscoderInstaller` 备份，以便之后恢复。
-
+Unity asset bundle 会在设备上通过 astcenc + Metal compute 混合方案进行处理，并重新打包以适配 iOS

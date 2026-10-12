@@ -74,8 +74,8 @@ static NSDictionary<NSString *, NSString *> *zs_docs_section_files(void) {
             @"Post FX": @"PostFX.md",
             @"Particles": @"Particles.md",
             @"Miscellaneous": @"Miscellaneous.md",
+            @"Memory management": @"MemoryManagement.md",
             @"Mods": @"Mods.md",
-            @"Config": @"Config.md",
         };
     });
     return files;
@@ -293,6 +293,10 @@ static void zs_docs_fetch_image(NSString *filename, void (^completion)(UIImage *
 static NSString * const kZSDocsQuoteBarColorAttributeName = @"ZSDocsQuoteBarColor";
 static const CGFloat kZSDocsQuoteBarWidth = 2.5;
 static const CGFloat kZSDocsQuoteBarIndent = 14;
+static NSString * const kZSDocsCodeBackgroundAttributeName = @"ZSDocsCodeBackground";
+static NSString * const kZSDocsCodeBlockBackgroundAttributeName = @"ZSDocsCodeBlockBackground";
+static const CGFloat kZSDocsCodeCornerRadius = 4;
+static const CGFloat kZSDocsCodeBlockCornerRadius = 7;
 
 @interface ZSDocsQuoteLayoutManager : NSLayoutManager
 @end
@@ -307,6 +311,55 @@ static const CGFloat kZSDocsQuoteBarIndent = 14;
     if (!textStorage || !textContainer) return;
 
     NSRange characterRange = [self characterRangeForGlyphRange:glyphsToShow actualGlyphRange:NULL];
+
+    [textStorage enumerateAttribute:kZSDocsCodeBackgroundAttributeName
+                             inRange:characterRange
+                             options:0
+                          usingBlock:^(UIColor *color, NSRange range, BOOL *stop) {
+        if (![color isKindOfClass:[UIColor class]] || range.length == 0) return;
+
+        NSRange runGlyphRange = [self glyphRangeForCharacterRange:range actualCharacterRange:NULL];
+        [self enumerateEnclosingRectsForGlyphRange:runGlyphRange
+                          withinSelectedGlyphRange:NSMakeRange(NSNotFound, 0)
+                                   inTextContainer:textContainer
+                                        usingBlock:^(CGRect rect, BOOL *innerStop) {
+            CGRect fill = CGRectOffset(rect, origin.x, origin.y);
+            fill = CGRectInset(fill, -2, 1);
+            [color setFill];
+            [[UIBezierPath bezierPathWithRoundedRect:fill cornerRadius:kZSDocsCodeCornerRadius] fill];
+        }];
+    }];
+
+    NSMutableArray<NSDictionary *> *blocks = [NSMutableArray array];
+    [textStorage enumerateAttribute:kZSDocsCodeBlockBackgroundAttributeName
+                             inRange:characterRange
+                             options:0
+                          usingBlock:^(UIColor *color, NSRange range, BOOL *stop) {
+        if (![color isKindOfClass:[UIColor class]] || range.length == 0) return;
+
+        NSRange runGlyphRange = [self glyphRangeForCharacterRange:range actualCharacterRange:NULL];
+        [self enumerateEnclosingRectsForGlyphRange:runGlyphRange
+                          withinSelectedGlyphRange:NSMakeRange(NSNotFound, 0)
+                                   inTextContainer:textContainer
+                                        usingBlock:^(CGRect rect, BOOL *innerStop) {
+            CGRect fill = CGRectOffset(rect, origin.x, origin.y);
+            NSDictionary *last = blocks.lastObject;
+            if (last && last[@"color"] == color) {
+                CGRect lastRect = [last[@"rect"] CGRectValue];
+                if (CGRectGetMinY(fill) <= CGRectGetMaxY(lastRect) + 20) {
+                    blocks[blocks.count - 1] = @{@"color": color,
+                                                  @"rect": [NSValue valueWithCGRect:CGRectUnion(lastRect, fill)]};
+                    return;
+                }
+            }
+            [blocks addObject:@{@"color": color, @"rect": [NSValue valueWithCGRect:fill]}];
+        }];
+    }];
+    for (NSDictionary *block in blocks) {
+        CGRect fill = CGRectInset([block[@"rect"] CGRectValue], -6, -4);
+        [(UIColor *)block[@"color"] setFill];
+        [[UIBezierPath bezierPathWithRoundedRect:fill cornerRadius:kZSDocsCodeBlockCornerRadius] fill];
+    }
 
     [textStorage enumerateAttribute:kZSDocsQuoteBarColorAttributeName
                              inRange:characterRange
@@ -343,8 +396,8 @@ static NSAttributedString *zs_render_markdown_inline(NSString *line, UIFont *bas
         fontDescriptorWithSymbolicTraits:baseFont.fontDescriptor.symbolicTraits | UIFontDescriptorTraitBold]
                                               size:baseFont.pointSize] ?: baseFont;
     UIFont *codeFont = [UIFont monospacedSystemFontOfSize:baseFont.pointSize - 1 weight:UIFontWeightRegular];
-    UIColor *codeColor = [UIColor colorWithWhite:1 alpha:0.85];
-    UIColor *codeBackground = [UIColor colorWithWhite:1 alpha:0.14];
+    UIColor *codeColor = [UIColor colorWithRed:0x30 / 255.0 green:0xD1 / 255.0 blue:0x58 / 255.0 alpha:1.0];
+    UIColor *codeBackground = [UIColor colorWithWhite:0 alpha:0.38];
 
     while (i < length) {
         unichar c = [line characterAtIndex:i];
@@ -368,7 +421,7 @@ static NSAttributedString *zs_render_markdown_inline(NSString *line, UIFont *bas
                 NSString *inner = [line substringWithRange:NSMakeRange(i + 1, close.location - (i + 1))];
                 [result appendAttributedString:[[NSAttributedString alloc] initWithString:inner
                     attributes:@{NSFontAttributeName: codeFont, NSForegroundColorAttributeName: codeColor,
-                                  NSBackgroundColorAttributeName: codeBackground}]];
+                                  kZSDocsCodeBackgroundAttributeName: codeBackground}]];
                 i = close.location + 1;
                 continue;
             }
@@ -470,7 +523,8 @@ static NSAttributedString *zs_render_markdown(NSString *markdownInput, CGFloat c
     UIFont *h2Font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightBold];
     UIFont *codeFont = [UIFont monospacedSystemFontOfSize:11.5 weight:UIFontWeightRegular];
     UIFont *captionFont = [UIFont monospacedSystemFontOfSize:10.5 weight:UIFontWeightRegular];
-    UIColor *codeBackground = [UIColor colorWithWhite:1 alpha:0.14];
+    UIColor *codeBackground = [UIColor colorWithWhite:0 alpha:0.38];
+    UIColor *codeBlockColor = [UIColor colorWithRed:0x30 / 255.0 green:0xD1 / 255.0 blue:0x58 / 255.0 alpha:0.92];
 
     NSMutableParagraphStyle *bodyParagraph = [NSMutableParagraphStyle new];
     bodyParagraph.lineSpacing = 2;
@@ -544,8 +598,8 @@ static NSAttributedString *zs_render_markdown(NSString *markdownInput, CGFloat c
 
         if (inCodeBlock) {
             appendLine([[NSAttributedString alloc] initWithString:rawLine
-                attributes:@{NSFontAttributeName: codeFont, NSForegroundColorAttributeName: dimColor,
-                              NSBackgroundColorAttributeName: codeBackground}],
+                attributes:@{NSFontAttributeName: codeFont, NSForegroundColorAttributeName: codeBlockColor,
+                              kZSDocsCodeBlockBackgroundAttributeName: codeBackground}],
                 bodyParagraph);
             continue;
         }

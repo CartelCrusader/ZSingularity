@@ -15,11 +15,4 @@ Formatos compatibles:
 
 ## Procesamiento
 
-- **Unity AssetBundles** normalmente no pueden instalarse tal cual. Suelen estar construidos con una compresión de texturas de otra plataforma, por lo que el juego no los cargará hasta que se vuelvan a codificar. El tweak ahora transcodifica los bundles compatibles directamente en el dispositivo.
-
-## Flujo del transcodificador
-
-El transcodificador local lee el bundle importado y el bundle original del juego, relaciona los assets correspondientes y vuelve a codificar las texturas necesarias a ASTC 6x6. No se necesita un repositorio de GitHub, un PAT ni un flujo de trabajo remoto.
-
-Cuando termina la transcodificación, el bundle procesado se instala inmediatamente en lugar del original. El bundle original se respalda primero mediante `ZTranscoderInstaller` para poder restaurarlo más tarde.
-
+Los asset bundles de Unity se procesan en el dispositivo con un híbrido de astcenc + Metal compute y se reempaquetan para que funcionen en iOS
