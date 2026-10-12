@@ -730,11 +730,6 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
 
         ZSMallocSlab *slab = g_mallocSlabs[classIndex];
 
-        while (slab && !slab->freeList)
-        {
-            slab = slab->next;
-        }
-
         if (!slab)
         {
             void *page = zs_pool_take(vm_page_size);
@@ -770,6 +765,7 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
             }
 
             slab->next = g_mallocSlabs[classIndex];
+            slab->reserved = 1;
             g_mallocSlabs[classIndex] = slab;
             atomic_fetch_add_explicit(&g_mallocBytesAllocated, vm_page_size, memory_order_relaxed);
         }
@@ -777,6 +773,13 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
         uintptr_t block = slab->freeList;
         slab->freeList = *(uintptr_t *)block;
         slab->freeBlocks--;
+
+        if (!slab->freeList)
+        {
+            g_mallocSlabs[classIndex] = slab->next;
+            slab->next = NULL;
+            slab->reserved = 0;
+        }
 
         ZSMallocAllocationHeader *header = (ZSMallocAllocationHeader *)block;
         header->magic = ZS_MALLOC_ALLOCATION_MAGIC;
@@ -861,6 +864,15 @@ static void zs_malloc_zone_free_pointer(void *pointer)
         *(uintptr_t *)header = slab->freeList;
         slab->freeList = (uintptr_t)header;
         slab->freeBlocks++;
+
+        if (!slab->reserved)
+        {
+            const uint32_t slabClass = slab->classIndex;
+            slab->next = g_mallocSlabs[slabClass];
+            slab->reserved = 1;
+            g_mallocSlabs[slabClass] = slab;
+        }
+
         os_unfair_lock_unlock(&g_mallocZoneLock);
         return;
     }
