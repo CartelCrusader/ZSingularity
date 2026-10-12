@@ -594,6 +594,22 @@ static void zs_clear_button_configuration(UIButton *button) {
     }
 }
 
+static void * const kZSFlatButtonRadiusKey = (void *)&kZSFlatButtonRadiusKey;
+
+@interface ZSFlatChromeButton : UIButton
+@end
+
+@implementation ZSFlatChromeButton
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    NSNumber *fixed = objc_getAssociatedObject(self, kZSFlatButtonRadiusKey);
+    CGFloat radius = fixed.doubleValue;
+    CGFloat limit = MIN(CGRectGetWidth(self.bounds), CGRectGetHeight(self.bounds)) / 2.0;
+    if (radius <= 0 || radius > limit) radius = limit;
+    if (self.layer.cornerRadius != radius) self.layer.cornerRadius = radius;
+}
+@end
+
 static void zs_apply_flat_button_chrome(UIButton *button, CGFloat cornerRadius) {
     if (!button) return;
     zs_clear_button_configuration(button);
@@ -602,10 +618,17 @@ static void zs_apply_flat_button_chrome(UIButton *button, CGFloat cornerRadius) 
     button.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
     button.layer.borderWidth = 1;
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
-    button.layer.cornerCurve = kCACornerCurveContinuous;
-    button.layer.cornerRadius = cornerRadius;
+    button.layer.cornerCurve = kCACornerCurveCircular;
     button.layer.masksToBounds = YES;
     button.clipsToBounds = YES;
+    CGFloat limit = MIN(CGRectGetWidth(button.bounds), CGRectGetHeight(button.bounds)) / 2.0;
+    BOOL pill = cornerRadius >= 100;
+    objc_setAssociatedObject(button, kZSFlatButtonRadiusKey, pill ? nil : @(cornerRadius), OBJC_ASSOCIATION_RETAIN);
+    button.layer.cornerRadius = limit > 0 ? (pill ? limit : MIN(cornerRadius, limit)) : (pill ? 15 : cornerRadius);
+    if (object_getClass(button) == [UIButton class]) {
+        object_setClass(button, [ZSFlatChromeButton class]);
+    }
+    [button setNeedsLayout];
 }
 
 static void zs_style_button_as_native_glass_with_font(UIButton *button, NSString *title, UIColor *tintColor, UIFont *font) {
