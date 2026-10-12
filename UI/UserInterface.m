@@ -273,6 +273,38 @@ static ZSUpdateCheckMode zs_update_check_mode(void) {
     return zs_update_uses_nightly_releases() ? ZSUpdateCheckModeNightlyReleases : ZSUpdateCheckModeReleases;
 }
 
+static BOOL zs_plist_flag_enabled(id value) {
+    if ([value isKindOfClass:[NSNumber class]]) return [value boolValue];
+    if ([value isKindOfClass:[NSString class]]) {
+        NSString *lower = [(NSString *)value lowercaseString];
+        return [lower isEqualToString:@"yes"] || [lower isEqualToString:@"true"] || [lower isEqualToString:@"1"];
+    }
+    return NO;
+}
+
+static BOOL zs_design_requires_compatibility(void) {
+    static BOOL compat;
+    static dispatch_once_t token;
+    dispatch_once(&token, ^{
+        static NSString * const key = @"UIDesignRequiresCompatibility";
+        BOOL found = zs_plist_flag_enabled([NSBundle mainBundle].infoDictionary[key]);
+        if (!found) {
+            CFBundleRef mainRef = CFBundleGetMainBundle();
+            if (mainRef) {
+                CFTypeRef raw = CFBundleGetValueForInfoDictionaryKey(mainRef, (__bridge CFStringRef)key);
+                if (raw) found = zs_plist_flag_enabled((__bridge id)raw);
+            }
+        }
+        if (!found) {
+            NSString *path = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"Info.plist"];
+            NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:path];
+            found = zs_plist_flag_enabled(plist[key]);
+        }
+        compat = found;
+    });
+    return compat;
+}
+
 static BOOL zs_has_liquid_glass(void) {
     static BOOL has;
     static dispatch_once_t token;
@@ -280,7 +312,8 @@ static BOOL zs_has_liquid_glass(void) {
         has = NO;
         if (@available(iOS 26.0, *)) {
             has = (NSClassFromString(@"UIGlassEffect") != nil &&
-                   NSClassFromString(@"UIGlassContainerEffect") != nil);
+                   NSClassFromString(@"UIGlassContainerEffect") != nil &&
+                   !zs_design_requires_compatibility());
         }
     });
     return has && !zs_liquid_glass_disabled_by_user();
@@ -561,6 +594,20 @@ static void zs_clear_button_configuration(UIButton *button) {
     }
 }
 
+static void zs_apply_flat_button_chrome(UIButton *button, CGFloat cornerRadius) {
+    if (!button) return;
+    zs_clear_button_configuration(button);
+    button.hidden = NO;
+    button.opaque = NO;
+    button.backgroundColor = [UIColor colorWithWhite:0.2 alpha:1.0];
+    button.layer.borderWidth = 1;
+    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
+    button.layer.cornerCurve = kCACornerCurveContinuous;
+    button.layer.cornerRadius = cornerRadius;
+    button.layer.masksToBounds = YES;
+    button.clipsToBounds = YES;
+}
+
 static void zs_style_button_as_native_glass_with_font(UIButton *button, NSString *title, UIColor *tintColor, UIFont *font) {
     if (zs_has_liquid_glass()) {
         Class configClass = NSClassFromString(@"UIButtonConfiguration");
@@ -602,17 +649,13 @@ static void zs_style_button_as_native_glass_with_font(UIButton *button, NSString
         }
     }
 
-    zs_clear_button_configuration(button);
+    zs_apply_flat_button_chrome(button, 200);
     [button setTitle:title forState:UIControlStateNormal];
-    if (tintColor) [button setTitleColor:tintColor forState:UIControlStateNormal];
+    if (tintColor) {
+        [button setTitleColor:tintColor forState:UIControlStateNormal];
+        button.tintColor = tintColor;
+    }
     if (font) button.titleLabel.font = font;
-    button.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
-    button.layer.cornerCurve = kCACornerCurveContinuous;
-
-    button.layer.cornerRadius = 200;
-    button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
@@ -621,6 +664,7 @@ static void zs_style_button_as_native_glass(UIButton *button, NSString *title, U
 }
 
 static void zs_style_button_as_liquid_glass_fallback_with_font(UIButton *button, NSString *title, UIColor *tintColor, UIFont *font) {
+    zs_apply_flat_button_chrome(button, 200);
     NSMutableParagraphStyle *paragraphStyle = [NSMutableParagraphStyle new];
     paragraphStyle.lineBreakMode = NSLineBreakByTruncatingTail;
     NSDictionary *titleAttributes = @{
@@ -634,12 +678,6 @@ static void zs_style_button_as_liquid_glass_fallback_with_font(UIButton *button,
     if (tintColor) [button setTitleColor:tintColor forState:UIControlStateNormal];
     if (font) button.titleLabel.font = font;
     button.tintColor = tintColor ?: UIColor.whiteColor;
-    button.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
-    button.layer.cornerCurve = kCACornerCurveContinuous;
-    button.layer.cornerRadius = 200;
-    button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
@@ -751,15 +789,9 @@ static void zs_style_pill_icon_button_as_native_glass(UIButton *button, UIImage 
         }
     }
 
-    zs_clear_button_configuration(button);
-    [button setImage:image forState:UIControlStateNormal];
-    if (tintColor) button.tintColor = tintColor;
-    button.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
-    button.layer.cornerCurve = kCACornerCurveContinuous;
-    button.layer.cornerRadius = 200;
-    button.clipsToBounds = YES;
+    zs_apply_flat_button_chrome(button, 200);
+    [button setImage:[image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    button.tintColor = tintColor ?: UIColor.whiteColor;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
@@ -813,14 +845,9 @@ static void zs_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
         }
     }
 
-    zs_clear_button_configuration(button);
-    [button setImage:image forState:UIControlStateNormal];
-    if (tintColor) button.tintColor = tintColor;
-    button.backgroundColor = [UIColor colorWithWhite:0.16 alpha:1.0];
-    button.layer.cornerRadius = 9;
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.24].CGColor;
-    button.clipsToBounds = YES;
+    zs_apply_flat_button_chrome(button, 9);
+    [button setImage:[image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate] forState:UIControlStateNormal];
+    button.tintColor = tintColor ?: UIColor.whiteColor;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
