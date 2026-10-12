@@ -69,13 +69,14 @@ input[type=file] { display: none; }
 .bar { height: 2px; background: #2a2a2a; margin-top: 4px; }
 .bar > i { display: block; height: 100%; width: 0%; background: var(--accent); box-shadow: 0 0 10px var(--glow); transition: width 0.12s linear; }
 .stage { font-size: 12px; color: var(--accent); letter-spacing: 1.5px; text-transform: uppercase; margin-top: 12px; min-height: 20px; text-align: center; }
-.log { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-muted); white-space: pre-wrap; margin-top: 12px; max-height: 190px; overflow: auto; border: 1px solid #2a2a2a; padding: 10px 12px; }
+.log { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-muted); white-space: pre-wrap; margin-top: 12px; max-height: 320px; overflow: auto; border: 1px solid #2a2a2a; padding: 10px 12px; }
 .log:empty { display: none; }
 .log .e { color: var(--err); } .log .w { color: var(--accent-soft); } .log .k { color: var(--accent); }
 .meta { font-size: 13px; color: var(--accent-soft); text-align: center; word-break: break-all; font-style: italic; margin-bottom: 16px; }
 .note { font-size: 12px; color: var(--text-muted); text-align: center; letter-spacing: 0.5px; margin-top: 16px; line-height: 1.6; }
 .hidden { display: none !important; }
 .fail .stage { color: var(--err); }
+.done .bar { display: none; }
 .row { display: flex; gap: 12px; margin-top: 18px; align-items: stretch; }
 .row .pop { position: relative; flex: 1 1 0; min-width: 0; }
 .row .pop .btn { padding: 13px 4px; font-size: 11px; letter-spacing: 1.4px; white-space: nowrap; }
@@ -128,9 +129,7 @@ input[type=file] { display: none; }
     <div class="meta" id="outMeta"></div>
     <div class="actions" style="margin-top:0">
       <button class="btn big" id="dl">「 Save IPA 」</button>
-      <button class="btn big hidden" id="share">「 Share 」</button>
     </div>
-    <div class="note">Sideload with SideStore, AltStore, Sideloadly or LiveContainer. They re-sign it for you.</div>
   </section>
 </div>
 
@@ -140,7 +139,7 @@ import { inject } from "./js/inject.js";
 const $ = (id) => document.getElementById(id);
 const state = {
   channel: "release", versions: [], version: null, manifests: {}, nightly: null,
-  file: null, busy: false, outUrl: null, outBlob: null, outName: "",
+  file: null, t0: 0, busy: false, outUrl: null, outBlob: null, outName: "",
 };
 
 function fmtSize(n) {
@@ -149,10 +148,15 @@ function fmtSize(n) {
   return Math.max(1, Math.round(n / 1024)) + " KB";
 }
 
+function stamp() {
+  const t = state.t0 ? (performance.now() - state.t0) / 1000 : 0;
+  return "[+" + t.toFixed(2).padStart(6, " ") + "s] ";
+}
+
 function log(msg, cls) {
   const d = document.createElement("div");
   if (cls) d.className = cls;
-  d.textContent = msg;
+  d.textContent = stamp() + msg;
   $("log").appendChild(d);
   $("log").scrollTop = $("log").scrollHeight;
 }
@@ -273,13 +277,20 @@ async function sha256Hex(buf) {
 }
 
 async function fetchVerified(path, expected) {
+  const t = performance.now();
+  log("GET " + path);
   const r = await fetch(path, { cache: "no-store" });
+  log("  HTTP " + r.status + " " + r.statusText + " \u00b7 type " + (r.headers.get("content-type") || "?") + " \u00b7 length " + (r.headers.get("content-length") || "?"));
   if (!r.ok) throw new Error("Could not download " + path + " (" + r.status + ")");
   const buf = await r.arrayBuffer();
+  log("  received " + fmtSize(buf.byteLength) + " (" + buf.byteLength + " bytes) in " + (performance.now() - t).toFixed(0) + " ms");
   if (expected) {
+    const t2 = performance.now();
     const got = await sha256Hex(buf);
+    log("  sha256 expected " + expected);
+    log("  sha256 computed " + got + " (" + (performance.now() - t2).toFixed(0) + " ms)");
     if (got !== expected) throw new Error("Checksum mismatch for " + path + ". The site may be mid-update, try again in a minute.");
-  }
+  } else log("  no checksum in manifest, skipping verification", "w");
   return buf;
 }
 
@@ -293,6 +304,7 @@ function reset() {
   $("stage").textContent = "";
   $("progressCard").classList.remove("hidden");
   $("progressCard").classList.remove("fail");
+  $("progressCard").classList.remove("done");
 }
 
 const STAGE_SPAN = { "Reading IPA": [0, 0.05], "Patching Info.plist": [0.05, 0.08], "Patching executable": [0.08, 0.7], "Writing IPA": [0.7, 1], Done: [1, 1] };
@@ -308,39 +320,62 @@ $("go").addEventListener("click", async () => {
   let lock = null;
   try { lock = await navigator.wakeLock?.request("screen"); } catch (e) {}
   const t0 = performance.now();
+  state.t0 = t0;
   try {
     $("stage").textContent = "Downloading tweak payload";
+    log("Environment: " + navigator.userAgent);
+    log("Wake lock: " + (lock ? "held" : "unavailable") + " \u00b7 crypto.subtle: " + (crypto && crypto.subtle ? "yes" : "NO") + " \u00b7 deviceMemory: " + (navigator.deviceMemory || "?") + " GB \u00b7 cores: " + (navigator.hardwareConcurrency || "?"));
+    log("Input: " + state.file.name + " \u00b7 " + fmtSize(state.file.size) + " (" + state.file.size + " bytes) \u00b7 type " + (state.file.type || "unknown"));
+    log("Channel: " + state.channel + " \u00b7 base " + base);
+    log("Manifest: " + JSON.stringify(m));
     log("Fetching " + m.dylib.file + " (" + m.version + (m.build ? ", build " + m.build : "") + ")");
     const dylib = new Uint8Array(await fetchVerified(base + m.dylib.file, m.dylib.sha256));
     let appex = null;
     if (m.appex) {
       appex = new Blob([await fetchVerified(base + m.appex.file, m.appex.sha256)]);
-      log("Fetched " + m.appex.file);
+      log("Fetched " + m.appex.file + " (" + fmtSize(appex.size) + ")");
     } else log("No extension in this build, skipping embed");
     log("Checksums OK", "k");
+    log("Payload dylib: " + fmtSize(dylib.length) + " (" + dylib.length + " bytes)");
     let lastStage = "";
+    let stageT = performance.now();
+    let lastPct = -1;
     const res = await inject(state.file, { dylib, appex }, {
+      onLog: (msg, cls) => log("  " + msg, cls),
       onProgress(stage, f) {
         const [a, b] = STAGE_SPAN[stage] || [0, 1];
         $("barFill").style.width = Math.round((a + (b - a) * f) * 100) + "%";
-        if (stage !== lastStage) { lastStage = stage; $("stage").textContent = stage + "\u2026"; log(stage); }
+        if (stage !== lastStage) {
+          if (lastStage) log("  " + lastStage + " finished in " + (performance.now() - stageT).toFixed(0) + " ms");
+          lastStage = stage;
+          stageT = performance.now();
+          lastPct = -1;
+          $("stage").textContent = stage + "\u2026";
+          log(stage);
+        } else {
+          const pct = Math.floor(f * 4) * 25;
+          if (pct > lastPct && pct > 0 && pct < 100) { lastPct = pct; log("  " + stage + " " + pct + "%"); }
+        }
       },
     });
+    log("  " + lastStage + " finished in " + (performance.now() - stageT).toFixed(0) + " ms");
     for (const w of res.warnings) log(w, "w");
     state.outBlob = res.blob;
     state.outName = "LC" + res.gameVersion + "\u2014ZS" + m.version + ".ipa";
     state.outUrl = URL.createObjectURL(res.blob);
     $("stage").textContent = "Done in " + ((performance.now() - t0) / 1000).toFixed(1) + "s";
+    log("Output blob: " + fmtSize(res.blob.size) + " (" + res.blob.size + " bytes) \u00b7 extension embedded: " + res.embeddedAppex + " \u00b7 already injected: " + res.alreadyInjected);
     log("Game " + res.gameVersion + " \u00b7 " + res.arch.join("+") + " \u00b7 " + res.appId, "k");
     $("outMeta").textContent = state.outName + " \u00b7 " + fmtSize(res.blob.size);
     $("result").classList.remove("hidden");
-    const canShare = (() => { try { return !!(navigator.canShare && navigator.canShare({ files: [new File([new Blob()], "x.ipa")] })); } catch (e) { return false; } })();
-    $("share").classList.toggle("hidden", !canShare);
+    $("progressCard").classList.add("done");
   } catch (err) {
     console.error(err);
     $("stage").textContent = "Failed";
     $("progressCard").classList.add("fail");
     log(err && err.message ? err.message : String(err), "e");
+    if (err && err.name) log("Error type: " + err.name, "e");
+    if (err && err.stack) log(String(err.stack), "e");
   } finally {
     try { await lock?.release(); } catch (e) {}
     state.busy = false;
@@ -356,13 +391,6 @@ $("dl").addEventListener("click", () => {
   document.body.appendChild(a);
   a.click();
   a.remove();
-});
-
-$("share").addEventListener("click", async () => {
-  if (!state.outBlob) return;
-  try {
-    await navigator.share({ files: [new File([state.outBlob], state.outName, { type: "application/octet-stream" })] });
-  } catch (e) {}
 });
 
 loadAll();
