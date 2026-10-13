@@ -35,5 +35,6 @@ void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot);
 void zs_set_donated_heap_enabled(BOOL enabled);
 void zs_ram_bypass_get_stats(RamBypassStats *outStats);
 void zs_ram_bypass_trim(void);
+void zs_ram_bypass_log_profile(void);
 
 #endif

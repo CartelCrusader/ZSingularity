@@ -177,7 +177,7 @@ static ZSRamDonor *sharedDonor;
             }
         }
 
-        ZLog(@"[RamDonor] donor extension: %@", identifier ?: @"not found in PlugIns");
+        ZLog(@"[RamBypass] donor extension: %@", identifier ?: @"not found in PlugIns");
     });
 
     return identifier;
@@ -200,7 +200,7 @@ static ZSRamDonor *sharedDonor;
     {
         self.lastError = [NSString stringWithFormat:@"Could not load %@: %@",
                                                     identifier, error.localizedDescription];
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
@@ -210,7 +210,7 @@ static ZSRamDonor *sharedDonor;
     item.userInfo = @{ @"endpoint": ZSWrapEndpoint(xpc_endpoint_create(self.listener)) };
 
     [extension setRequestCancellationBlock:^(NSUUID *uuid, NSError *cancelError) {
-        ZLog(@"[RamDonor] donor request cancelled: %@", cancelError);
+        ZLog(@"[RamBypass] donor request cancelled: %@", cancelError);
     }];
 
     const NSUInteger before = self.liveDonorCount;
@@ -231,11 +231,11 @@ static ZSRamDonor *sharedDonor;
     if (!started)
     {
         self.lastError = @"The extension request was rejected, so no process was spawned";
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
-    ZLog(@"[RamDonor] donor spawned, pid %d, waiting for it to connect",
+    ZLog(@"[RamBypass] donor spawned, pid %d, waiting for it to connect",
          [extension pidForRequestIdentifier:requestIdentifier]);
 
     const NSTimeInterval deadline = NSDate.timeIntervalSinceReferenceDate + timeout;
@@ -247,7 +247,7 @@ static ZSRamDonor *sharedDonor;
         if (remaining <= 0)
         {
             self.lastError = @"The donor spawned, but no connection was accepted before the timeout";
-            ZLog(@"[RamDonor] %@", self.lastError);
+            ZLog(@"[RamBypass] %@", self.lastError);
             return NO;
         }
 
@@ -291,7 +291,7 @@ static ZSRamDonor *sharedDonor;
         [self.connections removeObjectIdenticalTo:connection];
     }
 
-    ZLog(@"[RamDonor] a donor went away, %lu left", (unsigned long)self.liveDonorCount);
+    ZLog(@"[RamBypass] a donor went away, %lu left", (unsigned long)self.liveDonorCount);
 }
 
 - (nullable xpc_object_t)send:(const char *)op
@@ -383,7 +383,7 @@ static ZSRamDonor *sharedDonor;
                 self.lastError = [NSString stringWithFormat:
                     @"%lu donor(s) could only take %llu MB of the %llu MB needed",
                     (unsigned long)slots.count, offset / (1024 * 1024), size / (1024 * 1024)];
-                ZLog(@"[RamDonor] %@", self.lastError);
+                ZLog(@"[RamBypass] %@", self.lastError);
             }
 
             break;
@@ -410,7 +410,7 @@ static ZSRamDonor *sharedDonor;
         self.regions[@(base)] = region;
     }
 
-    ZLog(@"[RamDonor] %llu MB of %llu MB mapped at 0x%llx across %lu donor(s)",
+    ZLog(@"[RamBypass] %llu MB of %llu MB mapped at 0x%llx across %lu donor(s)",
          offset / (1024 * 1024), size / (1024 * 1024), (uint64_t)base, (unsigned long)slots.count);
 
     if (actual)
@@ -437,7 +437,7 @@ static ZSRamDonor *sharedDonor;
     {
         self.lastError = [NSString stringWithFormat:@"A donor did not answer while asking for %llu MB",
                                                     length / (1024 * 1024)];
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
@@ -447,7 +447,7 @@ static ZSRamDonor *sharedDonor;
     {
         self.lastError = [NSString stringWithFormat:@"Donor could not supply %llu MB: %s",
                                                     length / (1024 * 1024), donorError];
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
@@ -456,7 +456,7 @@ static ZSRamDonor *sharedDonor;
     if (!shmem || xpc_get_type(shmem) != XPC_TYPE_SHMEM)
     {
         self.lastError = @"A donor's reply carried no shared memory";
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
@@ -467,7 +467,7 @@ static ZSRamDonor *sharedDonor;
     {
         self.lastError = [NSString stringWithFormat:@"xpc_shmem_map returned %zu of %llu bytes",
                                                     mapped, length];
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
@@ -486,7 +486,7 @@ static ZSRamDonor *sharedDonor;
     {
         self.lastError = [NSString stringWithFormat:@"Could not remap a donated chunk: %s",
                                                     mach_error_string(kr)];
-        ZLog(@"[RamDonor] %@", self.lastError);
+        ZLog(@"[RamBypass] %@", self.lastError);
         return NO;
     }
 
@@ -559,7 +559,7 @@ static ZSRamDonor *sharedDonor;
 
     [slots addObject:slot];
 
-    ZLog(@"[RamDonor] donor %lu reports %llu MB available, will use up to %llu MB of it",
+    ZLog(@"[RamBypass] donor %lu reports %llu MB available, will use up to %llu MB of it",
          (unsigned long)slots.count, budget / (1024 * 1024), slot.remaining / (1024 * 1024));
 
     return slot.remaining > 0;
@@ -654,7 +654,7 @@ static uint64_t ZSTouchedBytesInRange(mach_vm_address_t start, mach_vm_size_t le
         [self.extensions removeAllObjects];
     }
 
-    ZLog(@"[RamDonor] killing %lu donor(s), mapped memory stays with this process",
+    ZLog(@"[RamBypass] killing %lu donor(s), mapped memory stays with this process",
          (unsigned long)extensions.count);
 
     for (NSExtension *extension in extensions)

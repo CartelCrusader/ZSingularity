@@ -23,6 +23,9 @@
 #import <string.h>
 #import <sys/mman.h>
 #import <time.h>
+#if __has_include(<ptrauth.h>)
+#import <ptrauth.h>
+#endif
 
 static NSString * const kZSRamBypassSection = @"ramBypass";
 static NSString * const kZSRamBypassEnabledKey = @"enabled";
@@ -103,6 +106,7 @@ static struct {
     uint32_t pageCount;
     uint32_t cleanPage;
     uint64_t used;
+    uint64_t loggedStride;
     ZSRun *runs;
     uint8_t *freeMap;
     uint8_t *zeroMap;
@@ -586,10 +590,17 @@ static void *zs_pool_take(uint64_t length, BOOL zero)
 
     if (result)
     {
-        const uint64_t before = g_pool.used;
         g_pool.used += needBytes;
         usedAfter = g_pool.used;
-        crossedStride = (before / kZSDonatedLogStride) != (usedAfter / kZSDonatedLogStride);
+
+        const uint64_t stride = usedAfter / kZSDonatedLogStride;
+
+        crossedStride = stride > g_pool.loggedStride;
+
+        if (crossedStride)
+        {
+            g_pool.loggedStride = stride;
+        }
     }
 
     os_unfair_lock_unlock(&g_pool.lock);
@@ -957,6 +968,7 @@ static BOOL zs_pool_install(void *base, uint64_t size)
     g_pool.pageCount = (uint32_t)pages;
     g_pool.cleanPage = 0;
     g_pool.used = 0;
+    g_pool.loggedStride = 0;
     g_pool.runs = runs;
     g_pool.freeMap = map;
     g_pool.zeroMap = zeroMap;
@@ -996,6 +1008,303 @@ static void zs_log_rejected_mmap(size_t length, void *address, int prot, int fla
     });
 }
 
+#define ZS_PROFILE_SLOTS 2048
+#define ZS_PROFILE_PROBE 16
+#define ZS_PROFILE_FRAMES 4
+#define ZS_PROFILE_KEYED_FRAMES 3
+#define ZS_PROFILE_TOP 12
+
+typedef enum {
+    ZSProfileMalloc,
+    ZSProfileCalloc,
+    ZSProfileValloc,
+    ZSProfileMemalign,
+    ZSProfileMmap,
+    ZSProfileMmapReserve,
+    ZSProfileMmapFile,
+    ZSProfileMmapOther,
+    ZSProfileVmAllocate,
+    ZSProfileApiCount
+} ZSProfileApi;
+
+static const char *const kZSProfileApiNames[ZSProfileApiCount] = {
+    "malloc", "calloc", "valloc", "memalign", "mmap", "mmap-reserve", "mmap-file", "mmap-other", "vm_allocate"
+};
+
+typedef struct {
+    _Atomic(uint64_t) key;
+    _Atomic(uint32_t) ready;
+    uint32_t api;
+    uintptr_t frames[ZS_PROFILE_FRAMES];
+    _Atomic(uint64_t) calls;
+    _Atomic(uint64_t) bytes;
+    _Atomic(uint64_t) minSize;
+    _Atomic(uint64_t) maxSize;
+} ZSProfileSlot;
+
+typedef struct {
+    uint32_t api;
+    uintptr_t frames[ZS_PROFILE_FRAMES];
+    uint64_t calls;
+    uint64_t bytes;
+    uint64_t minSize;
+    uint64_t maxSize;
+} ZSProfileRow;
+
+static ZSProfileSlot g_profileSlots[ZS_PROFILE_SLOTS];
+static _Atomic(uint64_t) g_profileDropped;
+static uint64_t g_profileStartNs;
+
+static inline uintptr_t zs_profile_strip(uintptr_t address)
+{
+#if __has_feature(ptrauth_calls)
+    return (uintptr_t)ptrauth_strip((void *)address, ptrauth_key_return_address);
+#else
+    return address;
+#endif
+}
+
+static __attribute__((noinline)) void zs_profile_record(uint32_t api, uint64_t size, void *frame)
+{
+    uintptr_t frames[ZS_PROFILE_FRAMES] = {0};
+    void **cursor = (void **)frame;
+
+    for (int i = 0; i < ZS_PROFILE_FRAMES && cursor; i++)
+    {
+        if ((uintptr_t)cursor & 15)
+        {
+            break;
+        }
+
+        frames[i] = zs_profile_strip((uintptr_t)cursor[1]);
+
+        void **next = (void **)cursor[0];
+
+        if ((uintptr_t)next <= (uintptr_t)cursor || (uintptr_t)next - (uintptr_t)cursor > (1u << 20))
+        {
+            break;
+        }
+
+        cursor = next;
+    }
+
+    uint64_t key = 1469598103934665603ull ^ api;
+
+    for (int i = 0; i < ZS_PROFILE_KEYED_FRAMES; i++)
+    {
+        key = (key ^ (uint64_t)frames[i]) * 1099511628211ull;
+    }
+
+    key |= 1;
+
+    ZSProfileSlot *slot = NULL;
+
+    for (uint32_t probe = 0; probe < ZS_PROFILE_PROBE && !slot; probe++)
+    {
+        ZSProfileSlot *candidate = &g_profileSlots[(key + probe) % ZS_PROFILE_SLOTS];
+        uint64_t current = atomic_load_explicit(&candidate->key, memory_order_acquire);
+
+        if (current == 0 && atomic_compare_exchange_strong_explicit(&candidate->key, &current, key,
+                                                                    memory_order_acq_rel, memory_order_acquire))
+        {
+            candidate->api = api;
+            memcpy(candidate->frames, frames, sizeof(frames));
+            atomic_store_explicit(&candidate->ready, 1, memory_order_release);
+            slot = candidate;
+        }
+        else if (current == key)
+        {
+            slot = candidate;
+        }
+    }
+
+    if (!slot)
+    {
+        atomic_fetch_add_explicit(&g_profileDropped, 1, memory_order_relaxed);
+        return;
+    }
+
+    atomic_fetch_add_explicit(&slot->calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&slot->bytes, size, memory_order_relaxed);
+
+    uint64_t low = atomic_load_explicit(&slot->minSize, memory_order_relaxed);
+
+    while ((low == 0 || size < low) &&
+           !atomic_compare_exchange_weak_explicit(&slot->minSize, &low, size, memory_order_relaxed, memory_order_relaxed))
+    {
+    }
+
+    uint64_t high = atomic_load_explicit(&slot->maxSize, memory_order_relaxed);
+
+    while (size > high &&
+           !atomic_compare_exchange_weak_explicit(&slot->maxSize, &high, size, memory_order_relaxed, memory_order_relaxed))
+    {
+    }
+}
+
+#define ZS_PROFILE(api, size) zs_profile_record((api), (size), __builtin_frame_address(0))
+#define ZS_PROFILE_LARGE(api, size) \
+    do { if ((size) >= zs_donated_min_allocation()) ZS_PROFILE((api), (size)); } while (0)
+
+static NSString *zs_profile_format_bytes(uint64_t bytes)
+{
+    if (bytes >= 1024ull * 1024ull * 1024ull)
+    {
+        return [NSString stringWithFormat:@"%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0)];
+    }
+
+    if (bytes >= 1024ull * 1024ull)
+    {
+        return [NSString stringWithFormat:@"%.1f MB", (double)bytes / (1024.0 * 1024.0)];
+    }
+
+    return [NSString stringWithFormat:@"%.1f KB", (double)bytes / 1024.0];
+}
+
+static NSString *zs_profile_describe(uintptr_t returnAddress)
+{
+    if (!returnAddress)
+    {
+        return @"?";
+    }
+
+    const uintptr_t address = returnAddress - 4;
+    Dl_info info;
+
+    if (!dladdr((void *)address, &info) || !info.dli_fname || !info.dli_fbase)
+    {
+        return [NSString stringWithFormat:@"0x%lx", (unsigned long)address];
+    }
+
+    const char *name = strrchr(info.dli_fname, '/');
+    name = name ? name + 1 : info.dli_fname;
+
+    NSString *text = [NSString stringWithFormat:@"%s+0x%lx", name, (unsigned long)(address - (uintptr_t)info.dli_fbase)];
+
+    if (info.dli_sname)
+    {
+        text = [text stringByAppendingFormat:@"(%s)", info.dli_sname];
+    }
+
+    return text;
+}
+
+static int zs_profile_compare_calls(const void *left, const void *right)
+{
+    const uint64_t a = ((const ZSProfileRow *)left)->calls;
+    const uint64_t b = ((const ZSProfileRow *)right)->calls;
+
+    return a < b ? 1 : (a > b ? -1 : 0);
+}
+
+static int zs_profile_compare_bytes(const void *left, const void *right)
+{
+    const uint64_t a = ((const ZSProfileRow *)left)->bytes;
+    const uint64_t b = ((const ZSProfileRow *)right)->bytes;
+
+    return a < b ? 1 : (a > b ? -1 : 0);
+}
+
+static void zs_profile_log_rows(const char *title, ZSProfileRow *rows, size_t count, double seconds)
+{
+    const size_t limit = MIN(count, (size_t)ZS_PROFILE_TOP);
+
+    for (size_t i = 0; i < limit; i++)
+    {
+        const ZSProfileRow *row = &rows[i];
+        NSMutableArray<NSString *> *chain = [NSMutableArray array];
+
+        for (int f = 0; f < ZS_PROFILE_FRAMES && row->frames[f]; f++)
+        {
+            [chain addObject:zs_profile_describe(row->frames[f])];
+        }
+
+        ZLog(@"[RamBypass] hot by %s #%zu %s x%llu (%.2f/s) total %@ avg %@ min %@ max %@ | %@",
+             title, i + 1, kZSProfileApiNames[row->api], row->calls, seconds > 0 ? (double)row->calls / seconds : 0.0,
+             zs_profile_format_bytes(row->bytes), zs_profile_format_bytes(row->calls ? row->bytes / row->calls : 0),
+             zs_profile_format_bytes(row->minSize), zs_profile_format_bytes(row->maxSize),
+             [chain componentsJoinedByString:@" <- "]);
+    }
+}
+
+static void zs_profile_dump(void)
+{
+    ZSProfileRow *rows = calloc(ZS_PROFILE_SLOTS, sizeof(ZSProfileRow));
+
+    if (!rows)
+    {
+        return;
+    }
+
+    size_t count = 0;
+
+    for (uint32_t i = 0; i < ZS_PROFILE_SLOTS; i++)
+    {
+        ZSProfileSlot *slot = &g_profileSlots[i];
+
+        if (!atomic_load_explicit(&slot->ready, memory_order_acquire))
+        {
+            continue;
+        }
+
+        ZSProfileRow *row = &rows[count];
+        row->calls = atomic_load_explicit(&slot->calls, memory_order_relaxed);
+
+        if (!row->calls)
+        {
+            continue;
+        }
+
+        row->api = slot->api;
+        memcpy(row->frames, slot->frames, sizeof(row->frames));
+        row->bytes = atomic_load_explicit(&slot->bytes, memory_order_relaxed);
+        row->minSize = atomic_load_explicit(&slot->minSize, memory_order_relaxed);
+        row->maxSize = atomic_load_explicit(&slot->maxSize, memory_order_relaxed);
+        count++;
+    }
+
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    const double seconds = g_profileStartNs && now > g_profileStartNs ? (double)(now - g_profileStartNs) / 1e9 : 0.0;
+
+    uint64_t apiCalls[ZSProfileApiCount] = {0};
+    uint64_t apiBytes[ZSProfileApiCount] = {0};
+
+    for (size_t i = 0; i < count; i++)
+    {
+        apiCalls[rows[i].api] += rows[i].calls;
+        apiBytes[rows[i].api] += rows[i].bytes;
+    }
+
+    NSMutableArray<NSString *> *totals = [NSMutableArray array];
+
+    for (uint32_t api = 0; api < ZSProfileApiCount; api++)
+    {
+        if (apiCalls[api])
+        {
+            [totals addObject:[NSString stringWithFormat:@"%s %llu calls %@", kZSProfileApiNames[api],
+                                                         apiCalls[api], zs_profile_format_bytes(apiBytes[api])]];
+        }
+    }
+
+    ZLog(@"[RamBypass] profile after %.0fs: %zu call sites, %llu dropped | %@",
+         seconds, count, atomic_load(&g_profileDropped), [totals componentsJoinedByString:@", "]);
+
+    qsort(rows, count, sizeof(ZSProfileRow), zs_profile_compare_calls);
+    zs_profile_log_rows("calls", rows, count, seconds);
+
+    qsort(rows, count, sizeof(ZSProfileRow), zs_profile_compare_bytes);
+    zs_profile_log_rows("bytes", rows, count, seconds);
+
+    free(rows);
+}
+
+void zs_ram_bypass_log_profile(void)
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        zs_profile_dump();
+    });
+}
+
 static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int fd, off_t offset)
 {
     const BOOL anonymous = (flags & MAP_ANON) != 0 && (fd == -1 || ((uint32_t)fd & 0xff000000u) != 0);
@@ -1010,6 +1319,23 @@ static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int
     if (large)
     {
         atomic_fetch_add(&g_largeCalls, 1);
+
+        uint32_t category = ZSProfileMmapOther;
+
+        if (eligible)
+        {
+            category = ZSProfileMmap;
+        }
+        else if (!anonymous)
+        {
+            category = ZSProfileMmapFile;
+        }
+        else if (prot == PROT_NONE)
+        {
+            category = ZSProfileMmapReserve;
+        }
+
+        ZS_PROFILE(category, length);
     }
 
     if (large && !eligible)
@@ -1067,7 +1393,7 @@ static void zs_log_rejected_vm(const char *api, uint64_t length, int flags)
     });
 }
 
-static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *address, uint64_t size, int flags)
+static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *address, uint64_t size, int flags, void *callerFrame)
 {
     if (!address || target != mach_task_self() || size < zs_donated_min_allocation())
     {
@@ -1075,6 +1401,7 @@ static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *ad
     }
 
     atomic_fetch_add(&g_vmLargeCalls, 1);
+    zs_profile_record(ZSProfileVmAllocate, size, callerFrame);
 
     if ((flags & VM_FLAGS_ANYWHERE) == 0 || (flags & (VM_FLAGS_OVERWRITE | VM_FLAGS_PURGABLE)) != 0)
     {
@@ -1104,7 +1431,7 @@ static kern_return_t zs_hook_vm_allocate(vm_map_t target, vm_address_t *address,
 {
     uint64_t served = 0;
 
-    if (zs_vm_allocate_common("vm_allocate", target, &served, size, flags))
+    if (zs_vm_allocate_common("vm_allocate", target, &served, size, flags, __builtin_frame_address(0)))
     {
         *address = (vm_address_t)served;
 
@@ -1118,7 +1445,7 @@ static kern_return_t zs_hook_mach_vm_allocate(vm_map_t target, mach_vm_address_t
 {
     uint64_t served = 0;
 
-    if (zs_vm_allocate_common("mach_vm_allocate", target, &served, size, flags))
+    if (zs_vm_allocate_common("mach_vm_allocate", target, &served, size, flags, __builtin_frame_address(0)))
     {
         *address = (mach_vm_address_t)served;
 
@@ -1890,6 +2217,8 @@ static inline BOOL zs_malloc_should_redirect(size_t size)
 
 static void *zs_hook_malloc(size_t size)
 {
+    ZS_PROFILE_LARGE(ZSProfileMalloc, size);
+
     if (zs_malloc_should_redirect(size))
     {
         void *pointer = zs_malloc_zone_allocate(size, 16, NO);
@@ -1909,6 +2238,8 @@ static void *zs_hook_calloc(size_t count, size_t size)
     {
         return g_origCalloc(count, size);
     }
+
+    ZS_PROFILE_LARGE(ZSProfileCalloc, count * size);
 
     if (zs_malloc_should_redirect(count * size))
     {
@@ -1957,6 +2288,8 @@ static size_t zs_hook_malloc_size(const void *pointer)
 
 static void *zs_hook_valloc(size_t size)
 {
+    ZS_PROFILE_LARGE(ZSProfileValloc, size);
+
     if (zs_malloc_should_redirect(size))
     {
         void *pointer = zs_malloc_zone_allocate(size, vm_page_size, NO);
@@ -1972,6 +2305,8 @@ static void *zs_hook_valloc(size_t size)
 
 static int zs_hook_posix_memalign(void **pointer, size_t alignment, size_t size)
 {
+    ZS_PROFILE_LARGE(ZSProfileMemalign, size);
+
     if (!pointer)
     {
         return EINVAL;
@@ -1994,6 +2329,8 @@ static int zs_hook_posix_memalign(void **pointer, size_t alignment, size_t size)
 
 static void *zs_hook_aligned_alloc(size_t alignment, size_t size)
 {
+    ZS_PROFILE_LARGE(ZSProfileMemalign, size);
+
     if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0 && size % alignment == 0)
     {
@@ -2010,6 +2347,8 @@ static void *zs_hook_aligned_alloc(size_t alignment, size_t size)
 
 static void *zs_hook_memalign(size_t alignment, size_t size)
 {
+    ZS_PROFILE_LARGE(ZSProfileMemalign, size);
+
     if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0)
     {
@@ -2026,6 +2365,8 @@ static void *zs_hook_memalign(size_t alignment, size_t size)
 
 static void *zs_hook_malloc_type_malloc(size_t size, uintptr_t typeID)
 {
+    ZS_PROFILE_LARGE(ZSProfileMalloc, size);
+
     if (zs_malloc_should_redirect(size))
     {
         void *pointer = zs_malloc_zone_allocate(size, 16, NO);
@@ -2043,6 +2384,8 @@ static void *zs_hook_malloc_type_calloc(size_t count, size_t size, uintptr_t typ
 {
     if (!count || size <= SIZE_MAX / count)
     {
+        ZS_PROFILE_LARGE(ZSProfileCalloc, count * size);
+
         if (zs_malloc_should_redirect(count * size))
         {
             void *pointer = zs_malloc_zone_allocate(count * size, 16, YES);
@@ -2074,6 +2417,8 @@ static void *zs_hook_malloc_type_realloc(void *pointer, size_t size, uintptr_t t
 
 static void *zs_hook_malloc_type_memalign(size_t alignment, size_t size, uintptr_t typeID)
 {
+    ZS_PROFILE_LARGE(ZSProfileMemalign, size);
+
     if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0)
     {
@@ -2360,6 +2705,7 @@ static BOOL zs_install_rebinds(void)
         }
 
         g_bundlePrefixLength = strlen(g_bundlePrefix);
+        g_profileStartNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 
         Dl_info selfInfo;
 
@@ -2391,7 +2737,7 @@ static void zs_ram_bypass_start(void)
         return;
     }
 
-    for (NSNumber *delay in @[@20, @60, @120])
+    for (NSNumber *delay in @[@20, @60, @120, @300, @900])
     {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -2401,6 +2747,8 @@ static void zs_ram_bypass_start(void)
                  atomic_load(&g_reserveCalls), atomic_load(&g_vmLargeCalls),
                  atomic_load(&g_servedCount), atomic_load(&g_fallbackCount),
                  atomic_load(&g_poolReady) ? @"ready" : @"not ready");
+
+            zs_profile_dump();
         });
     }
 
