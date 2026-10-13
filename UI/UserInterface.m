@@ -7119,7 +7119,7 @@ static void zs_mt_encode_hud(id<MTLCommandBuffer> commandBuffer, id<CAMetalDrawa
     if (!target) return;
 
     CFTimeInterval now = CACurrentMediaTime();
-    if (data.length == 0 || now - r_zsmtHudLastRequest >= 0.5) {
+    if (data.length == 0 || now - r_zsmtHudLastRequest >= 1.0) {
         r_zsmtHudLastRequest = now;
         zs_mt_hud_request_refresh();
     }
@@ -7308,6 +7308,20 @@ static void zs_mt_hud_build_texture(void) {
             : @"off",
     ];
 
+    UIView *host = zs_ui_host_view();
+    CGFloat hostWidth = host.bounds.size.width;
+    UIEdgeInsets insets = host.safeAreaInsets;
+
+    static NSString *lastKey;
+    NSString *key = [NSString stringWithFormat:@"%@|%@|%@|%.1f|%.1f|%.1f",
+                     values[0], values[1], values[2], hostWidth, insets.top, insets.right];
+
+    os_unfair_lock_lock(&g_zsmtLock);
+    BOOL hasData = g_zsmtHudData.length > 0;
+    os_unfair_lock_unlock(&g_zsmtLock);
+
+    if (hasData && [key isEqualToString:lastKey]) return;
+
     UIFont *font = zs_mono_font(10, UIFontWeightSemibold);
     UIColor *labelColor = [UIColor colorWithWhite:1 alpha:0.6];
     NSMutableParagraphStyle *right = [[NSMutableParagraphStyle alloc] init];
@@ -7350,9 +7364,7 @@ static void zs_mt_hud_build_texture(void) {
     if (!buffer) return;
     NSData *data = [NSData dataWithBytesNoCopy:buffer length:pixelWidth * pixelHeight * 4 freeWhenDone:YES];
 
-    UIView *host = zs_ui_host_view();
-    CGFloat hostWidth = host.bounds.size.width;
-    UIEdgeInsets insets = host.safeAreaInsets;
+    lastKey = key;
 
     os_unfair_lock_lock(&g_zsmtLock);
     g_zsmtHudData = data;

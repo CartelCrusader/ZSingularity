@@ -22,6 +22,7 @@
 #import <Security/Security.h>
 #import "UnityBundleTools.h"
 #import "Mods.h"
+#import "DonatedHeap.h"
 
 #pragma mark - ZSScripts
 
@@ -2014,6 +2015,7 @@ void zs_run_memory_cleanup(void (^completion)(BOOL ran)) {
         zs_run_gc_collect();
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kMemoryCleanupSecondGCDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             zs_run_gc_collect();
+            zs_ram_bypass_trim();
             g_memoryCleanupInFlight = NO;
             if (completion) completion(YES);
         });

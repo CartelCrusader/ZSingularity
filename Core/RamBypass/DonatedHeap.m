@@ -22,6 +22,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <sys/mman.h>
+#import <time.h>
 
 static NSString * const kZSRamBypassSection = @"ramBypass";
 static NSString * const kZSRamBypassEnabledKey = @"enabled";
@@ -62,7 +63,17 @@ typedef struct __attribute__((aligned(16))) ZSMallocSlab {
 #define VM_FLAGS_OVERWRITE 0x4000
 #endif
 
+#ifndef MADV_ZERO
+#define MADV_ZERO 11
+#endif
+
 static const uint64_t kZSDonatedTargetBytes = 3ull * 1024ull * 1024ull * 1024ull;
+static const uint64_t kZSDonatedPhysicalDivisor = 2ull;
+static const uint64_t kZSDonatedTargetGranularity = 64ull * 1024ull * 1024ull;
+static const uint64_t kZSDonatedDecommitMinBytes = 1ull * 1024ull * 1024ull;
+static const uint64_t kZSTrimMinIntervalNs = 10ull * NSEC_PER_SEC;
+
+#define ZS_TRIM_BATCH 32
 static const uint64_t kZSDonatedMinimumBytes = 256ull * 1024ull * 1024ull;
 static const uint64_t kZSDonatedMinAllocation = 256ull * 1024ull;
 static const uint64_t kZSDonatedMinAllocation16KB = 16ull * 1024ull;
@@ -94,6 +105,7 @@ static struct {
     uint64_t used;
     ZSRun *runs;
     uint8_t *freeMap;
+    uint8_t *zeroMap;
     uint32_t bins[ZS_BIN_COUNT];
     uint64_t binMap[2];
 } g_pool;
@@ -128,6 +140,14 @@ static _Atomic(uint64_t) g_rejectedCalls;
 static _Atomic(uint32_t) g_rejectLogged;
 static _Atomic(uint64_t) g_vmLargeCalls;
 static _Atomic(uint64_t) g_reserveCalls;
+static _Atomic(uint64_t) g_zeroedBytes;
+static _Atomic(uint64_t) g_zeroSkippedBytes;
+static _Atomic(uint64_t) g_decommittedBytes;
+static _Atomic(uint64_t) g_decommitFailures;
+static _Atomic(uint64_t) g_zeroPages;
+static _Atomic(uint64_t) g_trimmedBytes;
+static _Atomic(uint64_t) g_lastTrimAt;
+static _Atomic(uint8_t) g_trimRunning;
 
 static void *(*g_origMmap)(void *, size_t, int, int, int, off_t);
 static int (*g_origMunmap)(void *, size_t);
@@ -238,20 +258,20 @@ void zs_ram_bypass_get_stats(RamBypassStats *outStats)
     outStats->fallbackAllocations = atomic_load(&g_fallbackCount);
 }
 
-static _Atomic(uint64_t) g_donatedUsedCache;
-static _Atomic(uint8_t) g_donatedUsedRefreshing;
-
-static uint64_t zs_donated_used_cached(void)
+static uint64_t zs_pool_resident_estimate(void)
 {
-    if (!atomic_exchange_explicit(&g_donatedUsedRefreshing, 1, memory_order_acq_rel))
+    if (!atomic_load_explicit(&g_poolReady, memory_order_acquire))
     {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            atomic_store_explicit(&g_donatedUsedCache, [ZSRamDonor.shared donatedBytes], memory_order_release);
-            atomic_store_explicit(&g_donatedUsedRefreshing, 0, memory_order_release);
-        });
+        return 0;
     }
 
-    return atomic_load_explicit(&g_donatedUsedCache, memory_order_acquire);
+    os_unfair_lock_lock(&g_pool.lock);
+    const uint64_t committed = (uint64_t)g_pool.cleanPage * g_pool.pageSize;
+    os_unfair_lock_unlock(&g_pool.lock);
+
+    const uint64_t zeroed = atomic_load_explicit(&g_zeroPages, memory_order_relaxed) * g_pool.pageSize;
+
+    return committed > zeroed ? committed - zeroed : 0;
 }
 
 void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
@@ -275,7 +295,7 @@ void zs_ram_hud_get_snapshot(RamHudSnapshot *outSnapshot)
     zs_ram_bypass_get_stats(&stats);
 
     outSnapshot->donatedBytes = stats.active ? stats.poolBytes : 0;
-    outSnapshot->donatedUsedBytes = stats.active ? zs_donated_used_cached() : 0;
+    outSnapshot->donatedUsedBytes = stats.active ? zs_pool_resident_estimate() : 0;
     outSnapshot->totalBytes = outSnapshot->appBytes + outSnapshot->donatedUsedBytes;
 }
 
@@ -304,8 +324,13 @@ static void zs_pool_log_async(uint64_t used)
     const uint64_t fallback = atomic_load(&g_fallbackCount);
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        ZLog(@"[RamBypass] %llu MB of %llu MB in use, %llu allocations served, %llu large allocations fell through",
-             used / (1024 * 1024), g_pool.size / (1024 * 1024), served, fallback);
+        ZLog(@"[RamBypass] %llu MB of %llu MB in use, %llu allocations served, %llu large allocations fell through, zeroed %llu MB, skipped %llu MB, decommitted %llu MB (%llu failed), trimmed %llu MB, resident scan %llu MB (estimate %llu MB), thermal %ld",
+             used / (1024 * 1024), g_pool.size / (1024 * 1024), served, fallback,
+             atomic_load(&g_zeroedBytes) / (1024 * 1024), atomic_load(&g_zeroSkippedBytes) / (1024 * 1024),
+             atomic_load(&g_decommittedBytes) / (1024 * 1024), atomic_load(&g_decommitFailures),
+             atomic_load(&g_trimmedBytes) / (1024 * 1024),
+             [ZSRamDonor.shared donatedBytes] / (1024 * 1024), zs_pool_resident_estimate() / (1024 * 1024),
+             (long)NSProcessInfo.processInfo.thermalState);
     });
 }
 
@@ -472,7 +497,54 @@ static inline BOOL zs_bytes_all_zero(const uint8_t *cursor, size_t count)
     return YES;
 }
 
-static void *zs_pool_take(uint64_t length, BOOL *outDirty)
+static void zs_pool_prepare(void *base, uint64_t bytes, BOOL zero)
+{
+    const uint64_t pageSize = g_pool.pageSize;
+    const uint64_t first = ((uintptr_t)base - g_pool.base) / pageSize;
+    const uint64_t count = bytes / pageSize;
+    uint8_t *map = g_pool.zeroMap + first;
+    uint64_t dirtyPages = 0;
+    uint64_t index = 0;
+
+    while (index < count)
+    {
+        if (map[index])
+        {
+            index++;
+            continue;
+        }
+
+        uint64_t end = index;
+
+        while (end < count && !map[end])
+        {
+            end++;
+        }
+
+        if (zero)
+        {
+            memset((uint8_t *)base + index * pageSize, 0, (size_t)((end - index) * pageSize));
+        }
+
+        dirtyPages += end - index;
+        index = end;
+    }
+
+    memset(map, 0, (size_t)count);
+
+    if (count > dirtyPages)
+    {
+        atomic_fetch_sub_explicit(&g_zeroPages, count - dirtyPages, memory_order_relaxed);
+    }
+
+    if (zero)
+    {
+        atomic_fetch_add_explicit(&g_zeroedBytes, dirtyPages * pageSize, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_zeroSkippedBytes, (count - dirtyPages) * pageSize, memory_order_relaxed);
+    }
+}
+
+static void *zs_pool_take(uint64_t length, BOOL zero)
 {
     const uint64_t needBytes = zs_round_page(length);
     const uint64_t pageSize = g_pool.pageSize;
@@ -480,11 +552,6 @@ static void *zs_pool_take(uint64_t length, BOOL *outDirty)
     BOOL dirty = NO;
     BOOL crossedStride = NO;
     uint64_t usedAfter = 0;
-
-    if (outDirty)
-    {
-        *outDirty = NO;
-    }
 
     if (needBytes == 0 || needBytes / pageSize > g_pool.pageCount)
     {
@@ -532,9 +599,9 @@ static void *zs_pool_take(uint64_t length, BOOL *outDirty)
         return NULL;
     }
 
-    if (outDirty)
+    if (dirty)
     {
-        *outDirty = dirty;
+        zs_pool_prepare(result, needBytes, zero);
     }
 
     atomic_fetch_add_explicit(&g_servedCount, 1, memory_order_relaxed);
@@ -593,10 +660,27 @@ static BOOL zs_pool_extend(uintptr_t ownerAddress, uint64_t currentBytes, uint64
 
     os_unfair_lock_unlock(&g_pool.lock);
 
+    if (extended)
+    {
+        uint64_t cleared = 0;
+
+        for (uint64_t i = 0; i < extraPages; i++)
+        {
+            cleared += g_pool.zeroMap[endPage + i] ? 1 : 0;
+        }
+
+        memset(g_pool.zeroMap + endPage, 0, (size_t)extraPages);
+
+        if (cleared)
+        {
+            atomic_fetch_sub_explicit(&g_zeroPages, cleared, memory_order_relaxed);
+        }
+    }
+
     return extended;
 }
 
-static void zs_pool_give(void *address, uint64_t length)
+static void zs_pool_give_internal(void *address, uint64_t length, BOOL decommit)
 {
     const uint64_t pageSize = g_pool.pageSize;
     const uint64_t bytes = zs_round_page(length);
@@ -609,6 +693,29 @@ static void zs_pool_give(void *address, uint64_t length)
 
     const uint64_t first = offset / pageSize;
     const uint64_t count = bytes / pageSize;
+
+    if (decommit && bytes >= kZSDonatedDecommitMinBytes)
+    {
+        os_unfair_lock_lock(&g_pool.lock);
+        const BOOL valid = first + count <= g_pool.cleanPage && zs_bytes_all_zero(g_pool.freeMap + first, count);
+        os_unfair_lock_unlock(&g_pool.lock);
+
+        if (!valid)
+        {
+            return;
+        }
+
+        if (madvise(address, (size_t)bytes, MADV_ZERO) == 0)
+        {
+            memset(g_pool.zeroMap + first, 1, (size_t)count);
+            atomic_fetch_add_explicit(&g_zeroPages, count, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_decommittedBytes, bytes, memory_order_relaxed);
+        }
+        else
+        {
+            atomic_fetch_add_explicit(&g_decommitFailures, 1, memory_order_relaxed);
+        }
+    }
 
     os_unfair_lock_lock(&g_pool.lock);
 
@@ -646,6 +753,167 @@ static void zs_pool_give(void *address, uint64_t length)
     os_unfair_lock_unlock(&g_pool.lock);
 }
 
+static void zs_pool_give(void *address, uint64_t length)
+{
+    zs_pool_give_internal(address, length, YES);
+}
+
+static uint64_t zs_pool_trim(uint64_t goal)
+{
+    const uint64_t pageSize = g_pool.pageSize;
+    uint64_t released = 0;
+
+    for (;;)
+    {
+        uint32_t starts[ZS_TRIM_BATCH];
+        uint32_t lengths[ZS_TRIM_BATCH];
+        int taken = 0;
+
+        os_unfair_lock_lock(&g_pool.lock);
+
+        for (uint32_t bin = 0; bin < ZS_BIN_COUNT && taken < ZS_TRIM_BATCH; bin++)
+        {
+            for (uint32_t cursor = g_pool.bins[bin]; cursor != ZS_RUN_NONE && taken < ZS_TRIM_BATCH;
+                 cursor = g_pool.runs[cursor].next)
+            {
+                const uint32_t length = g_pool.runs[cursor].len;
+                BOOL clean = YES;
+
+                for (uint32_t i = 0; i < length; i++)
+                {
+                    if (!g_pool.zeroMap[cursor + i])
+                    {
+                        clean = NO;
+                        break;
+                    }
+                }
+
+                if (!clean)
+                {
+                    starts[taken] = cursor;
+                    lengths[taken] = length;
+                    taken++;
+                }
+            }
+        }
+
+        for (int i = 0; i < taken; i++)
+        {
+            zs_run_remove(starts[i]);
+            memset(g_pool.freeMap + starts[i], 0, lengths[i]);
+            g_pool.used += (uint64_t)lengths[i] * pageSize;
+        }
+
+        os_unfair_lock_unlock(&g_pool.lock);
+
+        if (taken == 0)
+        {
+            break;
+        }
+
+        BOOL failed = NO;
+
+        for (int i = 0; i < taken; i++)
+        {
+            void *base = (void *)(g_pool.base + (uint64_t)starts[i] * pageSize);
+            const uint64_t bytes = (uint64_t)lengths[i] * pageSize;
+            uint64_t dirtyPages = 0;
+
+            for (uint32_t j = 0; j < lengths[i]; j++)
+            {
+                dirtyPages += g_pool.zeroMap[starts[i] + j] ? 0 : 1;
+            }
+
+            if (madvise(base, (size_t)bytes, MADV_ZERO) == 0)
+            {
+                memset(g_pool.zeroMap + starts[i], 1, lengths[i]);
+                atomic_fetch_add_explicit(&g_zeroPages, dirtyPages, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_decommittedBytes, dirtyPages * pageSize, memory_order_relaxed);
+                released += dirtyPages * pageSize;
+            }
+            else
+            {
+                failed = YES;
+                atomic_fetch_add_explicit(&g_decommitFailures, 1, memory_order_relaxed);
+            }
+
+            zs_pool_give_internal(base, bytes, NO);
+        }
+
+        if (failed || (goal && released >= goal))
+        {
+            break;
+        }
+    }
+
+    return released;
+}
+
+static uint64_t zs_pool_trim_guarded(uint64_t goal, BOOL throttled)
+{
+    if (!atomic_load_explicit(&g_poolReady, memory_order_acquire))
+    {
+        return 0;
+    }
+
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+    if (throttled && now - atomic_load_explicit(&g_lastTrimAt, memory_order_relaxed) < kZSTrimMinIntervalNs)
+    {
+        return 0;
+    }
+
+    if (atomic_exchange_explicit(&g_trimRunning, 1, memory_order_acq_rel))
+    {
+        return 0;
+    }
+
+    atomic_store_explicit(&g_lastTrimAt, now, memory_order_relaxed);
+
+    const uint64_t released = zs_pool_trim(goal);
+
+    atomic_fetch_add_explicit(&g_trimmedBytes, released, memory_order_relaxed);
+    atomic_store_explicit(&g_trimRunning, 0, memory_order_release);
+
+    if (released)
+    {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            ZLog(@"[RamBypass] trim released %llu MB, resident scan %llu MB (estimate %llu MB)",
+                 released / (1024 * 1024), [ZSRamDonor.shared donatedBytes] / (1024 * 1024),
+                 zs_pool_resident_estimate() / (1024 * 1024));
+        });
+    }
+
+    return released;
+}
+
+void zs_ram_bypass_trim(void)
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        zs_pool_trim_guarded(0, NO);
+    });
+}
+
+static void zs_pool_install_pressure_handler(void)
+{
+    static dispatch_source_t source;
+
+    if (source)
+    {
+        return;
+    }
+
+    source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
+                                    DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
+                                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+
+    dispatch_source_set_event_handler(source, ^{
+        zs_pool_trim_guarded(0, YES);
+    });
+
+    dispatch_resume(source);
+}
+
 static BOOL zs_pool_install(void *base, uint64_t size)
 {
     const uint64_t pageSize = vm_page_size;
@@ -660,8 +928,10 @@ static BOOL zs_pool_install(void *base, uint64_t size)
                             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     void *map = g_origMmap(NULL, (size_t)zs_round_page(pages),
                            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *zeroMap = g_origMmap(NULL, (size_t)zs_round_page(pages),
+                               PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
-    if (runs == MAP_FAILED || map == MAP_FAILED)
+    if (runs == MAP_FAILED || map == MAP_FAILED || zeroMap == MAP_FAILED)
     {
         if (runs != MAP_FAILED)
         {
@@ -671,6 +941,11 @@ static BOOL zs_pool_install(void *base, uint64_t size)
         if (map != MAP_FAILED)
         {
             g_origMunmap(map, (size_t)zs_round_page(pages));
+        }
+
+        if (zeroMap != MAP_FAILED)
+        {
+            g_origMunmap(zeroMap, (size_t)zs_round_page(pages));
         }
 
         return NO;
@@ -684,6 +959,7 @@ static BOOL zs_pool_install(void *base, uint64_t size)
     g_pool.used = 0;
     g_pool.runs = runs;
     g_pool.freeMap = map;
+    g_pool.zeroMap = zeroMap;
     g_pool.binMap[0] = 0;
     g_pool.binMap[1] = 0;
 
@@ -698,6 +974,8 @@ static BOOL zs_pool_install(void *base, uint64_t size)
     {
         zs_malloc_zone_register();
     }
+
+    zs_pool_install_pressure_handler();
 
     ZLog(@"[RamBypass] pool ready: %llu MB at %p, serving anonymous mappings of %llu KB or more",
          g_pool.size / (1024 * 1024), base, zs_donated_min_allocation() / 1024);
@@ -752,16 +1030,10 @@ static void *zs_hook_mmap(void *address, size_t length, int prot, int flags, int
     {
         if (atomic_load_explicit(&g_poolReady, memory_order_acquire))
         {
-            BOOL dirty = NO;
-            void *served = zs_pool_take(length, &dirty);
+            void *served = zs_pool_take(length, YES);
 
             if (served)
             {
-                if (dirty)
-                {
-                    memset(served, 0, (size_t)zs_round_page(length));
-                }
-
                 return served;
             }
         }
@@ -815,18 +1087,12 @@ static BOOL zs_vm_allocate_common(const char *api, vm_map_t target, uint64_t *ad
         return NO;
     }
 
-    BOOL dirty = NO;
-    void *served = zs_pool_take(size, &dirty);
+    void *served = zs_pool_take(size, YES);
 
     if (!served)
     {
         atomic_fetch_add(&g_fallbackCount, 1);
         return NO;
-    }
-
-    if (dirty)
-    {
-        memset(served, 0, (size_t)zs_round_page(size));
     }
 
     *address = (uint64_t)(uintptr_t)served;
@@ -1125,7 +1391,7 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
                 return NULL;
             }
 
-            void *span = zs_pool_take(spanSize, NULL);
+            void *span = zs_pool_take(spanSize, NO);
 
             if (!span)
             {
@@ -1205,8 +1471,7 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
     }
 
     const size_t totalSize = actualSize + sizeof(ZSMallocAllocationHeader) + alignment - 1;
-    BOOL dirty = NO;
-    void *base = zs_pool_take(totalSize, &dirty);
+    void *base = zs_pool_take(totalSize, zeroed);
 
     if (!base)
     {
@@ -1227,11 +1492,6 @@ static void *zs_malloc_zone_allocate(size_t requested, size_t alignment, BOOL ze
     header->classIndex = (uint32_t)alignment;
 
     void *result = (void *)alignedUserAddress;
-
-    if (zeroed && requested && dirty)
-    {
-        memset(result, 0, requested);
-    }
 
     atomic_fetch_add_explicit(&g_mallocBytesAllocated, mappedSize, memory_order_relaxed);
     zs_malloc_record_allocation(requested);
@@ -1466,7 +1726,7 @@ static void zs_malloc_zone_free_definite_size(malloc_zone_t *zone, void *pointer
 
 static size_t zs_malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal)
 {
-    return 0;
+    return (size_t)zs_pool_trim_guarded(goal, YES);
 }
 
 static boolean_t zs_malloc_zone_claimed_address(malloc_zone_t *zone, void *pointer)
@@ -1623,9 +1883,14 @@ static BOOL zs_malloc_redirect_enabled(void)
            atomic_load_explicit(&g_mallocZoneRegistered, memory_order_acquire) == 2;
 }
 
+static inline BOOL zs_malloc_should_redirect(size_t size)
+{
+    return size >= zs_donated_min_allocation() && zs_malloc_redirect_enabled();
+}
+
 static void *zs_hook_malloc(size_t size)
 {
-    if (zs_malloc_redirect_enabled())
+    if (zs_malloc_should_redirect(size))
     {
         void *pointer = zs_malloc_zone_allocate(size, 16, NO);
 
@@ -1640,13 +1905,13 @@ static void *zs_hook_malloc(size_t size)
 
 static void *zs_hook_calloc(size_t count, size_t size)
 {
-    if (zs_malloc_redirect_enabled())
+    if (count && size > SIZE_MAX / count)
     {
-        if (count && size > SIZE_MAX / count)
-        {
-            return g_origCalloc(count, size);
-        }
+        return g_origCalloc(count, size);
+    }
 
+    if (zs_malloc_should_redirect(count * size))
+    {
         void *pointer = zs_malloc_zone_allocate(count * size, 16, YES);
 
         if (pointer)
@@ -1692,7 +1957,7 @@ static size_t zs_hook_malloc_size(const void *pointer)
 
 static void *zs_hook_valloc(size_t size)
 {
-    if (zs_malloc_redirect_enabled())
+    if (zs_malloc_should_redirect(size))
     {
         void *pointer = zs_malloc_zone_allocate(size, vm_page_size, NO);
 
@@ -1712,7 +1977,7 @@ static int zs_hook_posix_memalign(void **pointer, size_t alignment, size_t size)
         return EINVAL;
     }
 
-    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+    if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0)
     {
         void *allocated = zs_malloc_zone_allocate(size, alignment, NO);
@@ -1729,7 +1994,7 @@ static int zs_hook_posix_memalign(void **pointer, size_t alignment, size_t size)
 
 static void *zs_hook_aligned_alloc(size_t alignment, size_t size)
 {
-    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+    if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0 && size % alignment == 0)
     {
         void *pointer = zs_malloc_zone_allocate(size, alignment, NO);
@@ -1745,7 +2010,7 @@ static void *zs_hook_aligned_alloc(size_t alignment, size_t size)
 
 static void *zs_hook_memalign(size_t alignment, size_t size)
 {
-    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+    if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0)
     {
         void *pointer = zs_malloc_zone_allocate(size, alignment, NO);
@@ -1761,7 +2026,7 @@ static void *zs_hook_memalign(size_t alignment, size_t size)
 
 static void *zs_hook_malloc_type_malloc(size_t size, uintptr_t typeID)
 {
-    if (zs_malloc_redirect_enabled())
+    if (zs_malloc_should_redirect(size))
     {
         void *pointer = zs_malloc_zone_allocate(size, 16, NO);
 
@@ -1776,9 +2041,9 @@ static void *zs_hook_malloc_type_malloc(size_t size, uintptr_t typeID)
 
 static void *zs_hook_malloc_type_calloc(size_t count, size_t size, uintptr_t typeID)
 {
-    if (zs_malloc_redirect_enabled())
+    if (!count || size <= SIZE_MAX / count)
     {
-        if (!count || size <= SIZE_MAX / count)
+        if (zs_malloc_should_redirect(count * size))
         {
             void *pointer = zs_malloc_zone_allocate(count * size, 16, YES);
 
@@ -1809,7 +2074,7 @@ static void *zs_hook_malloc_type_realloc(void *pointer, size_t size, uintptr_t t
 
 static void *zs_hook_malloc_type_memalign(size_t alignment, size_t size, uintptr_t typeID)
 {
-    if (zs_malloc_redirect_enabled() && alignment >= sizeof(void *) &&
+    if (zs_malloc_should_redirect(size) && alignment >= sizeof(void *) &&
         (alignment & (alignment - 1)) == 0)
     {
         void *pointer = zs_malloc_zone_allocate(size, alignment, NO);
@@ -2110,6 +2375,15 @@ static BOOL zs_install_rebinds(void)
     return installed;
 }
 
+static uint64_t zs_donated_target_bytes(void)
+{
+    uint64_t target = NSProcessInfo.processInfo.physicalMemory / kZSDonatedPhysicalDivisor;
+
+    target -= target % kZSDonatedTargetGranularity;
+
+    return MAX(kZSDonatedMinimumBytes, MIN(kZSDonatedTargetBytes, target));
+}
+
 static void zs_ram_bypass_start(void)
 {
     if (!zs_install_rebinds())
@@ -2140,9 +2414,15 @@ static void zs_ram_bypass_start(void)
         ZSRamDonor *donor = ZSRamDonor.shared;
         donor.killDonorsAfterMapping = YES;
 
+        const uint64_t target = zs_donated_target_bytes();
+        const uint64_t minimum = MIN(kZSDonatedMinimumBytes, target);
+
+        ZLog(@"[RamBypass] device has %llu MB, requesting a %llu MB pool",
+             NSProcessInfo.processInfo.physicalMemory / (1024 * 1024), target / (1024 * 1024));
+
         uint64_t granted = 0;
-        void *mapped = [donor acquireUpTo:kZSDonatedTargetBytes
-                                  minimum:kZSDonatedMinimumBytes
+        void *mapped = [donor acquireUpTo:target
+                                  minimum:minimum
                                    actual:&granted];
 
         if (!mapped || granted == 0)
