@@ -9811,6 +9811,9 @@ static const CGFloat kContentFadeHeight = 22;
     ZSRow *overrideTutorialRow = zs_make_switch_row(@"Override tutorial completion", zs_tutorial_override_completion_enabled());
     [overrideTutorialRow.toggle addTarget:self action:@selector(overrideTutorialCompletionChanged:) forControlEvents:UIControlEventValueChanged];
 
+    ZSRow *fullManifestZeroingRow = zs_make_switch_row(@"Full manifest zeroing", PatchManifestNetwork.isFullZeroingEnabled);
+    [fullManifestZeroingRow.toggle addTarget:self action:@selector(fullManifestZeroingChanged:) forControlEvents:UIControlEventValueChanged];
+
     ZSRow *checkCIBuildsRow = zs_make_switch_row(@"Enable nightly builds", zs_update_uses_nightly_releases());
     [checkCIBuildsRow.toggle addTarget:self action:@selector(nightlyReleasesEnabledChanged:) forControlEvents:UIControlEventValueChanged];
 
@@ -9848,6 +9851,7 @@ static const CGFloat kContentFadeHeight = 22;
         overrideTutorialRow,
         checkCIBuildsRow,
         experimentalEnabledRow,
+        fullManifestZeroingRow,
         dumpIL2CPPMethodsButton,
         librarySymlinkButton,
         patchLCButton,
@@ -13937,12 +13941,13 @@ static const NSTimeInterval kDoctorPollInterval = 6.0;
     ZSRow *row = self.manifestZeroingRow;
     if (!row) return;
 
-    BOOL eligible = zs_mod_library_has_zeroable_assets();
+    BOOL fullZeroing = PatchManifestNetwork.isFullZeroingEnabled;
+    BOOL eligible = !fullZeroing && zs_mod_library_has_zeroable_assets();
     CGFloat alpha = eligible ? 1.0 : 0.35;
     row.toggle.enabled = eligible;
     row.toggle.alpha = alpha;
     row.titleLabel.alpha = alpha;
-    [row.toggle setOn:(eligible && PatchManifestNetwork.isZeroAllEnabled) animated:NO];
+    [row.toggle setOn:(fullZeroing || (eligible && PatchManifestNetwork.isZeroAllEnabled)) animated:NO];
 }
 
 - (void)zs_rebuildModsLibrary {
@@ -21879,6 +21884,11 @@ static void zs_update_value_label(ZSCapsuleSlider *slider) {
 
 - (void)manifestZeroingChanged:(UISwitch *)toggle {
     [PatchManifestNetwork setZeroAllEnabled:toggle.on];
+}
+
+- (void)fullManifestZeroingChanged:(UISwitch *)toggle {
+    [PatchManifestNetwork setFullZeroingEnabled:toggle.on];
+    [self zs_refreshManifestZeroingRow];
 }
 
 - (void)overrideTutorialCompletionChanged:(UISwitch *)toggle {

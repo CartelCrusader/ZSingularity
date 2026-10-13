@@ -30,6 +30,7 @@ static dispatch_queue_t gStateQueue;
 
 static NSString * const kSettingsSection = @"network";
 static NSString * const kZeroingEnabledKey = @"fmodManifestZeroingEnabled";
+static NSString * const kFullZeroingEnabledKey = @"fullManifestZeroingEnabled";
 
 static NSString *PMMatchedSuffixForTask(NSURLSessionTask *task) {
     NSURL *url = task.currentRequest.URL ?: task.originalRequest.URL;
@@ -75,14 +76,18 @@ static NSData *PMPatchManifestData(NSData *input) {
         return input;
     }
 
-    if (![PatchManifestNetwork isZeroAllEnabled]) {
+    BOOL fullZeroing = [PatchManifestNetwork isFullZeroingEnabled];
+    if (!fullZeroing && ![PatchManifestNetwork isZeroAllEnabled]) {
         return input;
     }
 
-    NSSet<NSString *> *replacedPaths = PMReplacedAssetPaths();
-    if (replacedPaths.count == 0) {
-        ZLog(@"[PatchManifestNetwork] no replaced assets - leaving manifest untouched");
-        return input;
+    NSSet<NSString *> *replacedPaths = nil;
+    if (!fullZeroing) {
+        replacedPaths = PMReplacedAssetPaths();
+        if (replacedPaths.count == 0) {
+            ZLog(@"[PatchManifestNetwork] no replaced assets - leaving manifest untouched");
+            return input;
+        }
     }
 
     NSError *jsonError = nil;
@@ -103,7 +108,7 @@ static NSData *PMPatchManifestData(NSData *input) {
 
     NSUInteger patchedCount = 0;
     for (NSString *key in files) {
-        if (![replacedPaths containsObject:key.lowercaseString]) continue;
+        if (!fullZeroing && ![replacedPaths containsObject:key.lowercaseString]) continue;
 
         NSMutableDictionary *entry = files[key];
         if (![entry isKindOfClass:[NSMutableDictionary class]]) continue;
@@ -132,7 +137,8 @@ static NSData *PMPatchManifestData(NSData *input) {
         return input;
     }
 
-    ZLog(@"[PatchManifestNetwork] zeroed Hash/Size on %lu replaced Files entries", (unsigned long)patchedCount);
+    ZLog(@"[PatchManifestNetwork] zeroed Hash/Size on %lu %@ Files entries",
+          (unsigned long)patchedCount, fullZeroing ? @"(full zeroing)" : @"replaced");
 
     return output;
 }
@@ -262,6 +268,20 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
     section[kZeroingEnabledKey] = @(enabled);
     zs_write_settings_section(kSettingsSection, section);
     ZLog(@"[PatchManifestNetwork] zero-all mode %@ via Developer switch", enabled ? @"enabled" : @"disabled");
+}
+
++ (BOOL)isFullZeroingEnabled {
+    NSDictionary *section = zs_settings_section(kSettingsSection);
+    id stored = section[kFullZeroingEnabledKey];
+
+    return stored ? [stored boolValue] : NO;
+}
+
++ (void)setFullZeroingEnabled:(BOOL)enabled {
+    NSMutableDictionary *section = [zs_settings_section(kSettingsSection) mutableCopy] ?: [NSMutableDictionary new];
+    section[kFullZeroingEnabledKey] = @(enabled);
+    zs_write_settings_section(kSettingsSection, section);
+    ZLog(@"[PatchManifestNetwork] full zeroing mode %@ via Developer switch", enabled ? @"enabled" : @"disabled");
 }
 
 + (void)install {

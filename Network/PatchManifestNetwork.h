@@ -9,6 +9,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (BOOL)isZeroAllEnabled;
 + (void)setZeroAllEnabled:(BOOL)enabled;
+
++ (BOOL)isFullZeroingEnabled;
++ (void)setFullZeroingEnabled:(BOOL)enabled;
 @end
 
 NS_ASSUME_NONNULL_END
