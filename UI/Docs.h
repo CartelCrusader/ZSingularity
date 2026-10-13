@@ -303,6 +303,29 @@ static const CGFloat kZSDocsCodeBlockCornerRadius = 7;
 
 @implementation ZSDocsQuoteLayoutManager
 
+- (void)zs_enumerateTightRectsForGlyphRange:(NSRange)glyphRange
+                                  container:(NSTextContainer *)container
+                                 usingBlock:(void (^)(CGRect rect))block {
+    NSString *text = self.textStorage.string;
+    NSCharacterSet *whitespace = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    [self enumerateLineFragmentsForGlyphRange:glyphRange usingBlock:^(CGRect rect, CGRect usedRect, NSTextContainer *lineContainer, NSRange lineGlyphRange, BOOL *stop) {
+        NSRange sub = NSIntersectionRange(glyphRange, lineGlyphRange);
+        if (sub.length == 0) return;
+
+        NSRange chars = [self characterRangeForGlyphRange:sub actualGlyphRange:NULL];
+        NSUInteger end = NSMaxRange(chars);
+        while (end > chars.location && [whitespace characterIsMember:[text characterAtIndex:end - 1]]) end--;
+        if (end <= chars.location) return;
+
+        NSRange trimmedGlyphs = [self glyphRangeForCharacterRange:NSMakeRange(chars.location, end - chars.location)
+                                              actualCharacterRange:NULL];
+        CGRect tight = [self boundingRectForGlyphRange:trimmedGlyphs inTextContainer:container];
+        tight.origin.y = usedRect.origin.y;
+        tight.size.height = usedRect.size.height;
+        block(tight);
+    }];
+}
+
 - (void)drawBackgroundForGlyphRange:(NSRange)glyphsToShow atPoint:(CGPoint)origin {
     [super drawBackgroundForGlyphRange:glyphsToShow atPoint:origin];
 
@@ -319,10 +342,9 @@ static const CGFloat kZSDocsCodeBlockCornerRadius = 7;
         if (![color isKindOfClass:[UIColor class]] || range.length == 0) return;
 
         NSRange runGlyphRange = [self glyphRangeForCharacterRange:range actualCharacterRange:NULL];
-        [self enumerateEnclosingRectsForGlyphRange:runGlyphRange
-                          withinSelectedGlyphRange:NSMakeRange(NSNotFound, 0)
-                                   inTextContainer:textContainer
-                                        usingBlock:^(CGRect rect, BOOL *innerStop) {
+        [self zs_enumerateTightRectsForGlyphRange:runGlyphRange
+                                        container:textContainer
+                                       usingBlock:^(CGRect rect) {
             CGRect fill = CGRectOffset(rect, origin.x, origin.y);
             fill = CGRectInset(fill, -2, 1);
             [color setFill];
@@ -338,10 +360,9 @@ static const CGFloat kZSDocsCodeBlockCornerRadius = 7;
         if (![color isKindOfClass:[UIColor class]] || range.length == 0) return;
 
         NSRange runGlyphRange = [self glyphRangeForCharacterRange:range actualCharacterRange:NULL];
-        [self enumerateEnclosingRectsForGlyphRange:runGlyphRange
-                          withinSelectedGlyphRange:NSMakeRange(NSNotFound, 0)
-                                   inTextContainer:textContainer
-                                        usingBlock:^(CGRect rect, BOOL *innerStop) {
+        [self zs_enumerateTightRectsForGlyphRange:runGlyphRange
+                                        container:textContainer
+                                       usingBlock:^(CGRect rect) {
             CGRect fill = CGRectOffset(rect, origin.x, origin.y);
             NSDictionary *last = blocks.lastObject;
             if (last && last[@"color"] == color) {
@@ -442,7 +463,7 @@ static NSAttributedString *zs_render_markdown_inline(NSString *line, UIFont *bas
 
                     NSMutableDictionary *linkAttrs = [@{
                         NSFontAttributeName: baseFont,
-                        NSForegroundColorAttributeName: [UIColor colorWithRed:0.55 green:0.75 blue:1.0 alpha:1.0],
+                        NSForegroundColorAttributeName: [UIColor colorWithRed:0x30 / 255.0 green:0xD1 / 255.0 blue:0x58 / 255.0 alpha:1.0],
                     } mutableCopy];
 
                     NSURL *linkURL = [NSURL URLWithString:href];

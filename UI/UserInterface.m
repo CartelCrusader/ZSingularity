@@ -9412,7 +9412,7 @@ static const CGFloat kContentFadeHeight = 22;
     }];
 
     [self.pendingSectionBuilders addObject:^{
-    zs_add_section_header(self.stack, @"Memory management", self);
+    zs_add_section_header_with_docs(self.stack, @"Memory management", self, @selector(docsInfoTapped:));
 
     ZSMemorySystemStats entitlementStats = zs_collect_memory_system_stats();
     UIView *entitlementsCard = zs_make_entitlements_card(entitlementStats.hasIncreasedMemoryLimitEntitlement,
@@ -9636,7 +9636,7 @@ static const CGFloat kContentFadeHeight = 22;
     }];
 
     [self.pendingSectionBuilders addObject:^{
-    zs_add_section_header_with_docs(self.stack, @"Config", self, @selector(docsInfoTapped:));
+    zs_add_section_header(self.stack, @"Config", self);
 
     ZSRow *manifestZeroingRow = zs_make_switch_row(@"Manifest zeroing", PatchManifestNetwork.isZeroAllEnabled);
     [manifestZeroingRow.toggle addTarget:self action:@selector(manifestZeroingChanged:) forControlEvents:UIControlEventValueChanged];
@@ -10736,7 +10736,7 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
     self.docsBodyLabel.textContainer.lineFragmentPadding = 0;
     self.docsBodyLabel.dataDetectorTypes = UIDataDetectorTypeNone;
     self.docsBodyLabel.linkTextAttributes = @{
-        NSForegroundColorAttributeName: [UIColor colorWithRed:0.55 green:0.75 blue:1.0 alpha:1.0],
+        NSForegroundColorAttributeName: [UIColor colorWithRed:0x30 / 255.0 green:0xD1 / 255.0 blue:0x58 / 255.0 alpha:1.0],
         NSUnderlineStyleAttributeName: @(NSUnderlineStyleSingle),
     };
     self.docsBodyLabel.delegate = self;
@@ -21796,7 +21796,7 @@ static NSString *zs_docs_release_header_title(ZSUpdateCheckMode mode, NSString *
     objc_setAssociatedObject(self.docsGitHubReleaseLinkButton, "zs_releaseRepoURL", releaseURL, OBJC_ASSOCIATION_RETAIN);
 
     UIFont *repoLinkFont = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
-    UIColor *repoLinkColor = [UIColor colorWithRed:0.55 green:0.75 blue:1.0 alpha:1.0];
+    UIColor *repoLinkColor = [UIColor colorWithRed:0x30 / 255.0 green:0xD1 / 255.0 blue:0x58 / 255.0 alpha:1.0];
     NSAttributedString *repoTitle = [[NSAttributedString alloc] initWithString:@"View GitHub release"
         attributes:@{NSFontAttributeName: repoLinkFont,
                       NSForegroundColorAttributeName: repoLinkColor,
