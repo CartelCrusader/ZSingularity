@@ -1,3 +1,9 @@
+/*
+ * Credits: this file is based on code from the MeloNX iOS sideloading project
+ * (https://starforgejo.dev/projects/MeloNX), modified and adapted by the
+ * ZSingularity project to work as part of this tweak.
+ */
+
 #ifndef DonatedHeap_h
 #define DonatedHeap_h
 

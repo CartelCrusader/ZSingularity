@@ -19,6 +19,8 @@ This effectively allows the app to bypass Apple's memory restrictions, allowing 
 
 Do note that this requires registering an additional App ID.
 
+Credits: @Stossy11 and the MeloNX team for originally discovering this bypass
+
 ## Redirect minimum
 
 Filters which IL2CPP managed memory regions get reallocated. Lower thresholds will reallocate more memory but may come at the cost of stability.
