@@ -8369,16 +8369,19 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     [saveButton addTarget:self action:@selector(zs_crashSaveTapped:) forControlEvents:UIControlEventTouchUpInside];
     [panelHost addSubview:saveButton];
 
+    UILayoutGuide *leftColumn = [[UILayoutGuide alloc] init];
+    [panelHost addLayoutGuide:leftColumn];
+
     NSLayoutConstraint *preferredWidth = [panel.widthAnchor constraintEqualToAnchor:overlay.widthAnchor constant:-32];
     preferredWidth.priority = UILayoutPriorityDefaultHigh;
-    NSLayoutConstraint *preferredHeight = [panel.heightAnchor constraintEqualToConstant:520];
+    NSLayoutConstraint *preferredHeight = [panel.heightAnchor constraintEqualToConstant:340];
     preferredHeight.priority = UILayoutPriorityDefaultHigh;
 
     [NSLayoutConstraint activateConstraints:@[
         [panel.centerXAnchor constraintEqualToAnchor:overlay.centerXAnchor],
         [panel.centerYAnchor constraintEqualToAnchor:overlay.centerYAnchor],
-        [panel.widthAnchor constraintLessThanOrEqualToConstant:460],
-        [panel.heightAnchor constraintLessThanOrEqualToConstant:520],
+        [panel.widthAnchor constraintLessThanOrEqualToConstant:780],
+        [panel.heightAnchor constraintLessThanOrEqualToConstant:340],
         [panel.topAnchor constraintGreaterThanOrEqualToAnchor:overlay.topAnchor constant:24],
         [panel.bottomAnchor constraintLessThanOrEqualToAnchor:overlay.bottomAnchor constant:-24],
         [panel.leadingAnchor constraintGreaterThanOrEqualToAnchor:overlay.leadingAnchor constant:16],
@@ -8386,42 +8389,48 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
         preferredWidth,
         preferredHeight,
 
+        [leftColumn.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [leftColumn.topAnchor constraintEqualToAnchor:panelHost.topAnchor],
+        [leftColumn.bottomAnchor constraintEqualToAnchor:panelHost.bottomAnchor],
+        [leftColumn.widthAnchor constraintEqualToAnchor:panelHost.widthAnchor multiplier:0.4],
+
         [header.topAnchor constraintEqualToAnchor:panelHost.topAnchor constant:18],
-        [header.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:20],
-        [header.trailingAnchor constraintLessThanOrEqualToAnchor:panelHost.trailingAnchor constant:-20],
+        [header.leadingAnchor constraintEqualToAnchor:leftColumn.leadingAnchor constant:-2],
+        [header.trailingAnchor constraintLessThanOrEqualToAnchor:leftColumn.trailingAnchor],
         [header.heightAnchor constraintEqualToConstant:34],
 
-        [titleLabel.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
-        [titleLabel.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [titleLabel.leadingAnchor constraintEqualToAnchor:leftColumn.leadingAnchor],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:leftColumn.trailingAnchor],
         [titleLabel.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:14],
 
-        [message.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
-        [message.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [message.leadingAnchor constraintEqualToAnchor:leftColumn.leadingAnchor],
+        [message.trailingAnchor constraintEqualToAnchor:leftColumn.trailingAnchor],
         [message.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:10],
+        [message.bottomAnchor constraintLessThanOrEqualToAnchor:okButton.topAnchor constant:-12],
 
-        [traceCaption.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [okButton.leadingAnchor constraintEqualToAnchor:leftColumn.leadingAnchor],
+        [okButton.widthAnchor constraintEqualToAnchor:leftColumn.widthAnchor multiplier:0.32],
+        [okButton.bottomAnchor constraintEqualToAnchor:panelHost.bottomAnchor constant:-20],
+        [okButton.heightAnchor constraintEqualToConstant:46],
+
+        [saveButton.leadingAnchor constraintEqualToAnchor:okButton.trailingAnchor constant:10],
+        [saveButton.trailingAnchor constraintEqualToAnchor:leftColumn.trailingAnchor],
+        [saveButton.bottomAnchor constraintEqualToAnchor:okButton.bottomAnchor],
+        [saveButton.heightAnchor constraintEqualToAnchor:okButton.heightAnchor],
+
+        [traceCaption.leadingAnchor constraintEqualToAnchor:leftColumn.trailingAnchor constant:22],
         [traceCaption.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
-        [traceCaption.topAnchor constraintEqualToAnchor:message.bottomAnchor constant:14],
+        [traceCaption.topAnchor constraintEqualToAnchor:panelHost.topAnchor constant:24],
 
-        [traceBox.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [traceBox.leadingAnchor constraintEqualToAnchor:traceCaption.leadingAnchor],
         [traceBox.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
-        [traceBox.topAnchor constraintEqualToAnchor:traceCaption.bottomAnchor constant:6],
-        [traceBox.bottomAnchor constraintEqualToAnchor:okButton.topAnchor constant:-14],
+        [traceBox.topAnchor constraintEqualToAnchor:traceCaption.bottomAnchor constant:8],
+        [traceBox.bottomAnchor constraintEqualToAnchor:panelHost.bottomAnchor constant:-20],
 
         [traceView.leadingAnchor constraintEqualToAnchor:traceBox.leadingAnchor],
         [traceView.trailingAnchor constraintEqualToAnchor:traceBox.trailingAnchor],
         [traceView.topAnchor constraintEqualToAnchor:traceBox.topAnchor],
         [traceView.bottomAnchor constraintEqualToAnchor:traceBox.bottomAnchor],
-
-        [okButton.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
-        [okButton.widthAnchor constraintEqualToAnchor:panelHost.widthAnchor multiplier:0.3],
-        [okButton.bottomAnchor constraintEqualToAnchor:panelHost.bottomAnchor constant:-20],
-        [okButton.heightAnchor constraintEqualToConstant:46],
-
-        [saveButton.leadingAnchor constraintEqualToAnchor:okButton.trailingAnchor constant:12],
-        [saveButton.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
-        [saveButton.bottomAnchor constraintEqualToAnchor:okButton.bottomAnchor],
-        [saveButton.heightAnchor constraintEqualToAnchor:okButton.heightAnchor],
     ]];
 
     panel.alpha = 0;
