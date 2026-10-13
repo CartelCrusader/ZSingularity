@@ -6021,6 +6021,7 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, strong) NSLayoutConstraint *docsScrollViewTopToSubheaderConstraint;
 @property (nonatomic, strong) UITextView *docsBodyLabel;
 @property (nonatomic, strong) UIStackView *docsUpdateActionsStack;
+@property (nonatomic, strong) UIView *docsUpdateActionsSpacer;
 @property (nonatomic, strong) UIButton *docsLiveContainerInstallButton;
 @property (nonatomic, strong) UIButton *docsGitHubReleaseLinkButton;
 @property (nonatomic, strong) UILabel *docsUpdateActionsDisabledNoteLabel;
@@ -8777,6 +8778,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
     self.docsScrollViewTopToSubheaderConstraint = nil;
     self.docsBodyLabel = nil;
     self.docsUpdateActionsStack = nil;
+    self.docsUpdateActionsSpacer = nil;
     self.docsLiveContainerInstallButton = nil;
     self.docsGitHubReleaseLinkButton = nil;
     self.docsUpdateActionsDisabledNoteLabel = nil;
@@ -10982,6 +10984,8 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
     self.docsSubheaderLeftArrowButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.docsSubheaderLeftArrowButton setImage:zs_make_release_history_arrow_image(YES) forState:UIControlStateNormal];
     self.docsSubheaderLeftArrowButton.hidden = YES;
+    [self.docsSubheaderLeftArrowButton.widthAnchor constraintEqualToConstant:28].active = YES;
+    [self.docsSubheaderLeftArrowButton.heightAnchor constraintEqualToConstant:28].active = YES;
     [self.docsSubheaderLeftArrowButton addTarget:self action:@selector(docsSubheaderOlderReleaseTapped:) forControlEvents:UIControlEventTouchUpInside];
 
     self.docsSubheaderPageLabel = [[UILabel alloc] init];
@@ -10993,6 +10997,8 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
     self.docsSubheaderRightArrowButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.docsSubheaderRightArrowButton setImage:zs_make_release_history_arrow_image(NO) forState:UIControlStateNormal];
     self.docsSubheaderRightArrowButton.hidden = YES;
+    [self.docsSubheaderRightArrowButton.widthAnchor constraintEqualToConstant:28].active = YES;
+    [self.docsSubheaderRightArrowButton.heightAnchor constraintEqualToConstant:28].active = YES;
     [self.docsSubheaderRightArrowButton addTarget:self action:@selector(docsSubheaderNewerReleaseTapped:) forControlEvents:UIControlEventTouchUpInside];
 
     self.docsSubheaderPageGroup = [[UIStackView alloc] init];
@@ -11044,6 +11050,14 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
     };
     self.docsBodyLabel.delegate = self;
     [docsContent addArrangedSubview:self.docsBodyLabel];
+
+    self.docsUpdateActionsSpacer = [[UIView alloc] init];
+    self.docsUpdateActionsSpacer.translatesAutoresizingMaskIntoConstraints = NO;
+    self.docsUpdateActionsSpacer.hidden = YES;
+    [self.docsUpdateActionsSpacer setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisVertical];
+    [self.docsUpdateActionsSpacer setContentCompressionResistancePriority:1 forAxis:UILayoutConstraintAxisVertical];
+    [docsContent addArrangedSubview:self.docsUpdateActionsSpacer];
+    [docsContent setCustomSpacing:0 afterView:self.docsBodyLabel];
 
     self.docsUpdateActionsStack = [[UIStackView alloc] init];
     self.docsUpdateActionsStack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -11129,6 +11143,7 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
         [docsContent.trailingAnchor constraintEqualToAnchor:self.docsScrollView.contentLayoutGuide.trailingAnchor constant:-kPanelPadding],
         [docsContent.bottomAnchor constraintEqualToAnchor:self.docsScrollView.contentLayoutGuide.bottomAnchor constant:-kPanelPadding],
         [docsContent.widthAnchor constraintEqualToAnchor:self.docsScrollView.frameLayoutGuide.widthAnchor constant:-(kPanelPadding * 2)],
+        [docsContent.heightAnchor constraintGreaterThanOrEqualToAnchor:self.docsScrollView.frameLayoutGuide.heightAnchor constant:-(kPanelPadding * 2)],
     ]];
 
     self.docsScrollViewBottomToOverlayConstraint.active = YES;
@@ -11487,6 +11502,8 @@ static NSArray<NSArray<NSString *> *> *zs_section_index_entries(void) {
 
 - (void)zs_setDocsSubheaderArrowsVisible:(BOOL)visible hasOlder:(BOOL)hasOlder atLatest:(BOOL)atLatest {
     self.docsSubheaderPageGroup.hidden = !visible;
+    self.docsSubheaderLeftArrowButton.hidden = !visible;
+    self.docsSubheaderRightArrowButton.hidden = !visible;
     self.docsSubheaderLeftArrowButton.enabled = hasOlder;
     self.docsSubheaderLeftArrowButton.alpha = hasOlder ? 1.0 : 0.3;
     self.docsSubheaderRightArrowButton.enabled = !atLatest;
@@ -22078,6 +22095,7 @@ static NSString *zs_docs_release_header_title(ZSUpdateCheckMode mode, NSString *
 
 - (void)zs_setDocsUpdateActionsVisible:(BOOL)visible {
     self.docsUpdateActionsStack.hidden = !visible;
+    self.docsUpdateActionsSpacer.hidden = !visible;
 }
 
 - (void)zs_configureReleaseInfoActionsWithMode:(ZSUpdateCheckMode)mode disabled:(BOOL)disabled releaseURLString:(NSString * _Nullable)releaseURLString {
