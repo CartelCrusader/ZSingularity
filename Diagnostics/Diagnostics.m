@@ -1,28 +1,45 @@
 #import "Diagnostics.h"
 #import "ZTweakLog.h"
+#import "Version.h"
 #import <execinfo.h>
 #import <signal.h>
 #import <unistd.h>
 #import <fcntl.h>
-
-#pragma mark - ZCrashLogger
 #import <string.h>
+#import <time.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#import <sys/utsname.h>
+
+#pragma mark - ZCrashLogger
 
 static int g_crashLogFD = -1;
+static int g_pendingFD = -1;
 static NSString *g_crashLogPath = nil;
+static NSString *g_currentReportPath = nil;
+static NSString *g_pendingReportPath = nil;
+static char g_reportHeader[1024];
 
 static const int kHandledSignals[] = { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT, SIGFPE };
 static const int kHandledSignalCount = sizeof(kHandledSignals) / sizeof(kHandledSignals[0]);
 
 static uint8_t g_altStack[64 * 1024];
 
+static struct sigaction g_previousActions[NSIG];
+static NSUncaughtExceptionHandler *g_previousExceptionHandler = NULL;
+static volatile int g_handling = 0;
+static dispatch_source_t g_reinstallTimer = nil;
+
 #pragma mark - Async-signal-safe helpers
 
+static void safe_write(const char *s, size_t length) {
+    if (!s || length == 0) return;
+    if (g_crashLogFD >= 0) write(g_crashLogFD, s, length);
+    if (g_pendingFD >= 0) write(g_pendingFD, s, length);
+}
+
 static void safe_write_str(const char *s) {
-    if (g_crashLogFD < 0 || !s) return;
-    write(g_crashLogFD, s, strlen(s));
+    if (s) safe_write(s, strlen(s));
 }
 
 static void safe_write_hex(uintptr_t value) {
@@ -43,6 +60,26 @@ static void safe_write_hex(uintptr_t value) {
     safe_write_str(p);
 }
 
+static void safe_write_dec(unsigned long long value) {
+    char buf[24];
+    char *p = buf + sizeof(buf) - 1;
+    *p = '\0';
+    if (value == 0) {
+        *--p = '0';
+    } else {
+        while (value != 0) {
+            *--p = (char)('0' + (value % 10));
+            value /= 10;
+        }
+    }
+    safe_write_str(p);
+}
+
+static void safe_sync(void) {
+    if (g_crashLogFD >= 0) fsync(g_crashLogFD);
+    if (g_pendingFD >= 0) fsync(g_pendingFD);
+}
+
 static const char *name_for_signal(int sig) {
     switch (sig) {
         case SIGSEGV: return "SIGSEGV";
@@ -51,21 +88,23 @@ static const char *name_for_signal(int sig) {
         case SIGTRAP: return "SIGTRAP";
         case SIGABRT: return "SIGABRT";
         case SIGFPE:  return "SIGFPE";
+        case SIGKILL: return "SIGKILL";
         default:      return "UNKNOWN";
     }
 }
 
-static void crash_signal_handler(int sig, siginfo_t *info, void *uctx) {
-    (void)uctx;
-
+static void write_crash_report(int sig, void *faultAddress, int hasFaultAddress) {
     safe_write_str("\n=== ZCrashLogger: fatal signal ===\n");
-    safe_write_str("signal: ");
+    safe_write_str(g_reportHeader);
+    safe_write_str("time: ");
+    safe_write_dec((unsigned long long)time(NULL));
+    safe_write_str("\nsignal: ");
     safe_write_str(name_for_signal(sig));
     safe_write_str("\n");
 
-    if (info) {
+    if (hasFaultAddress) {
         safe_write_str("si_addr (faulting address, SIGSEGV/SIGBUS only - meaningless for other signals): ");
-        safe_write_hex((uintptr_t)info->si_addr);
+        safe_write_hex((uintptr_t)faultAddress);
         safe_write_str("\n");
     }
 
@@ -74,14 +113,36 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *uctx) {
     void *frames[64];
     int frameCount = backtrace(frames, 64);
     if (frameCount > 0) {
-        backtrace_symbols_fd(frames, frameCount, g_crashLogFD);
+        if (g_crashLogFD >= 0) backtrace_symbols_fd(frames, frameCount, g_crashLogFD);
+        if (g_pendingFD >= 0) backtrace_symbols_fd(frames, frameCount, g_pendingFD);
     } else {
         safe_write_str("(backtrace() returned no frames)\n");
     }
 
     safe_write_str("=== end ===\n");
+    safe_sync();
+}
 
-    fsync(g_crashLogFD);
+static void crash_signal_handler(int sig, siginfo_t *info, void *uctx) {
+    if (__sync_lock_test_and_set(&g_handling, 1)) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+
+    write_crash_report(sig, info ? info->si_addr : NULL, info != NULL);
+
+    struct sigaction previous;
+    memset(&previous, 0, sizeof(previous));
+    if (sig > 0 && sig < NSIG) previous = g_previousActions[sig];
+
+    if (previous.sa_flags & SA_SIGINFO) {
+        if (previous.sa_sigaction && previous.sa_sigaction != crash_signal_handler) {
+            previous.sa_sigaction(sig, info, uctx);
+        }
+    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN && previous.sa_handler != NULL) {
+        previous.sa_handler(sig);
+    }
 
     signal(sig, SIG_DFL);
     raise(sig);
@@ -91,25 +152,70 @@ static void crash_signal_handler(int sig, siginfo_t *info, void *uctx) {
 
 static void uncaught_exception_handler(NSException *exception) {
     NSMutableString *log = [NSMutableString stringWithFormat:
-        @"\n=== ZCrashLogger: uncaught NSException ===\nname: %@\nreason: %@\ncallStackSymbols:\n%@\n=== end ===\n",
+        @"\n=== ZCrashLogger: uncaught NSException ===\n%s" "time: %lld\nname: %@\nreason: %@\ncallStackSymbols:\n%@\n=== end ===\n",
+        g_reportHeader, (long long)time(NULL),
         exception.name, exception.reason, [exception.callStackSymbols componentsJoinedByString:@"\n"]];
     const char *utf8 = log.UTF8String;
-    if (g_crashLogFD >= 0 && utf8) {
-        write(g_crashLogFD, utf8, strlen(utf8));
-        fsync(g_crashLogFD);
+    if (utf8) {
+        safe_write(utf8, strlen(utf8));
+        safe_sync();
     }
     ZLog(@"%@", log);
 
+    if (g_previousExceptionHandler && g_previousExceptionHandler != &uncaught_exception_handler) {
+        g_previousExceptionHandler(exception);
+    }
+}
+
+static void install_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    sigemptyset(&action.sa_mask);
+    action.sa_sigaction = crash_signal_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+
+    for (int i = 0; i < kHandledSignalCount; i++) {
+        int sig = kHandledSignals[i];
+        struct sigaction current;
+        memset(&current, 0, sizeof(current));
+        if (sigaction(sig, NULL, &current) != 0) continue;
+        if ((current.sa_flags & SA_SIGINFO) && current.sa_sigaction == crash_signal_handler) continue;
+        g_previousActions[sig] = current;
+        sigaction(sig, &action, NULL);
+    }
+
+    NSUncaughtExceptionHandler *currentExceptionHandler = NSGetUncaughtExceptionHandler();
+    if (currentExceptionHandler != &uncaught_exception_handler) {
+        g_previousExceptionHandler = currentExceptionHandler;
+        NSSetUncaughtExceptionHandler(&uncaught_exception_handler);
+    }
+}
+
+static NSString *zs_documents_path(void) {
+    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 }
 
 @implementation ZCrashLogger
 
 + (NSString *)crashLogPath {
     if (!g_crashLogPath) {
-        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-        g_crashLogPath = [docs stringByAppendingPathComponent:@"zsingularity_crash.log"];
+        g_crashLogPath = [zs_documents_path() stringByAppendingPathComponent:@"zsingularity_crash.log"];
     }
     return g_crashLogPath;
+}
+
++ (NSString *)currentReportPath {
+    if (!g_currentReportPath) {
+        g_currentReportPath = [zs_documents_path() stringByAppendingPathComponent:@"zsingularity_crash_current.log"];
+    }
+    return g_currentReportPath;
+}
+
++ (NSString *)pendingReportPath {
+    if (!g_pendingReportPath) {
+        g_pendingReportPath = [zs_documents_path() stringByAppendingPathComponent:@"zsingularity_crash_pending.log"];
+    }
+    return g_pendingReportPath;
 }
 
 + (void)install {
@@ -117,12 +223,28 @@ static void uncaught_exception_handler(NSException *exception) {
     if (installed) return;
     installed = YES;
 
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *currentPath = [self currentReportPath];
+    NSString *pendingPath = [self pendingReportPath];
+
+    NSDictionary *currentAttributes = [fileManager attributesOfItemAtPath:currentPath error:nil];
+    if ([currentAttributes fileSize] > 0) {
+        [fileManager removeItemAtPath:pendingPath error:nil];
+        [fileManager moveItemAtPath:currentPath toPath:pendingPath error:nil];
+    }
+
+    g_pendingFD = open(currentPath.UTF8String, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (g_pendingFD < 0) {
+        ZLog(@"[ZCrashLogger] couldn't open %@ for writing - crash popup is disabled this run", currentPath);
+    }
+
     NSString *path = [self crashLogPath];
     g_crashLogFD = open(path.UTF8String, O_CREAT | O_APPEND | O_WRONLY, 0644);
     if (g_crashLogFD < 0) {
         ZLog(@"[ZCrashLogger] couldn't open %@ for writing - crash logging is disabled this run", path);
-        return;
     }
+
+    if (g_crashLogFD < 0 && g_pendingFD < 0) return;
 
     uint32_t imageCount = _dyld_image_count();
     uintptr_t mainSlide = (imageCount > 0) ? (uintptr_t)_dyld_get_image_vmaddr_slide(0) : 0;
@@ -141,12 +263,26 @@ static void uncaught_exception_handler(NSException *exception) {
         }
     }
 
-    NSString *header = [NSString stringWithFormat:
-        @"\n=== ZCrashLogger installed ===\nmain executable slide: 0x%lx\ntweak dylib (%@) slide: 0x%lx\n",
-        (unsigned long)mainSlide, tweakPath, (unsigned long)tweakSlide];
-    const char *headerUtf8 = header.UTF8String;
-    if (headerUtf8) write(g_crashLogFD, headerUtf8, strlen(headerUtf8));
-    fsync(g_crashLogFD);
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    NSString *reportHeader = [NSString stringWithFormat:
+        @"app: ZSingularity %s\ndevice: %s (%s %s)\nmain executable slide: 0x%lx\ntweak dylib slide: 0x%lx\n",
+        ZS_VERSION_STRING, systemInfo.machine, systemInfo.sysname, systemInfo.release,
+        (unsigned long)mainSlide, (unsigned long)tweakSlide];
+    strlcpy(g_reportHeader, reportHeader.UTF8String ?: "", sizeof(g_reportHeader));
+
+    if (g_crashLogFD >= 0) {
+        NSString *header = [NSString stringWithFormat:
+            @"\n=== ZCrashLogger installed ===\nmain executable slide: 0x%lx\ntweak dylib (%@) slide: 0x%lx\n",
+            (unsigned long)mainSlide, tweakPath, (unsigned long)tweakSlide];
+        const char *headerUtf8 = header.UTF8String;
+        if (headerUtf8) write(g_crashLogFD, headerUtf8, strlen(headerUtf8));
+        fsync(g_crashLogFD);
+    }
+
+    void *primeFrames[4];
+    backtrace(primeFrames, 4);
+    (void)time(NULL);
 
     stack_t ss;
     ss.ss_sp = g_altStack;
@@ -154,22 +290,90 @@ static void uncaught_exception_handler(NSException *exception) {
     ss.ss_flags = 0;
     sigaltstack(&ss, NULL);
 
-    struct sigaction action;
-    memset(&action, 0, sizeof(action));
-    sigemptyset(&action.sa_mask);
-    action.sa_sigaction = crash_signal_handler;
-    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    install_handlers();
 
-    for (int i = 0; i < kHandledSignalCount; i++) {
-        sigaction(kHandledSignals[i], &action, NULL);
-    }
-
-    NSSetUncaughtExceptionHandler(&uncaught_exception_handler);
+    g_reinstallTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                              dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(g_reinstallTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                              5 * NSEC_PER_SEC,
+                              1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(g_reinstallTimer, ^{
+        install_handlers();
+    });
+    dispatch_resume(g_reinstallTimer);
 
     ZLog(@"[ZCrashLogger] installed - crash log path: %@", path);
 }
 
++ (void)reinstallHandlersIfNeeded {
+    if (g_crashLogFD < 0 && g_pendingFD < 0) return;
+    install_handlers();
+}
+
++ (NSDictionary<NSString *, id> *)pendingCrashReport {
+    NSData *data = [NSData dataWithContentsOfFile:[self pendingReportPath]];
+    if (data.length == 0) return nil;
+
+    NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding]
+        ?: [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding];
+    if (text.length == 0) return nil;
+
+    NSString *signalName = nil;
+    NSString *exceptionName = nil;
+    long long timestamp = 0;
+    BOOL inTrace = NO;
+    NSMutableArray<NSString *> *display = [NSMutableArray array];
+
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        if ([line hasPrefix:@"signal: "]) {
+            signalName = [line substringFromIndex:8];
+        } else if ([line hasPrefix:@"time: "]) {
+            timestamp = [[line substringFromIndex:6] longLongValue];
+        } else if ([line hasPrefix:@"name: "]) {
+            exceptionName = [line substringFromIndex:6];
+            [display addObject:[@"NSException " stringByAppendingString:exceptionName]];
+        } else if ([line hasPrefix:@"reason: "]) {
+            [display addObject:line];
+        } else if ([line isEqualToString:@"backtrace:"] || [line isEqualToString:@"callStackSymbols:"]) {
+            inTrace = YES;
+        } else if ([line hasPrefix:@"=== end ==="]) {
+            if (inTrace) [display addObject:@""];
+            inTrace = NO;
+        } else if (inTrace && line.length > 0) {
+            [display addObject:line];
+        }
+    }
+
+    NSString *trace = [[display componentsJoinedByString:@"\n"] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (trace.length > 20000) trace = [trace substringToIndex:20000];
+    if (trace.length == 0) trace = @"(no stack trace was captured)";
+
+    return @{
+        @"signal": signalName ?: exceptionName ?: @"UNKNOWN",
+        @"trace": trace,
+        @"report": text,
+        @"timestamp": @(timestamp),
+    };
+}
+
++ (void)clearPendingCrashReport {
+    [NSFileManager.defaultManager removeItemAtPath:[self pendingReportPath] error:nil];
+}
+
++ (void)killProcessWithSIGKILL {
+    if (__sync_lock_test_and_set(&g_handling, 1) == 0) {
+        write_crash_report(SIGKILL, NULL, 0);
+    }
+    kill(getpid(), SIGKILL);
+}
+
 @end
+
+__attribute__((constructor))
+static void ZCrashLoggerConstructor(void) {
+    [ZCrashLogger install];
+}
 
 #pragma mark - ZSyslogController
 

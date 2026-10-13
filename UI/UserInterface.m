@@ -181,6 +181,7 @@ static void zs_set_enkephalin_disabled_by_user(BOOL disabled) {
 
 static NSString * const kZSSocialGitHubURL = @"https://github.com/Vastrilliant/ZSingularity";
 static NSString * const kZSSocialDiscordURL = @"https://discord.gg/nRmztE2unw";
+static const NSInteger kZSCrashMessageTextViewTag = 0x5A435248;
 
 static void zs_style_social_text_button(UIButton *button, NSString *text) {
     UIFont *baseFont = zs_mono_font(kZSSubtitleFontSize, UIFontWeightMedium);
@@ -5987,6 +5988,10 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
 @property (nonatomic, assign) BOOL tutorialCanDismiss;
 @property (nonatomic, assign) BOOL tutorialPresented;
 @property (nonatomic, strong) NSTimer *tutorialUnlockTimer;
+@property (nonatomic, strong) UIView *crashOverlay;
+@property (nonatomic, strong) UIView *crashPanel;
+@property (nonatomic, assign) BOOL crashReportPresented;
+@property (nonatomic, copy) NSDictionary *crashReport;
 
 @property (nonatomic, strong) UIVisualEffectView *docsPanelGlass;
 @property (nonatomic, strong) UIView *docsPanel;
@@ -7925,7 +7930,10 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
 
     zs_gif_tint_set_disabled(zs_enkephalin_disabled_by_user());
 
-    [self zs_presentTutorialIfNeeded];
+    [ZCrashLogger reinstallHandlersIfNeeded];
+    if (![self zs_presentCrashReportIfNeeded]) {
+        [self zs_presentTutorialIfNeeded];
+    }
     [self zs_refreshMetalTabs];
     [[ZSMetalTabs shared] setRamHudVisible:zs_ram_hud_enabled()];
 
@@ -7948,6 +7956,7 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
 
 - (void)zs_handleOpenPanelGesture:(UISwipeGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateRecognized) return;
+    if (self.crashReportPresented) return;
     if (self.tutorialPresented) {
         [self zs_flashTutorialGestureWarning];
         return;
@@ -8207,6 +8216,284 @@ static void zs_install_unity_touch_filter(UIView *hostView) {
 - (void)zs_layoutTutorialForWindow:(UIView *)unityView {
     if (!self.tutorialOverlay || !self.tutorialPanel) return;
     self.tutorialOverlay.frame = unityView.bounds;
+}
+
+- (void)zs_layoutCrashReportForWindow:(UIView *)unityView {
+    if (!self.crashOverlay || !self.crashPanel) return;
+    self.crashOverlay.frame = unityView.bounds;
+}
+
+- (BOOL)zs_presentCrashReportIfNeeded {
+    if (self.crashReportPresented) return YES;
+
+    NSDictionary *report = [ZCrashLogger pendingCrashReport];
+    if (!report) return NO;
+
+    UIView *unityView = zs_ui_host_view();
+    if (!unityView) return NO;
+
+    self.crashReport = report;
+    self.crashReportPresented = YES;
+
+    UIView *overlay = [[UIView alloc] initWithFrame:unityView.bounds];
+    overlay.backgroundColor = UIColor.clearColor;
+    overlay.opaque = NO;
+    overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    overlay.userInteractionEnabled = YES;
+    [unityView addSubview:overlay];
+    zs_mark_host_owned(overlay);
+    self.crashOverlay = overlay;
+    zs_force_dark(overlay);
+
+    UIView *panelHost;
+    UIView *panel;
+    if (zs_has_liquid_glass()) {
+        UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:zs_make_glass_effect_dark(NO)];
+        glass.translatesAutoresizingMaskIntoConstraints = NO;
+        glass.userInteractionEnabled = YES;
+        zs_configure_glass_corners(glass, 24, NO);
+        glass.layer.borderWidth = 1;
+        glass.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+        panel = glass;
+        panelHost = glass.contentView;
+    } else {
+        UIView *plain = [[UIView alloc] init];
+        plain.translatesAutoresizingMaskIntoConstraints = NO;
+        plain.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
+        plain.layer.cornerRadius = 24;
+        plain.layer.cornerCurve = kCACornerCurveContinuous;
+        plain.layer.borderWidth = 1;
+        plain.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+        plain.clipsToBounds = YES;
+        panel = plain;
+        panelHost = plain;
+    }
+
+    [overlay addSubview:panel];
+    self.crashPanel = panel;
+
+    UILabel *header = [[UILabel alloc] init];
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    header.textAlignment = NSTextAlignmentLeft;
+    NSMutableAttributedString *headerTitle = [[NSMutableAttributedString alloc] initWithString:@"ZSingularity"
+                                                                                     attributes:@{
+        NSFontAttributeName: zs_excelsior_sans_font(20.5, UIFontWeightBold),
+        NSForegroundColorAttributeName: zs_accent_green_color()
+    }];
+    [headerTitle addAttribute:NSFontAttributeName
+                        value:zs_excelsior_sans_font(27.5, UIFontWeightBold)
+                        range:NSMakeRange(0, 2)];
+    header.attributedText = headerTitle;
+    [panelHost addSubview:header];
+
+    UILabel *titleLabel = [[UILabel alloc] init];
+    titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    titleLabel.text = [NSString stringWithFormat:@"EXC_CRASH: %@", report[@"signal"]];
+    titleLabel.font = zs_mono_font(16, UIFontWeightBold);
+    titleLabel.textColor = UIColor.systemRedColor;
+    titleLabel.numberOfLines = 1;
+    titleLabel.adjustsFontSizeToFitWidth = YES;
+    titleLabel.minimumScaleFactor = 0.6;
+    [panelHost addSubview:titleLabel];
+
+    NSDictionary *messageAttributes = @{
+        NSFontAttributeName: zs_mono_font(12, UIFontWeightRegular),
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.72]
+    };
+    NSMutableAttributedString *messageText = [[NSMutableAttributedString alloc] initWithString:@"It looks like ZSingularity crashed, please report it to the " attributes:messageAttributes];
+    [messageText appendAttributedString:[[NSAttributedString alloc] initWithString:@"Discord Server" attributes:@{
+        NSFontAttributeName: zs_mono_font(12, UIFontWeightBold),
+        NSLinkAttributeName: [NSURL URLWithString:kZSSocialDiscordURL],
+        NSBackgroundColorAttributeName: [zs_accent_green_color() colorWithAlphaComponent:0.18]
+    }]];
+    [messageText appendAttributedString:[[NSAttributedString alloc] initWithString:@"." attributes:messageAttributes]];
+
+    UITextView *message = [[UITextView alloc] init];
+    message.translatesAutoresizingMaskIntoConstraints = NO;
+    message.tag = kZSCrashMessageTextViewTag;
+    message.backgroundColor = UIColor.clearColor;
+    message.opaque = NO;
+    message.editable = NO;
+    message.selectable = YES;
+    message.scrollEnabled = NO;
+    message.textContainerInset = UIEdgeInsetsZero;
+    message.textContainer.lineFragmentPadding = 0;
+    message.delegate = self;
+    message.linkTextAttributes = @{
+        NSForegroundColorAttributeName: zs_accent_green_color(),
+        NSUnderlineStyleAttributeName: @(NSUnderlineStyleSingle)
+    };
+    message.attributedText = messageText;
+    [panelHost addSubview:message];
+
+    UILabel *traceCaption = [[UILabel alloc] init];
+    traceCaption.translatesAutoresizingMaskIntoConstraints = NO;
+    traceCaption.text = @"Stack Trace:";
+    traceCaption.font = zs_mono_font(12, UIFontWeightSemibold);
+    traceCaption.textColor = [UIColor colorWithWhite:1 alpha:0.9];
+    [panelHost addSubview:traceCaption];
+
+    UIView *traceBox = [[UIView alloc] init];
+    traceBox.translatesAutoresizingMaskIntoConstraints = NO;
+    traceBox.backgroundColor = [UIColor colorWithWhite:1 alpha:0.06];
+    traceBox.layer.cornerRadius = 12;
+    traceBox.layer.cornerCurve = kCACornerCurveContinuous;
+    traceBox.layer.borderWidth = 1;
+    traceBox.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.1].CGColor;
+    traceBox.clipsToBounds = YES;
+    [panelHost addSubview:traceBox];
+
+    UITextView *traceView = [[UITextView alloc] init];
+    traceView.translatesAutoresizingMaskIntoConstraints = NO;
+    traceView.backgroundColor = UIColor.clearColor;
+    traceView.editable = NO;
+    traceView.selectable = YES;
+    traceView.scrollEnabled = YES;
+    traceView.indicatorStyle = UIScrollViewIndicatorStyleWhite;
+    traceView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    traceView.textContainer.lineFragmentPadding = 0;
+    traceView.font = zs_mono_font(9.5, UIFontWeightRegular);
+    traceView.textColor = [UIColor colorWithWhite:1 alpha:0.78];
+    traceView.text = report[@"trace"];
+    [traceBox addSubview:traceView];
+
+    UIButton *okButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    okButton.translatesAutoresizingMaskIntoConstraints = NO;
+    zs_style_button_as_solid_glass_with_font(okButton, @"OK", zs_accent_green_color(), zs_mono_font(18, UIFontWeightBold));
+    [okButton addTarget:self action:@selector(zs_crashOKTapped) forControlEvents:UIControlEventTouchUpInside];
+    [panelHost addSubview:okButton];
+
+    UIButton *saveButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    saveButton.translatesAutoresizingMaskIntoConstraints = NO;
+    zs_style_button_as_solid_glass_with_font(saveButton, @"Save trace stack", UIColor.systemBlueColor, zs_mono_font(14, UIFontWeightBold));
+    [saveButton addTarget:self action:@selector(zs_crashSaveTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [panelHost addSubview:saveButton];
+
+    NSLayoutConstraint *preferredWidth = [panel.widthAnchor constraintEqualToAnchor:overlay.widthAnchor constant:-32];
+    preferredWidth.priority = UILayoutPriorityDefaultHigh;
+    NSLayoutConstraint *preferredHeight = [panel.heightAnchor constraintEqualToConstant:520];
+    preferredHeight.priority = UILayoutPriorityDefaultHigh;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [panel.centerXAnchor constraintEqualToAnchor:overlay.centerXAnchor],
+        [panel.centerYAnchor constraintEqualToAnchor:overlay.centerYAnchor],
+        [panel.widthAnchor constraintLessThanOrEqualToConstant:460],
+        [panel.heightAnchor constraintLessThanOrEqualToConstant:520],
+        [panel.topAnchor constraintGreaterThanOrEqualToAnchor:overlay.topAnchor constant:24],
+        [panel.bottomAnchor constraintLessThanOrEqualToAnchor:overlay.bottomAnchor constant:-24],
+        [panel.leadingAnchor constraintGreaterThanOrEqualToAnchor:overlay.leadingAnchor constant:16],
+        [panel.trailingAnchor constraintLessThanOrEqualToAnchor:overlay.trailingAnchor constant:-16],
+        preferredWidth,
+        preferredHeight,
+
+        [header.topAnchor constraintEqualToAnchor:panelHost.topAnchor constant:18],
+        [header.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:20],
+        [header.trailingAnchor constraintLessThanOrEqualToAnchor:panelHost.trailingAnchor constant:-20],
+        [header.heightAnchor constraintEqualToConstant:34],
+
+        [titleLabel.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [titleLabel.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [titleLabel.topAnchor constraintEqualToAnchor:header.bottomAnchor constant:14],
+
+        [message.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [message.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [message.topAnchor constraintEqualToAnchor:titleLabel.bottomAnchor constant:10],
+
+        [traceCaption.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [traceCaption.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [traceCaption.topAnchor constraintEqualToAnchor:message.bottomAnchor constant:14],
+
+        [traceBox.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [traceBox.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [traceBox.topAnchor constraintEqualToAnchor:traceCaption.bottomAnchor constant:6],
+        [traceBox.bottomAnchor constraintEqualToAnchor:okButton.topAnchor constant:-14],
+
+        [traceView.leadingAnchor constraintEqualToAnchor:traceBox.leadingAnchor],
+        [traceView.trailingAnchor constraintEqualToAnchor:traceBox.trailingAnchor],
+        [traceView.topAnchor constraintEqualToAnchor:traceBox.topAnchor],
+        [traceView.bottomAnchor constraintEqualToAnchor:traceBox.bottomAnchor],
+
+        [okButton.leadingAnchor constraintEqualToAnchor:panelHost.leadingAnchor constant:22],
+        [okButton.widthAnchor constraintEqualToAnchor:panelHost.widthAnchor multiplier:0.3],
+        [okButton.bottomAnchor constraintEqualToAnchor:panelHost.bottomAnchor constant:-20],
+        [okButton.heightAnchor constraintEqualToConstant:46],
+
+        [saveButton.leadingAnchor constraintEqualToAnchor:okButton.trailingAnchor constant:12],
+        [saveButton.trailingAnchor constraintEqualToAnchor:panelHost.trailingAnchor constant:-22],
+        [saveButton.bottomAnchor constraintEqualToAnchor:okButton.bottomAnchor],
+        [saveButton.heightAnchor constraintEqualToAnchor:okButton.heightAnchor],
+    ]];
+
+    panel.alpha = 0;
+    panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    [UIView animateWithDuration:0.22 animations:^{
+        panel.alpha = 1;
+        panel.transform = CGAffineTransformIdentity;
+    }];
+
+    return YES;
+}
+
+- (void)zs_crashSaveTapped:(UIButton *)sender {
+    NSDictionary *report = self.crashReport;
+    NSString *fullReport = report[@"report"];
+    if (fullReport.length == 0) return;
+
+    NSTimeInterval timestamp = [report[@"timestamp"] doubleValue];
+    NSDate *date = timestamp > 0 ? [NSDate dateWithTimeIntervalSince1970:timestamp] : [NSDate date];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *fileName = [NSString stringWithFormat:@"ZSingularity-crash-%@.txt", [formatter stringFromDate:date]];
+
+    NSString *directoryPath = [NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    NSURL *directoryURL = [NSURL fileURLWithPath:directoryPath isDirectory:YES];
+    NSURL *fileURL = [directoryURL URLByAppendingPathComponent:fileName];
+    NSString *contents = [NSString stringWithFormat:@"EXC_CRASH: %@\n%@", report[@"signal"], fullReport];
+
+    NSError *error = nil;
+    BOOL wrote = [NSFileManager.defaultManager createDirectoryAtURL:directoryURL withIntermediateDirectories:YES attributes:nil error:&error]
+        && [contents writeToURL:fileURL atomically:YES encoding:NSUTF8StringEncoding error:&error];
+    if (!wrote) {
+        [self zs_presentModsAlertWithTitle:@"Save Failed" message:error.localizedDescription ?: @"Couldn't write the crash report."];
+        return;
+    }
+
+    UIViewController *presenter = zs_key_window().rootViewController;
+    while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+    if (!presenter) {
+        [NSFileManager.defaultManager removeItemAtURL:directoryURL error:nil];
+        return;
+    }
+
+    UIActivityViewController *activityVC = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL] applicationActivities:nil];
+    activityVC.popoverPresentationController.sourceView = sender;
+    activityVC.popoverPresentationController.sourceRect = sender.bounds;
+    activityVC.completionWithItemsHandler = ^(UIActivityType activityType, BOOL completed, NSArray *returnedItems, NSError *activityError) {
+        [NSFileManager.defaultManager removeItemAtURL:directoryURL error:nil];
+    };
+    [presenter presentViewController:activityVC animated:YES completion:nil];
+}
+
+- (void)zs_crashOKTapped {
+    [ZCrashLogger clearPendingCrashReport];
+
+    UIView *panel = self.crashPanel;
+    UIView *overlay = self.crashOverlay;
+    self.crashPanel = nil;
+    self.crashOverlay = nil;
+    self.crashReport = nil;
+    self.crashReportPresented = NO;
+
+    [self zs_presentTutorialIfNeeded];
+    [self zs_refreshMetalTabs];
+
+    [UIView animateWithDuration:0.18 animations:^{
+        panel.alpha = 0;
+        panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
+    } completion:^(BOOL finished) {
+        [overlay removeFromSuperview];
+    }];
 }
 
 - (void)openPanel {
@@ -9503,6 +9790,12 @@ static const CGFloat kContentFadeHeight = 22;
     [experimentalEnabledRow.toggle addTarget:self action:@selector(experimentalSettingsEnabledChanged:) forControlEvents:UIControlEventValueChanged];
 
     UIButton *dumpIL2CPPMethodsButton = zs_make_grouped_action_button(@"Dump IL2CPP Methods", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
+    UIButton *sigkillButton = zs_make_grouped_action_button(@"SIGKILL process", [UIColor colorWithRed:0.85 green:0.08 blue:0.08 alpha:1.0]);
+    zs_attach_tap_to_confirm(sigkillButton, self,
+        @"SIGKILL process?", @"This immediately kills the app with SIGKILL to test crash reporting. Anything unsaved will be lost.", @"SIGKILL", YES, ^{
+        [ZCrashLogger killProcessWithSIGKILL];
+    });
+
     zs_attach_tap_to_confirm(dumpIL2CPPMethodsButton, self,
         @"Dump IL2CPP Methods?", @"This enumerates every loaded assembly, class, method, field, and property and writes the dump to Documents. It may take a while.", @"Dump", NO, ^{
         [weakSelf dumpIL2CPPMethodsTapped];
@@ -9532,6 +9825,7 @@ static const CGFloat kContentFadeHeight = 22;
         patchLCButton,
         syslogButton,
         keepAliveButton,
+        sigkillButton,
     ]);
     developerActionsCard.layer.borderWidth = 1;
     developerActionsCard.layer.borderColor = [zs_accent_green_color() colorWithAlphaComponent:0.2].CGColor;
@@ -11082,6 +11376,11 @@ static NSArray<NSArray<NSString *> *> *zs_section_index_entries(void) {
 
 - (BOOL)textView:(UITextView *)textView shouldInteractWithURL:(NSURL *)URL
          inRange:(NSRange)characterRange interaction:(UITextItemInteraction)interaction {
+    if (textView.tag == kZSCrashMessageTextViewTag) {
+        [[UIApplication sharedApplication] openURL:URL options:@{} completionHandler:nil];
+        return NO;
+    }
+
     if (textView != self.docsBodyLabel) return YES;
 
     if (URL.scheme.length == 0) {
@@ -20629,7 +20928,7 @@ static void zs_configure_glass_corners_flat_right(UIView *view, CGFloat leftRadi
     ZSMetalTabs *tabs = [ZSMetalTabs shared];
     UIView *unityView = zs_ui_host_view();
     NSArray<NSString *> *keys = [[self zs_pinnedKeys] copy];
-    BOOL show = unityView && self.installed && !self.panelOpen && (allowHierarchy || !self.glassContainer) && !self.tutorialPresented && keys.count > 0;
+    BOOL show = unityView && self.installed && !self.panelOpen && (allowHierarchy || !self.glassContainer) && !self.tutorialPresented && !self.crashReportPresented && keys.count > 0;
     if (!show) {
         [tabs setVisible:NO snap:NO];
         return;
@@ -21140,6 +21439,7 @@ static const CGFloat kZSSliderGlassCullMargin = 0;
     });
     [self zs_dismissPinMenuAnimated:NO delay:0 completion:nil];
     [self zs_layoutTutorialForWindow:unityView];
+    [self zs_layoutCrashReportForWindow:unityView];
     if (!self.panel) return;
     [self layoutPanelForWindow:unityView];
 }

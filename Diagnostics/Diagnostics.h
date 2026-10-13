@@ -8,7 +8,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (void)install;
 
++ (void)reinstallHandlersIfNeeded;
+
 + (NSString *)crashLogPath;
+
++ (nullable NSDictionary<NSString *, id> *)pendingCrashReport;
+
++ (void)clearPendingCrashReport;
+
++ (void)killProcessWithSIGKILL;
 
 @end
 
