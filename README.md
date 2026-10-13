@@ -51,30 +51,17 @@ Supported Mods:
 
 ## Installation
 
-**Pre-built ipa is available in the [Discord Server](https://discord.gg/nRmztE2unw)**
+**Due to legal reasons, ZSingularity will no longer provide .ipa releases**
 
-If you’d like to build it yourself; download a decrypted .ipa of Limbus Company through your decryption service of choice, fork this repository and use `build-ipa.yml` to inject ZSingularity into your .ipa
+You may use [The web portal](https://vastrilliant.github.io/ZSingularity/) to embed ZSingularity onto your .ipa of LimbusCompany 
 
-You must modify the .ipa’s `info.plist` to get all of ZSingularity’s functionality
-
-Add the following key’s to your .ipa’s `info.plist`
-```
-<key>CADisableMinimumFrameDurationOnPhone</key>
-<true/>
-<key>CADisableMinimumFrameDuration</key>
-<true/>
-<key>LSSupportsGameMode</key>
-<true/>
-<key>LSSupportsOpeningDocumentsInPlace</key>
-<true/>
-<key>UIFileSharingEnabled</key>
-<true/>
-```
 To install, **[SideStore](https://sidestore.io/)** is recommended, follow the steps provided in their Documentation
 
-A PC is recommended for the smoothest installation process, otherwise you may use **[Sideinstaller](https://sideinstaller.net)** (iOS27+ only)
+A PC is recommended for the smoothest installation process, otherwise you may use **[Sideinstaller](https://sideinstaller.net)** if you don't have a desktop environment (iOS27+ only)
 
 > [!WARNING]
+>Due to certain limitations and restrictions imposed by apple, you nust acknowledge the following caveats that come with Sideloading:
+>
 >You will not be able to install updates from the AppStore, every time Limbus updates you’ll need to manually sideload the new version into your device 
 >
 >You won’t be able to make any app purchases in a sideloaded version of LimbusCompany
