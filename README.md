@@ -60,7 +60,7 @@ To install, **[SideStore](https://sidestore.io/)** is recommended, follow the st
 A PC is recommended for the smoothest installation process, otherwise you may use **[Sideinstaller](https://sideinstaller.net)** if you don't have a desktop environment (iOS27+ only)
 
 > [!WARNING]
->Due to certain limitations and restrictions imposed by apple, you nust acknowledge the following caveats that come with Sideloading:
+>Due to certain limitations and restrictions imposed by apple, you must acknowledge the following caveats that come with Sideloading:
 >
 >You will not be able to install updates from the AppStore, every time Limbus updates you’ll need to manually sideload the new version into your device 
 >
