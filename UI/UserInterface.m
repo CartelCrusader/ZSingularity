@@ -5957,6 +5957,23 @@ static BOOL zs_mod_library_has_zeroable_assets(void) {
     return NO;
 }
 
+@interface ZSDocsScrollView : UIScrollView
+@property (nonatomic, weak) NSLayoutConstraint *minContentHeightConstraint;
+@property (nonatomic, assign) CGFloat minContentHeightInset;
+@end
+
+@implementation ZSDocsScrollView
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    NSLayoutConstraint *constraint = self.minContentHeightConstraint;
+    if (!constraint) return;
+    CGFloat target = MAX(0, self.bounds.size.height - self.minContentHeightInset);
+    if (fabs(constraint.constant - target) > 0.5) constraint.constant = target;
+}
+
+@end
+
 @interface UserInterface : NSObject <UIGestureRecognizerDelegate, UIScrollViewDelegate, UITextFieldDelegate, UIDocumentPickerDelegate, UITextViewDelegate, CLLocationManagerDelegate, UIContextMenuInteractionDelegate, UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UIVisualEffectView *glassContainer;
 @property (nonatomic, strong) UIVisualEffectView *panelGlass;
@@ -11012,7 +11029,7 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
     [self.docsSubheaderPageGroup addArrangedSubview:self.docsSubheaderRightArrowButton];
     [self.docsContentOverlay addSubview:self.docsSubheaderPageGroup];
 
-    self.docsScrollView = [[UIScrollView alloc] init];
+    self.docsScrollView = [[ZSDocsScrollView alloc] init];
     self.docsScrollView.translatesAutoresizingMaskIntoConstraints = NO;
     self.docsScrollView.showsVerticalScrollIndicator = NO;
     self.docsScrollView.alwaysBounceVertical = NO;
@@ -11097,6 +11114,10 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
     [self.docsUpdateActionsStack setCustomSpacing:16 afterView:self.docsLiveContainerInstallButton];
     [self.docsUpdateActionsStack setCustomSpacing:14 afterView:self.docsUpdateActionsDisabledNoteLabel];
 
+    NSLayoutConstraint *docsMinHeightConstraint = [docsContent.heightAnchor constraintGreaterThanOrEqualToConstant:0];
+    ((ZSDocsScrollView *)self.docsScrollView).minContentHeightConstraint = docsMinHeightConstraint;
+    ((ZSDocsScrollView *)self.docsScrollView).minContentHeightInset = kPanelPadding * 2;
+
     self.docsScrollViewBottomToOverlayConstraint =
         [self.docsScrollView.bottomAnchor constraintEqualToAnchor:self.docsContentOverlay.bottomAnchor];
 
@@ -11143,7 +11164,7 @@ static UIButton *zs_make_docs_language_option_button(NSDictionary<NSString *, NS
         [docsContent.trailingAnchor constraintEqualToAnchor:self.docsScrollView.contentLayoutGuide.trailingAnchor constant:-kPanelPadding],
         [docsContent.bottomAnchor constraintEqualToAnchor:self.docsScrollView.contentLayoutGuide.bottomAnchor constant:-kPanelPadding],
         [docsContent.widthAnchor constraintEqualToAnchor:self.docsScrollView.frameLayoutGuide.widthAnchor constant:-(kPanelPadding * 2)],
-        [docsContent.heightAnchor constraintGreaterThanOrEqualToAnchor:self.docsScrollView.frameLayoutGuide.heightAnchor constant:-(kPanelPadding * 2)],
+        docsMinHeightConstraint,
     ]];
 
     self.docsScrollViewBottomToOverlayConstraint.active = YES;
